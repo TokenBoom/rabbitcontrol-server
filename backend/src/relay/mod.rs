@@ -4,6 +4,7 @@
 mod splice;
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::io;
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
@@ -39,6 +40,7 @@ pub const MAX_TOKEN_LEN: usize = 128;
 
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_PAIR_TIMEOUT: Duration = Duration::from_secs(15);
+pub const DEFAULT_HALFCLOSE_GRACE: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_PENDING: usize = 4096;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 4096;
 
@@ -50,7 +52,10 @@ const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
-const USERSPACE_COPY_BUF_SIZE: usize = 32 * 1024;
+const COPY_BUF_SIZE: usize = 32 * 1024;
+const COPY_POOL_SHARDS: usize = 8;
+const COPY_POOL_SHARD_CAP: usize = 32;
+const _: () = assert!(COPY_POOL_SHARDS * COPY_POOL_SHARD_CAP * COPY_BUF_SIZE == 8 * 1024 * 1024);
 const USERSPACE_YIELD_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Error)]
@@ -134,6 +139,7 @@ pub fn encode_relay_handshake(role: u8, token: &str) -> Result<Vec<u8>, RelayErr
 pub struct RelayConfig {
     pub handshake_timeout: Duration,
     pub pair_timeout: Duration,
+    pub halfclose_grace: Duration,
     pub max_pending: usize,
     pub max_connections: usize,
 }
@@ -143,6 +149,7 @@ impl Default for RelayConfig {
         Self {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             pair_timeout: DEFAULT_PAIR_TIMEOUT,
+            halfclose_grace: DEFAULT_HALFCLOSE_GRACE,
             max_pending: DEFAULT_MAX_PENDING,
             max_connections: DEFAULT_MAX_CONNECTIONS,
         }
@@ -215,6 +222,24 @@ impl AsyncWrite for RelayStream {
         match self.get_mut() {
             Self::Plain(s) => Pin::new(s).poll_write(cx, buf),
             Self::Tls(s) => Pin::new(&mut **s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+            Self::Tls(s) => Pin::new(&mut **s).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Plain(s) => s.is_write_vectored(),
+            Self::Tls(s) => s.is_write_vectored(),
         }
     }
 
@@ -1362,6 +1387,7 @@ impl RelayServer {
                         Arc::clone(&self.total_bytes_up),
                         Arc::clone(&self.total_bytes_down),
                         cancel.clone(),
+                        self.config.halfclose_grace,
                     )
                     .await
                     {
@@ -1370,7 +1396,7 @@ impl RelayServer {
                             error = %err,
                             "linux splice(2) setup failed; falling back to userspace copy"
                         );
-                        let _ = copy_bidirectional_userspace_with_totals(
+                        let _ = copy_bidirectional_pooled(
                             host_tcp,
                             client_tcp,
                             Arc::clone(&bytes_up),
@@ -1378,6 +1404,7 @@ impl RelayServer {
                             Some(Arc::clone(&self.total_bytes_up)),
                             Some(Arc::clone(&self.total_bytes_down)),
                             cancel.clone(),
+                            self.config.halfclose_grace,
                         )
                         .await;
                     }
@@ -1385,7 +1412,7 @@ impl RelayServer {
 
                 #[cfg(not(target_os = "linux"))]
                 {
-                    let _ = copy_bidirectional_userspace_with_totals(
+                    let _ = copy_bidirectional_pooled(
                         host_tcp,
                         client_tcp,
                         Arc::clone(&bytes_up),
@@ -1393,12 +1420,13 @@ impl RelayServer {
                         Some(Arc::clone(&self.total_bytes_up)),
                         Some(Arc::clone(&self.total_bytes_down)),
                         cancel.clone(),
+                        self.config.halfclose_grace,
                     )
                     .await;
                 }
             }
             (host, client) => {
-                let _ = copy_bidirectional_streams_with_totals(
+                let _ = copy_bidirectional_pooled(
                     host,
                     client,
                     Arc::clone(&bytes_up),
@@ -1406,6 +1434,7 @@ impl RelayServer {
                     Some(Arc::clone(&self.total_bytes_up)),
                     Some(Arc::clone(&self.total_bytes_down)),
                     cancel.clone(),
+                    self.config.halfclose_grace,
                 )
                 .await;
             }
@@ -1545,6 +1574,177 @@ async fn send_reply_best_effort<S: AsyncWrite + Unpin>(stream: &mut S, code: u8)
     let _ = stream.shutdown().await;
 }
 
+static COPY_BUF_POOL: CopyBufPool = CopyBufPool::new();
+
+struct CopyBufPool {
+    shards: [std::sync::Mutex<Vec<Vec<u8>>>; COPY_POOL_SHARDS],
+    next_shard: AtomicUsize,
+    #[cfg(test)]
+    live: AtomicUsize,
+}
+
+impl CopyBufPool {
+    const fn new() -> Self {
+        Self {
+            shards: [const { std::sync::Mutex::new(Vec::new()) }; COPY_POOL_SHARDS],
+            next_shard: AtomicUsize::new(0),
+            #[cfg(test)]
+            live: AtomicUsize::new(0),
+        }
+    }
+
+    fn get(&self) -> PooledBuf<'_> {
+        let start = self.next_shard.fetch_add(1, Ordering::Relaxed) % COPY_POOL_SHARDS;
+        if let Some(buf) = self.shards[start]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop()
+        {
+            if buf.len() == COPY_BUF_SIZE {
+                #[cfg(test)]
+                self.live.fetch_add(1, Ordering::SeqCst);
+                return PooledBuf {
+                    pool: self,
+                    shard: start,
+                    buf,
+                };
+            }
+        }
+        for offset in 1..COPY_POOL_SHARDS {
+            let idx = (start + offset) % COPY_POOL_SHARDS;
+            if let Ok(mut guard) = self.shards[idx].try_lock() {
+                if let Some(buf) = guard.pop() {
+                    if buf.len() == COPY_BUF_SIZE {
+                        #[cfg(test)]
+                        self.live.fetch_add(1, Ordering::SeqCst);
+                        return PooledBuf {
+                            pool: self,
+                            shard: idx,
+                            buf,
+                        };
+                    }
+                }
+            }
+        }
+        #[cfg(test)]
+        self.live.fetch_add(1, Ordering::SeqCst);
+        PooledBuf {
+            pool: self,
+            shard: start,
+            buf: vec![0u8; COPY_BUF_SIZE],
+        }
+    }
+
+    fn put(&self, shard_hint: usize, buf: Vec<u8>) {
+        #[cfg(test)]
+        self.live.fetch_sub(1, Ordering::SeqCst);
+        if buf.len() != COPY_BUF_SIZE {
+            return;
+        }
+        let start = shard_hint % COPY_POOL_SHARDS;
+        {
+            let mut guard = self.shards[start]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if guard.len() < COPY_POOL_SHARD_CAP {
+                guard.push(buf);
+                return;
+            }
+        }
+        for offset in 1..COPY_POOL_SHARDS {
+            let idx = (start + offset) % COPY_POOL_SHARDS;
+            if let Ok(mut guard) = self.shards[idx].try_lock() {
+                if guard.len() < COPY_POOL_SHARD_CAP {
+                    guard.push(buf);
+                    return;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn live(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    fn pooled_count(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| s.lock().unwrap_or_else(|p| p.into_inner()).len())
+            .sum()
+    }
+}
+
+#[cfg(test)]
+fn copy_pool_live() -> usize {
+    COPY_BUF_POOL.live()
+}
+
+struct PooledBuf<'a> {
+    pool: &'a CopyBufPool,
+    shard: usize,
+    buf: Vec<u8>,
+}
+
+impl PooledBuf<'_> {
+    fn as_slice(&self) -> &[u8] {
+        &self.buf
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.buf
+    }
+}
+
+impl Drop for PooledBuf<'_> {
+    fn drop(&mut self) {
+        let buf = std::mem::take(&mut self.buf);
+        self.pool.put(self.shard, buf);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirPhase {
+    Active,
+    ShuttingDown,
+    Done,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirStep {
+    Pending,
+    Done,
+    YieldBudget,
+    Err,
+}
+
+struct DirState<'a> {
+    buf: Option<PooledBuf<'a>>,
+    pos: usize,
+    cap: usize,
+    need_flush: bool,
+    phase: DirPhase,
+}
+
+impl DirState<'_> {
+    fn new() -> Self {
+        Self {
+            buf: None,
+            pos: 0,
+            cap: 0,
+            need_flush: false,
+            phase: DirPhase::Active,
+        }
+    }
+
+    fn clear_buf(&mut self) {
+        self.buf = None;
+        self.pos = 0;
+        self.cap = 0;
+    }
+}
+
 /// Bounded 32 KiB userspace bidirectional copy fallback with half-close propagation and
 /// immediate cancellation wakeup (used on non-Linux targets or if Linux `splice(2)` setup fails).
 pub async fn copy_bidirectional_userspace(
@@ -1554,42 +1754,21 @@ pub async fn copy_bidirectional_userspace(
     bytes_b_to_a: Arc<AtomicU64>,
     cancel: CancellationFlag,
 ) -> io::Result<()> {
-    copy_bidirectional_userspace_with_totals(a, b, bytes_a_to_b, bytes_b_to_a, None, None, cancel)
-        .await
-}
-
-async fn copy_bidirectional_userspace_with_totals(
-    a: &mut TcpStream,
-    b: &mut TcpStream,
-    bytes_a_to_b: Arc<AtomicU64>,
-    bytes_b_to_a: Arc<AtomicU64>,
-    total_a_to_b: Option<Arc<AtomicU64>>,
-    total_b_to_a: Option<Arc<AtomicU64>>,
-    cancel: CancellationFlag,
-) -> io::Result<()> {
-    let (mut a_read, mut a_write) = a.split();
-    let (mut b_read, mut b_write) = b.split();
-
-    let ab = copy_one_dir(
-        &mut a_read,
-        &mut b_write,
+    copy_bidirectional_pooled(
+        a,
+        b,
         bytes_a_to_b,
-        total_a_to_b,
-        cancel.clone(),
-    );
-    let ba = copy_one_dir(
-        &mut b_read,
-        &mut a_write,
         bytes_b_to_a,
-        total_b_to_a,
+        None,
+        None,
         cancel,
-    );
-
-    let _ = tokio::join!(ab, ba);
-    Ok(())
+        DEFAULT_HALFCLOSE_GRACE,
+    )
+    .await
 }
 
-async fn copy_bidirectional_streams_with_totals<S>(
+#[allow(clippy::too_many_arguments)]
+async fn copy_bidirectional_pooled<S>(
     a: &mut S,
     b: &mut S,
     bytes_a_to_b: Arc<AtomicU64>,
@@ -1597,121 +1776,319 @@ async fn copy_bidirectional_streams_with_totals<S>(
     total_a_to_b: Option<Arc<AtomicU64>>,
     total_b_to_a: Option<Arc<AtomicU64>>,
     cancel: CancellationFlag,
+    halfclose_grace: Duration,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (mut a_read, mut a_write) = tokio::io::split(a);
-    let (mut b_read, mut b_write) = tokio::io::split(b);
-
-    let ab = copy_one_dir(
-        &mut a_read,
-        &mut b_write,
+    copy_bidirectional_pooled_with_pool(
+        a,
+        b,
         bytes_a_to_b,
-        total_a_to_b,
-        cancel.clone(),
-    );
-    let ba = copy_one_dir(
-        &mut b_read,
-        &mut a_write,
         bytes_b_to_a,
+        total_a_to_b,
         total_b_to_a,
         cancel,
-    );
-
-    let _ = tokio::join!(ab, ba);
-    Ok(())
+        halfclose_grace,
+        &COPY_BUF_POOL,
+    )
+    .await
 }
 
-async fn copy_one_dir<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    counter: Arc<AtomicU64>,
-    total_counter: Option<Arc<AtomicU64>>,
+#[allow(clippy::too_many_arguments)]
+async fn copy_bidirectional_pooled_with_pool<S>(
+    a: &mut S,
+    b: &mut S,
+    bytes_a_to_b: Arc<AtomicU64>,
+    bytes_b_to_a: Arc<AtomicU64>,
+    total_a_to_b: Option<Arc<AtomicU64>>,
+    total_b_to_a: Option<Arc<AtomicU64>>,
     cancel: CancellationFlag,
-) where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    halfclose_grace: Duration,
+    pool: &CopyBufPool,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; USERSPACE_COPY_BUF_SIZE];
-    let mut batch_bytes: usize = 0;
+    let mut ab = DirState::new();
+    let mut ba = DirState::new();
+    let mut ab_first = true;
+    let mut halfclose_deadline: Option<Pin<Box<tokio::time::Sleep>>> = None;
 
     let cancel_wait = cancel.cancelled();
     tokio::pin!(cancel_wait);
 
-    loop {
-        if cancel.is_cancelled() {
-            let _ = writer.shutdown().await;
-            return;
+    std::future::poll_fn(|cx| {
+        if cancel.is_cancelled() || cancel_wait.as_mut().poll(cx).is_ready() {
+            ab.clear_buf();
+            ba.clear_buf();
+            return Poll::Ready(Ok(()));
         }
 
-        let read_res = tokio::select! {
-            biased;
-            _ = &mut cancel_wait => {
-                let _ = writer.shutdown().await;
-                return;
-            }
-            res = reader.read(&mut buf) => res,
-        };
+        let mut poll_bytes: usize = 0;
 
-        let n = match read_res {
-            Ok(0) => {
-                // Clean read EOF: propagate TCP half-close to peer write side only.
-                let _ = writer.shutdown().await;
-                return;
-            }
-            Ok(n) => n,
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => {
-                // Hard socket read error (e.g. ECONNRESET): tear down both directions promptly.
+        let (step_ab, step_ba) = if ab_first {
+            let s_ab = poll_one_dir(
+                cx,
+                a,
+                b,
+                &mut ab,
+                pool,
+                &bytes_a_to_b,
+                total_a_to_b.as_deref(),
+                &mut poll_bytes,
+            );
+            if s_ab == DirStep::Err {
                 cancel.cancel();
-                let _ = writer.shutdown().await;
-                return;
+                ab.clear_buf();
+                ba.clear_buf();
+                return Poll::Ready(Ok(()));
             }
-        };
-
-        let write_res = tokio::select! {
-            biased;
-            _ = &mut cancel_wait => {
-                let _ = writer.shutdown().await;
-                return;
+            let s_ba = poll_one_dir(
+                cx,
+                b,
+                a,
+                &mut ba,
+                pool,
+                &bytes_b_to_a,
+                total_b_to_a.as_deref(),
+                &mut poll_bytes,
+            );
+            (s_ab, s_ba)
+        } else {
+            let s_ba = poll_one_dir(
+                cx,
+                b,
+                a,
+                &mut ba,
+                pool,
+                &bytes_b_to_a,
+                total_b_to_a.as_deref(),
+                &mut poll_bytes,
+            );
+            if s_ba == DirStep::Err {
+                cancel.cancel();
+                ab.clear_buf();
+                ba.clear_buf();
+                return Poll::Ready(Ok(()));
             }
-            res = writer.write_all(&buf[..n]) => res,
+            let s_ab = poll_one_dir(
+                cx,
+                a,
+                b,
+                &mut ab,
+                pool,
+                &bytes_a_to_b,
+                total_a_to_b.as_deref(),
+                &mut poll_bytes,
+            );
+            (s_ab, s_ba)
         };
+        ab_first = !ab_first;
 
-        if write_res.is_err() {
-            // Hard socket write error (e.g. EPIPE / ECONNRESET): tear down both directions promptly.
+        if step_ab == DirStep::Err || step_ba == DirStep::Err {
             cancel.cancel();
-            let _ = writer.shutdown().await;
-            return;
+            ab.clear_buf();
+            ba.clear_buf();
+            return Poll::Ready(Ok(()));
         }
 
-        // Flush underlying sink so TLS writers (rustls) push encrypted records out immediately
-        // instead of stalling inside internal TLS buffers under TCP backpressure.
-        let flush_res = tokio::select! {
-            biased;
-            _ = &mut cancel_wait => {
-                let _ = writer.shutdown().await;
-                return;
+        if ab.phase == DirPhase::Done && ba.phase == DirPhase::Done {
+            ab.clear_buf();
+            ba.clear_buf();
+            return Poll::Ready(Ok(()));
+        }
+
+        if (ab.phase == DirPhase::Done || ba.phase == DirPhase::Done)
+            && halfclose_grace > Duration::ZERO
+        {
+            let deadline = halfclose_deadline
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep(halfclose_grace)));
+            if deadline.as_mut().poll(cx).is_ready() {
+                cancel.cancel();
+                ab.clear_buf();
+                ba.clear_buf();
+                return Poll::Ready(Ok(()));
             }
-            res = writer.flush() => res,
-        };
-
-        if flush_res.is_err() {
-            cancel.cancel();
-            let _ = writer.shutdown().await;
-            return;
         }
 
-        let delta = n as u64;
-        counter.fetch_add(delta, Ordering::Relaxed);
-        if let Some(ref total) = total_counter {
-            total.fetch_add(delta, Ordering::Relaxed);
+        if step_ab == DirStep::YieldBudget
+            || step_ba == DirStep::YieldBudget
+            || poll_bytes >= USERSPACE_YIELD_BYTES
+        {
+            cx.waker().wake_by_ref();
         }
-        batch_bytes += n;
-        if batch_bytes >= USERSPACE_YIELD_BYTES {
-            tokio::task::yield_now().await;
-            batch_bytes = 0;
+
+        Poll::Pending
+    })
+    .await
+}
+
+fn poll_flush_writer<W: AsyncWrite + Unpin>(
+    cx: &mut Context<'_>,
+    writer: &mut W,
+    need_flush: &mut bool,
+) -> Poll<io::Result<()>> {
+    loop {
+        match Pin::new(&mut *writer).poll_flush(cx) {
+            Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Poll::Ready(Ok(())) => {
+                *need_flush = false;
+                return Poll::Ready(Ok(()));
+            }
+            other => return other,
+        }
+    }
+}
+
+fn poll_shutdown_writer<W: AsyncWrite + Unpin>(
+    cx: &mut Context<'_>,
+    writer: &mut W,
+) -> Poll<io::Result<()>> {
+    loop {
+        match Pin::new(&mut *writer).poll_shutdown(cx) {
+            Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
+            other => return other,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn poll_one_dir<'a, R, W>(
+    cx: &mut Context<'_>,
+    reader: &mut R,
+    writer: &mut W,
+    state: &mut DirState<'a>,
+    pool: &'a CopyBufPool,
+    counter: &AtomicU64,
+    total_counter: Option<&AtomicU64>,
+    poll_bytes: &mut usize,
+) -> DirStep
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    loop {
+        match state.phase {
+            DirPhase::Done => return DirStep::Done,
+            DirPhase::ShuttingDown => {
+                if state.need_flush {
+                    match poll_flush_writer(cx, writer, &mut state.need_flush) {
+                        Poll::Pending => return DirStep::Pending,
+                        Poll::Ready(Err(_)) => {
+                            state.clear_buf();
+                            return DirStep::Err;
+                        }
+                        Poll::Ready(Ok(())) => {}
+                    }
+                }
+                match poll_shutdown_writer(cx, writer) {
+                    Poll::Pending => return DirStep::Pending,
+                    Poll::Ready(Err(_)) => {
+                        state.clear_buf();
+                        return DirStep::Err;
+                    }
+                    Poll::Ready(Ok(())) => {
+                        state.phase = DirPhase::Done;
+                        return DirStep::Done;
+                    }
+                }
+            }
+            DirPhase::Active => {
+                while state.pos < state.cap {
+                    let Some(pooled) = state.buf.as_ref() else {
+                        state.clear_buf();
+                        break;
+                    };
+                    let slice = &pooled.as_slice()[state.pos..state.cap];
+                    let write_res = loop {
+                        match Pin::new(&mut *writer).poll_write(cx, slice) {
+                            Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::Interrupted => {
+                                continue;
+                            }
+                            other => break other,
+                        }
+                    };
+                    match write_res {
+                        Poll::Pending => return DirStep::Pending,
+                        Poll::Ready(Ok(0)) => {
+                            state.clear_buf();
+                            return DirStep::Err;
+                        }
+                        Poll::Ready(Ok(n)) => {
+                            state.pos += n;
+                            state.need_flush = true;
+                            *poll_bytes += n;
+                            let delta = n as u64;
+                            counter.fetch_add(delta, Ordering::Relaxed);
+                            if let Some(total) = total_counter {
+                                total.fetch_add(delta, Ordering::Relaxed);
+                            }
+                            if state.pos == state.cap {
+                                state.clear_buf();
+                                break;
+                            }
+                        }
+                        Poll::Ready(Err(_)) => {
+                            state.clear_buf();
+                            return DirStep::Err;
+                        }
+                    }
+                }
+
+                if *poll_bytes >= USERSPACE_YIELD_BYTES {
+                    if state.need_flush {
+                        match poll_flush_writer(cx, writer, &mut state.need_flush) {
+                            Poll::Pending => return DirStep::Pending,
+                            Poll::Ready(Err(_)) => return DirStep::Err,
+                            Poll::Ready(Ok(())) => {}
+                        }
+                    }
+                    return DirStep::YieldBudget;
+                }
+
+                let mut pooled = pool.get();
+                let read_res = {
+                    let mut read_buf = ReadBuf::new(pooled.as_mut_slice());
+                    loop {
+                        match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
+                            Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::Interrupted => {
+                                continue;
+                            }
+                            Poll::Ready(Ok(())) => break Poll::Ready(Ok(read_buf.filled().len())),
+                            Poll::Ready(Err(e)) => break Poll::Ready(Err(e)),
+                            Poll::Pending => break Poll::Pending,
+                        }
+                    }
+                };
+
+                match read_res {
+                    Poll::Pending => {
+                        drop(pooled);
+                        if state.need_flush {
+                            match poll_flush_writer(cx, writer, &mut state.need_flush) {
+                                Poll::Pending => return DirStep::Pending,
+                                Poll::Ready(Err(_)) => return DirStep::Err,
+                                Poll::Ready(Ok(())) => {}
+                            }
+                        }
+                        return DirStep::Pending;
+                    }
+                    Poll::Ready(Ok(0)) => {
+                        drop(pooled);
+                        state.phase = DirPhase::ShuttingDown;
+                    }
+                    Poll::Ready(Ok(n)) => {
+                        state.buf = Some(pooled);
+                        state.pos = 0;
+                        state.cap = n;
+                    }
+                    Poll::Ready(Err(_)) => {
+                        drop(pooled);
+                        return DirStep::Err;
+                    }
+                }
+            }
         }
     }
 }
@@ -2235,6 +2612,7 @@ mod tests {
                 pair_timeout: Duration::from_secs(30),
                 max_pending: 16,
                 max_connections: 2,
+                ..RelayConfig::default()
             },
         ));
 
@@ -3078,5 +3456,584 @@ mod tests {
         let _ = task.await;
         assert!(relay.pending.is_empty());
         relay.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn halfclose_grace_terminates_silent_opposite_peer() {
+        let store = Arc::new(MemoryDeviceStore::new());
+        let ephemeral = Arc::new(MemoryEphemeralStore::new());
+        let relay = Arc::new(RelayServer::new(
+            store.clone(),
+            ephemeral.clone(),
+            RelayConfig {
+                halfclose_grace: Duration::from_millis(150),
+                ..RelayConfig::default()
+            },
+        ));
+
+        ephemeral
+            .put_relay_token(
+                "tok-hc-grace",
+                RelayTokenRecord {
+                    session_id: "sess-hc-grace".into(),
+                    host_id: "111000111".into(),
+                    client_id: "222000222".into(),
+                },
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(relay.clone().serve_on_listener(listener));
+
+        let mut host = TcpStream::connect(addr).await.unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        host.write_all(&encode_relay_handshake(ROLE_HOST, "tok-hc-grace").unwrap())
+            .await
+            .unwrap();
+        client
+            .write_all(&encode_relay_handshake(ROLE_CLIENT, "tok-hc-grace").unwrap())
+            .await
+            .unwrap();
+
+        let mut ack = [0u8; 1];
+        host.read_exact(&mut ack).await.unwrap();
+        assert_eq!(ack[0], REPLY_OK);
+        client.read_exact(&mut ack).await.unwrap();
+        assert_eq!(ack[0], REPLY_OK);
+
+        let payload = b"halfclose-payload-delivered-before-grace-expiry";
+        host.write_all(payload).await.unwrap();
+        host.shutdown().await.unwrap();
+
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut received))
+            .await
+            .expect("client must receive full payload and FIN")
+            .unwrap();
+        assert_eq!(received, payload);
+
+        // Client stays open and silent (never sends FIN); halfclose_grace=150ms must terminate session < 1s.
+        let mut host_tail = [0u8; 16];
+        let host_closed = tokio::time::timeout(Duration::from_secs(1), host.read(&mut host_tail))
+            .await
+            .expect("host must observe closure within halfclose_grace (< 1s)");
+        assert!(matches!(host_closed, Ok(0) | Err(_)));
+
+        let drained = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if relay.stats().active_sessions == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "active_sessions must drop to 0 within < 1s after halfclose_grace expiry"
+        );
+        assert_eq!(relay.stats().active_sessions, 0);
+
+        drop(client);
+        relay.shutdown_all().await;
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn copy_buf_pool_returns_buffers_when_idle_and_closed() {
+        let local_pool: &'static CopyBufPool = Box::leak(Box::new(CopyBufPool::new()));
+        assert_eq!(local_pool.live(), 0);
+
+        // Exceed global pool capacity (8 * 32 = 256) and ensure cap & live tracking hold.
+        let mut checked_out = Vec::new();
+        for _ in 0..(COPY_POOL_SHARDS * COPY_POOL_SHARD_CAP + 16) {
+            checked_out.push(local_pool.get());
+        }
+        assert_eq!(
+            local_pool.live(),
+            COPY_POOL_SHARDS * COPY_POOL_SHARD_CAP + 16
+        );
+        drop(checked_out);
+        assert_eq!(local_pool.live(), 0);
+        assert!(local_pool.pooled_count() <= COPY_POOL_SHARDS * COPY_POOL_SHARD_CAP);
+
+        // Active session parked on Pending must hold 0 live buffers, and 0 after close.
+        let (mut a_cli, mut a_srv) = loopback_pair().await;
+        let (mut b_cli, mut b_srv) = loopback_pair().await;
+        let up = Arc::new(AtomicU64::new(0));
+        let down = Arc::new(AtomicU64::new(0));
+        let cancel = CancellationFlag::new();
+        let cancel_task = cancel.clone();
+        let up_task = Arc::clone(&up);
+        let down_task = Arc::clone(&down);
+
+        let pump = tokio::spawn(async move {
+            copy_bidirectional_pooled_with_pool(
+                &mut a_srv,
+                &mut b_srv,
+                up_task,
+                down_task,
+                None,
+                None,
+                cancel_task,
+                DEFAULT_HALFCLOSE_GRACE,
+                local_pool,
+            )
+            .await
+        });
+
+        a_cli.write_all(b"ping-pool-idle").await.unwrap();
+        let mut buf = [0u8; 14];
+        b_cli.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping-pool-idle");
+
+        // Let the pump drain back to Poll::Pending on both directions.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            local_pool.live(),
+            0,
+            "idle active relay session waiting on Pending must hold 0 PooledBufs"
+        );
+
+        cancel.cancel();
+        pump.await.unwrap().unwrap();
+        assert_eq!(
+            local_pool.live(),
+            0,
+            "closed relay session must hold 0 PooledBufs"
+        );
+
+        // Also check global COPY_BUF_POOL settles to 0 when idle.
+        let global_zero = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if copy_pool_live() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(global_zero.is_ok(), "global COPY_BUF_POOL live must be 0");
+    }
+
+    async fn write_vectored_all<W: AsyncWrite + Unpin>(
+        writer: &mut W,
+        mut slices: Vec<&[u8]>,
+    ) -> io::Result<()> {
+        let mut offset = 0usize;
+        let mut idx = 0usize;
+        while idx < slices.len() {
+            let mut io_slices = Vec::with_capacity(slices.len() - idx);
+            io_slices.push(io::IoSlice::new(&slices[idx][offset..]));
+            for s in &slices[idx + 1..] {
+                io_slices.push(io::IoSlice::new(s));
+            }
+            let n = writer.write_vectored(&io_slices).await?;
+            assert!(n > 0);
+            let mut rem = n;
+            while idx < slices.len() && rem > 0 {
+                let avail = slices[idx].len() - offset;
+                if rem >= avail {
+                    rem -= avail;
+                    idx += 1;
+                    offset = 0;
+                } else {
+                    offset += rem;
+                    rem = 0;
+                }
+            }
+        }
+        let _ = &mut slices;
+        writer.flush().await
+    }
+
+    #[tokio::test]
+    async fn relay_stream_write_vectored_forwarding_plain_and_tls() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // 1. Plain RelayStream
+        {
+            let (mut cli, srv) = loopback_pair().await;
+            let expected_vectored = srv.is_write_vectored();
+            let mut relay_plain = RelayStream::Plain(srv);
+            assert_eq!(relay_plain.is_write_vectored(), expected_vectored);
+
+            write_vectored_all(&mut relay_plain, vec![b"plain-", b"vectored-", b"payload"])
+                .await
+                .unwrap();
+            relay_plain.shutdown().await.unwrap();
+
+            let mut got = Vec::new();
+            cli.read_to_end(&mut got).await.unwrap();
+            assert_eq!(got, b"plain-vectored-payload");
+        }
+
+        // 2. TLS RelayStream
+        {
+            let pki = crate::pki::PkiAuthority::generate_ephemeral().unwrap();
+            let server_cert = pki
+                .issue_default_server_tls_cert(Some("127.0.0.1"), &[])
+                .unwrap();
+            let server_tls_cfg = pki.build_server_tls_config(&server_cert, false).unwrap();
+            let acceptor = TlsAcceptor::from(server_tls_cfg);
+
+            let roots = pki.root_cert_store().unwrap();
+            let client_tls_cfg = Arc::new(
+                rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+            );
+            let connector = tokio_rustls::TlsConnector::from(client_tls_cfg);
+
+            let (cli_tcp, srv_tcp) = loopback_pair().await;
+            let server_name =
+                rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
+            let (cli_res, srv_res) = tokio::join!(
+                connector.connect(server_name, cli_tcp),
+                acceptor.accept(srv_tcp)
+            );
+            let mut cli_tls = cli_res.unwrap();
+            let srv_tls = srv_res.unwrap();
+
+            let expected_vectored = srv_tls.is_write_vectored();
+            let mut relay_tls = RelayStream::Tls(Box::new(srv_tls));
+            assert_eq!(relay_tls.is_write_vectored(), expected_vectored);
+
+            write_vectored_all(&mut relay_tls, vec![b"tls-", b"vectored-", b"payload"])
+                .await
+                .unwrap();
+            relay_tls.shutdown().await.unwrap();
+
+            let mut got = Vec::new();
+            cli_tls.read_to_end(&mut got).await.unwrap();
+            assert_eq!(got, b"tls-vectored-payload");
+        }
+    }
+
+    fn make_pattern_bytes(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| seed.wrapping_add((i as u8).wrapping_mul(31)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn full_duplex_simultaneous_transfer_plain_and_mtls() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let up_payload = make_pattern_bytes(512 * 1024, 0x17);
+        let down_payload = make_pattern_bytes(384 * 1024, 0xA3);
+
+        // 1. Plain full-duplex simultaneous transfer (> 256 KiB each direction)
+        {
+            let store = Arc::new(MemoryDeviceStore::new());
+            let ephemeral = Arc::new(MemoryEphemeralStore::new());
+            let relay = Arc::new(RelayServer::new(
+                store.clone(),
+                ephemeral.clone(),
+                RelayConfig::default(),
+            ));
+
+            ephemeral
+                .put_relay_token(
+                    "tok-fd-plain",
+                    RelayTokenRecord {
+                        session_id: "sess-fd-plain".into(),
+                        host_id: "111111111".into(),
+                        client_id: "222222222".into(),
+                    },
+                    Duration::from_secs(30),
+                )
+                .await
+                .unwrap();
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server_task = tokio::spawn(relay.clone().serve_on_listener(listener));
+
+            let mut host = TcpStream::connect(addr).await.unwrap();
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            host.write_all(&encode_relay_handshake(ROLE_HOST, "tok-fd-plain").unwrap())
+                .await
+                .unwrap();
+            client
+                .write_all(&encode_relay_handshake(ROLE_CLIENT, "tok-fd-plain").unwrap())
+                .await
+                .unwrap();
+
+            let mut ack = [0u8; 1];
+            host.read_exact(&mut ack).await.unwrap();
+            assert_eq!(ack[0], REPLY_OK);
+            client.read_exact(&mut ack).await.unwrap();
+            assert_eq!(ack[0], REPLY_OK);
+
+            let (mut h_r, mut h_w) = tokio::io::split(host);
+            let (mut c_r, mut c_w) = tokio::io::split(client);
+
+            let mut got_up = Vec::with_capacity(up_payload.len());
+            let mut got_down = Vec::with_capacity(down_payload.len());
+
+            let (hw, hr, cw, cr) = tokio::join!(
+                async {
+                    h_w.write_all(&up_payload).await?;
+                    h_w.shutdown().await
+                },
+                h_r.read_to_end(&mut got_down),
+                async {
+                    c_w.write_all(&down_payload).await?;
+                    c_w.shutdown().await
+                },
+                c_r.read_to_end(&mut got_up),
+            );
+            hw.unwrap();
+            hr.unwrap();
+            cw.unwrap();
+            cr.unwrap();
+
+            assert_eq!(got_up, up_payload);
+            assert_eq!(got_down, down_payload);
+
+            for _ in 0..100 {
+                if relay.stats().active_sessions == 0 && !store.relay_logs().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let stats = relay.stats();
+            assert_eq!(stats.active_sessions, 0);
+            assert_eq!(stats.total_bytes_up, up_payload.len() as u64);
+            assert_eq!(stats.total_bytes_down, down_payload.len() as u64);
+
+            let logs = store.relay_logs();
+            assert_eq!(logs.len(), 1);
+            assert_eq!(logs[0].bytes_up, up_payload.len() as u64);
+            assert_eq!(logs[0].bytes_down, down_payload.len() as u64);
+
+            relay.shutdown_all().await;
+            let _ = server_task.await;
+        }
+
+        // 2. mTLS full-duplex simultaneous transfer (> 256 KiB each direction)
+        {
+            use crate::store::{
+                CreateUserInput, DeviceCertRecord, PkiStore, RegisterInput, UserStore,
+            };
+
+            let store = Arc::new(MemoryDeviceStore::new());
+            let ephemeral = Arc::new(MemoryEphemeralStore::new());
+            let pki = crate::pki::PkiAuthority::generate_ephemeral().unwrap();
+            let server_cert = pki
+                .issue_default_server_tls_cert(Some("127.0.0.1"), &[])
+                .unwrap();
+            let relay_mtls = pki.build_server_tls_config(&server_cert, true).unwrap();
+
+            let user = store
+                .create_user(CreateUserInput {
+                    email: "relay-mtls@rc.local".into(),
+                    display_name: "Relay mTLS Test".into(),
+                    password_hash: "not-used-in-mtls-test".into(),
+                    role: "user".into(),
+                    status: STATUS_ACTIVE.into(),
+                    must_change_password: false,
+                })
+                .await
+                .unwrap();
+            let user_id = user.id;
+
+            let host_dev = store
+                .register_or_get(RegisterInput {
+                    device_key: "host-mtls-key".into(),
+                    hostname: "host-mtls".into(),
+                    os: "macos".into(),
+                    device_group: "test".into(),
+                })
+                .await
+                .unwrap();
+            store
+                .bind_device_to_user(&host_dev.device_id, user_id, None, None)
+                .await
+                .unwrap();
+
+            let client_dev = store
+                .register_or_get(RegisterInput {
+                    device_key: "client-mtls-key".into(),
+                    hostname: "client-mtls".into(),
+                    os: "macos".into(),
+                    device_group: "test".into(),
+                })
+                .await
+                .unwrap();
+            store
+                .bind_device_to_user(&client_dev.device_id, user_id, None, None)
+                .await
+                .unwrap();
+            let issue_client_cfg = |device_id: &str| {
+                let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+                let mut params = rcgen::CertificateParams::default();
+                params
+                    .distinguished_name
+                    .push(rcgen::DnType::CommonName, "rc-device");
+                let csr = params.serialize_request(&kp).unwrap();
+                let issued = pki
+                    .issue_device_cert(csr.pem().unwrap().as_bytes(), user_id, device_id)
+                    .unwrap();
+
+                let mut ca_reader = std::io::BufReader::new(issued.ca_cert_pem.as_bytes());
+                let ca_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+                    rustls_pemfile::certs(&mut ca_reader)
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap();
+                let mut roots = rustls::RootCertStore::empty();
+                for c in ca_certs {
+                    roots.add(c).unwrap();
+                }
+
+                let mut leaf_reader = std::io::BufReader::new(issued.cert_pem.as_bytes());
+                let leaf_chain: Vec<rustls::pki_types::CertificateDer<'static>> =
+                    rustls_pemfile::certs(&mut leaf_reader)
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap();
+                let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(kp.serialize_der()),
+                );
+                let client_cfg = Arc::new(
+                    rustls::ClientConfig::builder_with_provider(Arc::new(
+                        rustls::crypto::ring::default_provider(),
+                    ))
+                    .with_protocol_versions(&[&rustls::version::TLS13])
+                    .unwrap()
+                    .with_root_certificates(roots)
+                    .with_client_auth_cert(leaf_chain, key)
+                    .unwrap(),
+                );
+                let cert_record = DeviceCertRecord {
+                    serial_hex: issued.serial_hex,
+                    user_id,
+                    device_id: device_id.to_string(),
+                    fingerprint_sha256: issued.fingerprint_sha256,
+                    cert_pem: issued.cert_pem,
+                    issued_at: issued.issued_at,
+                    expires_at: issued.expires_at,
+                    revoked_at: None,
+                    revoke_reason: None,
+                };
+                (client_cfg, cert_record)
+            };
+
+            let (host_tls_cfg, host_rec) = issue_client_cfg(&host_dev.device_id);
+            let (client_tls_cfg, client_rec) = issue_client_cfg(&client_dev.device_id);
+            store.insert_device_cert(host_rec).await.unwrap();
+            store.insert_device_cert(client_rec).await.unwrap();
+
+            ephemeral
+                .put_relay_token(
+                    "tok-fd-mtls",
+                    RelayTokenRecord {
+                        session_id: "sess-fd-mtls".into(),
+                        host_id: host_dev.device_id.clone(),
+                        client_id: client_dev.device_id.clone(),
+                    },
+                    Duration::from_secs(30),
+                )
+                .await
+                .unwrap();
+
+            let relay = Arc::new(RelayServer::new(
+                store.clone(),
+                ephemeral.clone(),
+                RelayConfig::default(),
+            ));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server_task = tokio::spawn(relay.clone().serve_tls_on_listener(
+                listener,
+                relay_mtls,
+                store.clone(),
+            ));
+
+            let server_name =
+                rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
+            let host_tcp = TcpStream::connect(addr).await.unwrap();
+            let client_tcp = TcpStream::connect(addr).await.unwrap();
+            let mut host = tokio_rustls::TlsConnector::from(host_tls_cfg)
+                .connect(server_name.clone(), host_tcp)
+                .await
+                .unwrap();
+            let mut client = tokio_rustls::TlsConnector::from(client_tls_cfg)
+                .connect(server_name, client_tcp)
+                .await
+                .unwrap();
+
+            host.write_all(&encode_relay_handshake(ROLE_HOST, "tok-fd-mtls").unwrap())
+                .await
+                .unwrap();
+            host.flush().await.unwrap();
+            client
+                .write_all(&encode_relay_handshake(ROLE_CLIENT, "tok-fd-mtls").unwrap())
+                .await
+                .unwrap();
+            client.flush().await.unwrap();
+
+            let mut ack = [0u8; 1];
+            host.read_exact(&mut ack).await.unwrap();
+            assert_eq!(ack[0], REPLY_OK);
+            client.read_exact(&mut ack).await.unwrap();
+            assert_eq!(ack[0], REPLY_OK);
+
+            let (mut h_r, mut h_w) = tokio::io::split(host);
+            let (mut c_r, mut c_w) = tokio::io::split(client);
+
+            let mut got_up = Vec::with_capacity(up_payload.len());
+            let mut got_down = Vec::with_capacity(down_payload.len());
+
+            let (hw, hr, cw, cr) = tokio::join!(
+                async {
+                    h_w.write_all(&up_payload).await?;
+                    h_w.flush().await?;
+                    h_w.shutdown().await
+                },
+                h_r.read_to_end(&mut got_down),
+                async {
+                    c_w.write_all(&down_payload).await?;
+                    c_w.flush().await?;
+                    c_w.shutdown().await
+                },
+                c_r.read_to_end(&mut got_up),
+            );
+            hw.unwrap();
+            hr.unwrap();
+            cw.unwrap();
+            cr.unwrap();
+
+            assert_eq!(got_up, up_payload);
+            assert_eq!(got_down, down_payload);
+
+            for _ in 0..100 {
+                if relay.stats().active_sessions == 0 && !store.relay_logs().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let stats = relay.stats();
+            assert_eq!(stats.active_sessions, 0);
+            assert_eq!(stats.total_bytes_up, up_payload.len() as u64);
+            assert_eq!(stats.total_bytes_down, down_payload.len() as u64);
+
+            let logs = store.relay_logs();
+            assert_eq!(logs.len(), 1);
+            assert_eq!(logs[0].bytes_up, up_payload.len() as u64);
+            assert_eq!(logs[0].bytes_down, down_payload.len() as u64);
+
+            relay.shutdown_all().await;
+            let _ = server_task.await;
+        }
     }
 }

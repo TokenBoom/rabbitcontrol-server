@@ -13,6 +13,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::unix::AsyncFd;
 use tokio::net::TcpStream;
@@ -279,10 +280,31 @@ async fn pump_one_direction(
     }
 }
 
+async fn finish_other_direction(
+    other: &mut AbortOnDropHandle<()>,
+    sa: &SpliceSock,
+    sb: &SpliceSock,
+    cancel: &CancellationFlag,
+    halfclose_grace: Duration,
+) {
+    if cancel.is_cancelled() || halfclose_grace.is_zero() {
+        let _ = (&mut other.0).await;
+        return;
+    }
+    if tokio::time::timeout(halfclose_grace, &mut other.0)
+        .await
+        .is_err()
+    {
+        cancel.cancel();
+        teardown(sa, sb);
+    }
+}
+
 /// Forward data bidirectionally between `a` and `b` using Linux `splice(2)` zero-copy pipes.
 ///
 /// Returns `Err` only if setup (`dup`, `pipe2`, or `AsyncFd` registration) fails, leaving
 /// `a` and `b` untouched so the caller can fall back cleanly to userspace copy.
+#[allow(clippy::too_many_arguments)]
 pub async fn splice_bidirectional(
     a: &TcpStream,
     b: &TcpStream,
@@ -291,6 +313,7 @@ pub async fn splice_bidirectional(
     total_a_to_b: Arc<AtomicU64>,
     total_b_to_a: Arc<AtomicU64>,
     cancel: CancellationFlag,
+    halfclose_grace: Duration,
 ) -> io::Result<()> {
     let sa = Arc::new(SpliceSock::dup(a)?);
     let sb = Arc::new(SpliceSock::dup(b)?);
@@ -321,7 +344,7 @@ pub async fn splice_bidirectional(
                 teardown(&sa, &sb);
                 return Ok(());
             }
-            let _ = (&mut g2.0).await;
+            finish_other_direction(&mut g2, &sa, &sb, &cancel, halfclose_grace).await;
         }
         r2 = &mut g2.0 => {
             if r2.is_err() {
@@ -329,7 +352,7 @@ pub async fn splice_bidirectional(
                 teardown(&sa, &sb);
                 return Ok(());
             }
-            let _ = (&mut g1.0).await;
+            finish_other_direction(&mut g1, &sa, &sb, &cancel, halfclose_grace).await;
         }
     }
 
