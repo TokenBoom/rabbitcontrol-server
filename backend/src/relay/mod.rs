@@ -788,7 +788,7 @@ impl RelayServer {
 
     /// Bind a TCP listener on `addr` and serve `RCR1` relay connections.
     pub async fn serve(self: Arc<Self>, addr: SocketAddr) -> io::Result<()> {
-        let listener = TcpListener::bind(addr).await?;
+        let listener = crate::bind_tcp_listener(addr, crate::DEFAULT_TCP_LISTEN_BACKLOG)?;
         info!(%addr, engine = Self::engine_name(), "TCP relay listener started");
         self.serve_on_listener(listener).await
     }

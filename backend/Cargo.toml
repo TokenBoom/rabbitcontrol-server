@@ -1,6 +1,6 @@
 [package]
 name = "rc-server"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "RabbitControl Rust Rendezvous, Zero-Copy TCP Relay, and Admin API Server"
 
@@ -8,7 +8,7 @@ description = "RabbitControl Rust Rendezvous, Zero-Copy TCP Relay, and Admin API
 [workspace]
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }

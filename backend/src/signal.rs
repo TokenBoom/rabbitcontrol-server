@@ -1318,7 +1318,7 @@ impl SignalHub {
 
     /// Bind a TCP listener on `addr` and serve native TCP framed signaling (NO WebSocket).
     pub async fn serve_tcp_signaling(self: Arc<Self>, addr: SocketAddr) -> std::io::Result<()> {
-        let listener = TcpListener::bind(addr).await?;
+        let listener = crate::bind_tcp_listener(addr, crate::DEFAULT_TCP_LISTEN_BACKLOG)?;
         info!(%addr, "native TCP framed signaling listener started");
         self.serve_tcp_signaling_on_listener(listener).await
     }

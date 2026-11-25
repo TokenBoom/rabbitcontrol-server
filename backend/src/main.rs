@@ -9,7 +9,7 @@ use chrono::Utc;
 use clap::Parser;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
@@ -24,6 +24,7 @@ use rc_server::pki::PkiAuthority;
 use rc_server::relay::{RelayConfig, RelayServer};
 use rc_server::signal::{SignalConfig, SignalHub};
 use rc_server::store::{AuthStore, DeviceStore, PgDeviceStore, PkiStore};
+use rc_server::{bind_tcp_listener, DEFAULT_TCP_LISTEN_BACKLOG};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -273,13 +274,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 5. Bind all network sockets upfront so address conflicts fail fast.
-    let signal_listener = TcpListener::bind(args.signal).await?;
+    let signal_listener = bind_tcp_listener(args.signal, DEFAULT_TCP_LISTEN_BACKLOG)?;
     let signal_local = signal_listener.local_addr()?;
     let udp_socket = Arc::new(UdpSocket::bind(signal_local).await?);
     let udp_local = udp_socket.local_addr()?;
-    let relay_listener = TcpListener::bind(args.relay).await?;
+    let relay_listener = bind_tcp_listener(args.relay, DEFAULT_TCP_LISTEN_BACKLOG)?;
     let relay_local = relay_listener.local_addr()?;
-    let http_listener = TcpListener::bind(args.http).await?;
+    let http_listener = bind_tcp_listener(args.http, DEFAULT_TCP_LISTEN_BACKLOG)?;
     let http_local = http_listener.local_addr()?;
 
     let advertised_signal = format_advertised_addr(args.public_host.as_deref(), signal_local);
