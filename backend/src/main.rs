@@ -46,6 +46,10 @@ struct Args {
     #[arg(long, env = "RC_HTTP_ADDR", value_name = "ADDR")]
     http: Option<String>,
 
+    /// Optional separate plain-HTTP listen address for Admin Web UI & Admin REST API (intended behind a TLS reverse proxy, e.g. 127.0.0.1:21119)
+    #[arg(long = "web-addr", env = "RC_WEB_ADDR", value_name = "ADDR")]
+    web_addr: Option<String>,
+
     /// Native TLS 1.3 TCP framed signaling + UDP STUN-lite probe listen address [default: 0.0.0.0:21116]
     #[arg(long, env = "RC_SIGNAL_ADDR", value_name = "ADDR")]
     signal: Option<String>,
@@ -96,7 +100,7 @@ struct Args {
     #[arg(long = "cors-origin", env = "RC_CORS_ORIGIN", value_delimiter = ',')]
     cors_origin: Vec<String>,
 
-    /// TCP listen backlog for HTTP, signaling, and relay sockets [default: 4096]
+    /// TCP listen backlog for HTTP, optional Web Admin, signaling, and relay sockets [default: 4096]
     #[arg(long, env = "RC_LISTEN_BACKLOG", value_name = "BACKLOG")]
     listen_backlog: Option<String>,
 }
@@ -104,6 +108,7 @@ struct Args {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedConfig {
     http: SocketAddr,
+    web_addr: Option<SocketAddr>,
     signal: SocketAddr,
     relay: SocketAddr,
     database_url: String,
@@ -153,6 +158,18 @@ fn parse_socket_addr_or_default(
         .map_err(|err| format!("invalid socket address '{val}' for {name}: {err}"))
 }
 
+fn parse_optional_socket_addr(
+    raw: Option<String>,
+    name: &str,
+) -> Result<Option<SocketAddr>, String> {
+    let Some(val) = trim_non_empty(raw) else {
+        return Ok(None);
+    };
+    val.parse::<SocketAddr>()
+        .map(Some)
+        .map_err(|err| format!("invalid socket address '{val}' for {name}: {err}"))
+}
+
 fn parse_optional_bool(raw: Option<String>, name: &str) -> Result<bool, String> {
     let Some(val) = trim_non_empty(raw) else {
         return Ok(false);
@@ -185,11 +202,19 @@ fn resolve_log_filter(env_lookup: impl Fn(&str) -> Option<String>) -> String {
         .unwrap_or_else(|| DEFAULT_LOG_FILTER.to_string())
 }
 
+fn addrs_conflict(a: SocketAddr, b: SocketAddr) -> bool {
+    a.port() != 0
+        && a.port() == b.port()
+        && a.is_ipv4() == b.is_ipv4()
+        && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
+}
+
 fn resolve_config(
     args: Args,
     env_lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<ResolvedConfig, String> {
     let http = parse_socket_addr_or_default(args.http, DEFAULT_HTTP_ADDR, "--http / RC_HTTP_ADDR")?;
+    let web_addr = parse_optional_socket_addr(args.web_addr, "--web-addr / RC_WEB_ADDR")?;
     let signal = parse_socket_addr_or_default(
         args.signal,
         DEFAULT_SIGNAL_ADDR,
@@ -197,6 +222,15 @@ fn resolve_config(
     )?;
     let relay =
         parse_socket_addr_or_default(args.relay, DEFAULT_RELAY_ADDR, "--relay / RC_RELAY_ADDR")?;
+
+    if let Some(addr) = web_addr {
+        if addrs_conflict(addr, http) || addrs_conflict(addr, signal) || addrs_conflict(addr, relay)
+        {
+            return Err(format!(
+                "--web-addr / RC_WEB_ADDR ({addr}) must not conflict with --http ({http}), --signal ({signal}), or --relay ({relay})"
+            ));
+        }
+    }
 
     let database_url = trim_non_empty(args.database_url)
         .or_else(|| trim_non_empty(env_lookup("RC_DATABASE_URL")))
@@ -218,6 +252,7 @@ fn resolve_config(
 
     Ok(ResolvedConfig {
         http,
+        web_addr,
         signal,
         relay,
         database_url,
@@ -419,6 +454,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let relay_local = relay_listener.local_addr()?;
     let http_listener = bind_tcp_listener(cfg.http, cfg.listen_backlog)?;
     let http_local = http_listener.local_addr()?;
+    let web_listener = match cfg.web_addr {
+        Some(web_bind) => Some(bind_tcp_listener(web_bind, cfg.listen_backlog)?),
+        None => None,
+    };
+    let web_local = web_listener
+        .as_ref()
+        .map(|listener| listener.local_addr())
+        .transpose()?;
+
+    if web_listener.is_some() && web_dir.is_none() {
+        warn!("--web-addr / RC_WEB_ADDR is set without a valid --web-dir; only Admin REST APIs will be served on the web listener");
+    }
 
     let advertised_signal = format_advertised_addr(cfg.public_host.as_deref(), signal_local);
     let advertised_udp = format_advertised_addr(cfg.public_host.as_deref(), udp_local);
@@ -464,11 +511,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth_rate_limiter: Arc::new(AuthRateLimiter::default()),
         allow_unauthenticated_legacy_admin: false,
     };
-    let app = api::router(app_state);
+    let (http_app, web_app) = if web_listener.is_some() {
+        (
+            api::router_with_mode(app_state.clone(), api::RouterMode::ClientApiOnly),
+            Some(api::router_with_mode(
+                app_state,
+                api::RouterMode::WebAdminOnly,
+            )),
+        )
+    } else {
+        (api::router(app_state), None)
+    };
 
     info!(
         http_addr = %http_local,
         https_enabled = tls_enabled,
+        web_http_addr = ?web_local,
+        split_web_admin = web_local.is_some(),
         signal_tls_addr = %signal_local,
         udp_probe_addr = %udp_local,
         relay_mtls_addr = %relay_local,
@@ -547,7 +606,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "http_api",
                     axum::serve(
                         http_listener,
-                        app.into_make_service_with_connect_info::<SocketAddr>(),
+                        http_app.into_make_service_with_connect_info::<SocketAddr>(),
                     )
                     .with_graceful_shutdown(wait_for_watch_shutdown(http_shutdown))
                     .await,
@@ -557,10 +616,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             listeners.spawn(async move {
                 (
                     "https_api",
-                    api::serve_https(http_listener, https_tls_config, app, http_shutdown).await,
+                    api::serve_https(http_listener, https_tls_config, http_app, http_shutdown)
+                        .await,
                 )
             });
         }
+    }
+
+    if let (Some(web_listener), Some(web_app)) = (web_listener, web_app) {
+        let web_shutdown = shutdown_rx.clone();
+        listeners.spawn(async move {
+            (
+                "web_http",
+                axum::serve(
+                    web_listener,
+                    web_app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(wait_for_watch_shutdown(web_shutdown))
+                .await,
+            )
+        });
     }
 
     let mut fatal_error: Option<String> = None;
@@ -665,6 +740,7 @@ mod tests {
     fn empty_args() -> Args {
         Args {
             http: None,
+            web_addr: None,
             signal: None,
             relay: None,
             database_url: None,
@@ -688,6 +764,7 @@ mod tests {
     fn resolve_config_handles_empty_env_defaults_and_fallbacks() {
         let mut args = empty_args();
         args.http = Some("  ".into());
+        args.web_addr = Some("  ".into());
         args.signal = Some(String::new());
         args.relay = Some("".into());
         args.database_url = Some("   ".into());
@@ -711,6 +788,7 @@ mod tests {
 
         let cfg = resolve_config(args, lookup_from(&env)).unwrap();
         assert_eq!(cfg.http, DEFAULT_HTTP_ADDR.parse().unwrap());
+        assert_eq!(cfg.web_addr, None);
         assert_eq!(cfg.signal, DEFAULT_SIGNAL_ADDR.parse().unwrap());
         assert_eq!(cfg.relay, DEFAULT_RELAY_ADDR.parse().unwrap());
         assert_eq!(
@@ -795,6 +873,50 @@ mod tests {
         args.database_url = Some("postgres://u:p@127.0.0.1/rc".into());
         args.listen_backlog = Some("0".into());
         assert!(resolve_config(args, lookup_from(&env)).is_err());
+
+        // Invalid web_addr
+        let mut args = empty_args();
+        args.database_url = Some("postgres://u:p@127.0.0.1/rc".into());
+        args.web_addr = Some("not-an-addr".into());
+        assert!(resolve_config(args, lookup_from(&env)).is_err());
+
+        // web_addr conflicting with http / signal / relay (exact or wildcard/loopback same port)
+        for conflict in [
+            "0.0.0.0:21118",
+            "127.0.0.1:21118",
+            "0.0.0.0:21116",
+            "127.0.0.1:21116",
+            "0.0.0.0:21117",
+        ] {
+            let mut args = empty_args();
+            args.database_url = Some("postgres://u:p@127.0.0.1/rc".into());
+            args.web_addr = Some(conflict.into());
+            let err = resolve_config(args, lookup_from(&env)).unwrap_err();
+            assert!(err.contains("--web-addr / RC_WEB_ADDR"), "{err}");
+        }
+
+        // IPv6 wildcard [::]:21118 conflicts with [::1]:21118
+        let mut args = empty_args();
+        args.database_url = Some("postgres://u:p@127.0.0.1/rc".into());
+        args.http = Some("[::]:21118".into());
+        args.web_addr = Some("[::1]:21118".into());
+        let err = resolve_config(args, lookup_from(&env)).unwrap_err();
+        assert!(err.contains("--web-addr / RC_WEB_ADDR"), "{err}");
+    }
+
+    #[test]
+    fn resolve_config_parses_valid_web_addr() {
+        let env = HashMap::new();
+        let parsed = Args::try_parse_from([
+            "rc-server",
+            "--database-url",
+            "postgres://cli:p@db/rc",
+            "--web-addr",
+            "127.0.0.1:21119",
+        ])
+        .unwrap();
+        let cfg = resolve_config(parsed, lookup_from(&env)).unwrap();
+        assert_eq!(cfg.web_addr, Some("127.0.0.1:21119".parse().unwrap()));
     }
 
     #[test]

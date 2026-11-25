@@ -1109,30 +1109,47 @@ pub struct DisableDeviceResponse {
     pub kicked_sessions: usize,
 }
 
+/// Controls which subset of REST APIs and static Web UI routes are mounted on a listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouterMode {
+    /// Serve all client API, admin API, and optional static Web UI on a single listener.
+    Combined,
+    /// Serve only client-facing REST APIs (no admin endpoints, no static Web UI).
+    ClientApiOnly,
+    /// Serve only the Admin Web UI static bundle and admin/auth APIs required by it.
+    WebAdminOnly,
+}
+
 /// Build the Axum 0.8 REST API router (plus optional SPA static hosting).
 pub fn router(state: AppState) -> Router {
+    router_with_mode(state, RouterMode::Combined)
+}
+
+/// Build the Axum 0.8 REST API router for a specific [`RouterMode`].
+pub fn router_with_mode(state: AppState, mode: RouterMode) -> Router {
     let cors_layer = build_cors_layer(&state.cors_origins).unwrap_or_else(|err| {
         warn!(error = %err, "invalid CORS configuration; falling back to same-origin only");
         build_cors_layer(&[]).expect("empty CORS allowlist is always valid")
     });
 
-    let register_route = Router::new()
-        .route("/api/v1/devices/register", post(post_register_device))
-        .layer(DefaultBodyLimit::max(MAX_REGISTER_BODY_BYTES));
+    let common_public = Router::new()
+        .route("/api/v1/health", get(get_health))
+        .route("/api/v1/pki/ca", get(get_pki_ca));
 
-    let auth_public_routes = Router::new()
-        .route("/api/v1/auth/config", get(get_auth_config))
-        .route("/api/v1/auth/register", post(post_auth_register))
+    let shared_auth_routes = Router::new()
         .route("/api/v1/auth/login", post(post_auth_login))
         .route("/api/v1/auth/refresh", post(post_auth_refresh))
         .route("/api/v1/auth/logout", post(post_auth_logout))
         .layer(DefaultBodyLimit::max(MAX_AUTH_BODY_BYTES));
 
-    let public_routes = Router::new()
-        .route("/api/v1/health", get(get_health))
-        .route("/api/v1/pki/ca", get(get_pki_ca))
-        .merge(register_route)
-        .merge(auth_public_routes);
+    let client_auth_routes = Router::new()
+        .route("/api/v1/auth/config", get(get_auth_config))
+        .route("/api/v1/auth/register", post(post_auth_register))
+        .layer(DefaultBodyLimit::max(MAX_AUTH_BODY_BYTES));
+
+    let register_route = Router::new()
+        .route("/api/v1/devices/register", post(post_register_device))
+        .layer(DefaultBodyLimit::max(MAX_REGISTER_BODY_BYTES));
 
     let restricted_user_routes = Router::new()
         .route("/api/v1/me", get(get_me))
@@ -1183,16 +1200,43 @@ pub fn router(state: AppState) -> Router {
 
     let api_fallback = Router::new().route("/api/{*rest}", axum::routing::any(api_not_found));
 
-    let mut app = public_routes
-        .merge(restricted_user_routes)
-        .merge(full_user_routes)
-        .merge(admin_routes)
-        .merge(api_fallback);
+    let mut app = common_public
+        .merge(shared_auth_routes)
+        .merge(restricted_user_routes);
 
-    if let Some(ref web_dir) = state.web_dir {
-        let index_file = web_dir.join("index.html");
-        let serve_dir = ServeDir::new(web_dir).fallback(ServeFile::new(index_file));
-        app = app.fallback_service(serve_dir);
+    match mode {
+        RouterMode::Combined => {
+            app = app
+                .merge(client_auth_routes)
+                .merge(register_route)
+                .merge(full_user_routes)
+                .merge(admin_routes);
+        }
+        RouterMode::ClientApiOnly => {
+            app = app
+                .merge(client_auth_routes)
+                .merge(register_route)
+                .merge(full_user_routes);
+        }
+        RouterMode::WebAdminOnly => {
+            app = app
+                .merge(admin_routes)
+                // Override `/api/v1/devices/{id}` (DELETE) so `/api/v1/devices/register` yields JSON 404 instead of empty 405.
+                .route(
+                    "/api/v1/devices/register",
+                    axum::routing::any(api_not_found),
+                );
+        }
+    }
+
+    app = app.merge(api_fallback);
+
+    if matches!(mode, RouterMode::Combined | RouterMode::WebAdminOnly) {
+        if let Some(ref web_dir) = state.web_dir {
+            let index_file = web_dir.join("index.html");
+            let serve_dir = ServeDir::new(web_dir).fallback(ServeFile::new(index_file));
+            app = app.fallback_service(serve_dir);
+        }
     }
 
     app.layer(cors_layer)

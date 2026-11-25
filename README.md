@@ -39,10 +39,11 @@ rabbitcontrol-server/
 |---|---|---|---|
 | `DATABASE_URL` / `RC_DATABASE_URL` | `--database-url` | 必填 | PostgreSQL 连接串（优先 `DATABASE_URL`） |
 | `REDIS_URL` / `RC_REDIS_URL` | `--redis-url` | 空（内存回退） | 可选 Redis 连接串（启用分布式缓存与吊销同步） |
-| `RC_HTTP_ADDR` | `--http` | `0.0.0.0:21118` | Admin/Auth/PKI REST API 与 Web UI 监听地址 |
+| `RC_HTTP_ADDR` | `--http` | `0.0.0.0:21118` | Admin/Auth/PKI REST API 与 Web UI 监听地址（设置 `RC_WEB_ADDR` 时仅保留客户端 API） |
+| `RC_WEB_ADDR` | `--web-addr` | 空（合设于 `:21118`） | 可选独立明文 HTTP 监听地址（如 `127.0.0.1:21119` 或容器内 `0.0.0.0:21119`），专供 Nginx TLS 反代托管管理后台与 Admin API |
 | `RC_SIGNAL_ADDR` | `--signal` | `0.0.0.0:21116` | TLS 1.3 信令与 UDP 探测监听地址 |
 | `RC_RELAY_ADDR` | `--relay` | `0.0.0.0:21117` | 强制 TLS 1.3 mTLS 中继监听地址 |
-| `RC_LISTEN_BACKLOG` | `--listen-backlog` | `4096` | 三个 TCP 监听器的内核全连接队列上限（需 `>= 1`） |
+| `RC_LISTEN_BACKLOG` | `--listen-backlog` | `4096` | 所有 TCP 监听器的内核全连接队列上限（需 `>= 1`） |
 | `RC_PUBLIC_HOST` | `--public-host` | 自动回退 | 下发给客户端的公网主机名或 IP（并写入服务端 TLS 证书 SAN） |
 | `RC_TLS_SAN` | `--tls-san` | 空 | 额外证书 SAN（逗号分隔 DNS 或 IP） |
 | `RC_PLAIN_HTTP` | `--plain-http` | `false` | 仅当置于 TLS 反向代理之后时设为 `true`（支持 `true/false/1/0/yes/no/on/off`） |
@@ -69,12 +70,41 @@ docker run -d --name rc-server \
   -p 21116:21116/tcp -p 21116:21116/udp -p 21117:21117/tcp -p 21118:21118/tcp \
   -e DATABASE_URL="postgres://user:pass@pg-host:5432/rabbitcontrol" \
   -e RC_PUBLIC_HOST="your-server-ip-or-domain" \
-  <dockerhub-user>/rabbitcontrol-server:v0.1.2
+  <dockerhub-user>/rabbitcontrol-server:v0.1.3
 ```
+
+## 公网部署与 Nginx 反代管理后台（推荐拆分端口）
+
+若需在公网以正规 HTTPS 域名访问 Web 管理后台，同时保持 `:21118`（桌面客户端内置 Root CA 自动 TOFU 锚定）、`:21116`（TLS 1.3 信令 + UDP 探测）与 `:21117`（强制 mTLS 中继）正常服务：
+
+1. 在 `.env` 中保持 `RC_PLAIN_HTTP=false`，设置 `RC_PUBLIC_HOST=rc.example.com` 与 `RC_WEB_ADDR=0.0.0.0:21119`（二进制直跑可设 `127.0.0.1:21119`）；
+2. 在 `docker-compose.yml` 仅向宿主机回环映射 `127.0.0.1:21119:21119/tcp`；
+3. 此时 `:21118` 仅提供客户端 API（无静态网页与 Admin 接口），`:21119` 以纯明文 HTTP 专供 Nginx `:443` 反代托管管理后台与 Admin API：
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name admin.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/admin.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/admin.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:21119;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+> **安全提醒**：经 Nginx 反代后，`rc-server` 在 `:21119` 看到的源 IP 恒为 `127.0.0.1`。建议在 Nginx `:443` 的 `/api/v1/auth/` 或整站配置 `limit_req` 限流（或对管理后台域名做源 IP 白名单），避免公网爆破把本地回环限流桶打满。
 
 ## 自动发布（Tag → Docker Hub & GitHub Release）
 
-推送 `v*` 标签（例如 `git tag -a v0.1.2 -m "Release v0.1.2" && git push origin v0.1.2`）会触发 [.github/workflows/docker-release.yml](.github/workflows/docker-release.yml)：
+推送 `v*` 标签（例如 `git tag -a v0.1.3 -m "Release v0.1.3" && git push origin v0.1.3`）会触发 [.github/workflows/docker-release.yml](.github/workflows/docker-release.yml)：
 
 - 使用组织/仓库 Secrets `DOCKERHUB_USERNAME` 与 `DOCKERHUB_TOKEN` 登录 Docker Hub；
 - 在原生 runner 上并行构建 `linux/amd64` 与 `linux/arm64` 多阶段镜像并推送 digest；

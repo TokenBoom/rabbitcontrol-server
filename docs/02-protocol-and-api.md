@@ -21,7 +21,8 @@ This document defines the exact wire protocols, storage contracts, and HTTP REST
 | Native TCP Signaling | `:21116` | TCP (`TCP_NODELAY=true`, TLS 1.3 default; `--no-tls` opt-out) | Framed JSON signaling (**NO WebSocket**): device/owner registration (`access_token`, `device_pubkey`), `UpdateAssistState`, `DeviceStatusChanged`, P2P punch coordination & `OwnerGrantTicket` issuance, relay token allocation, device/user kick |
 | UDP STUN-lite Probe | `:21116` | UDP | Public `IP:Port` discovery and NAT mapping refresh |
 | mTLS TCP Relay | `:21117` | TCP (`TCP_NODELAY=true`, mandatory TLS 1.3 mTLS) | Mutual-TLS authenticated full-duplex relay with `RCR1` header & SAN (`urn:rabbitcontrol:user:{uid}:device:{did}`) binding + serial revocation check |
-| Axum 0.8 REST API / Admin Web | `:21118` | HTTP/1.1 (TLS-capable via `rc-server`) | Health check, Root CA fetch, Auth/Refresh/ChangePassword/Logout, CSR device cert issue, My Devices bind/rename/unbind, Admin user CRUD/settings/sessions/stats + Admin Web UI |
+| Axum 0.8 REST API / Admin Web | `:21118` | HTTP/1.1 (TLS-capable via `rc-server`) | Health check, Root CA fetch, Auth/Refresh/ChangePassword/Logout, CSR device cert issue, My Devices bind/rename/unbind, plus Admin routes & Admin Web UI unless `--web-addr` / `RC_WEB_ADDR` is set |
+| Split Admin Web UI / Admin REST API (optional) | `--web-addr` / `RC_WEB_ADDR` | Plain HTTP/1.1 (reverse proxy only) | When configured, serves `RC_WEB_DIR` SPA static bundle + `/api/v1/health`, `/api/v1/pki/ca`, `/api/v1/auth/{login,refresh,logout,change-password}`, `/api/v1/me`, and all admin endpoints (`/api/v1/admin/*`, `/api/v1/stats`, `/api/v1/devices*`, `/api/v1/sessions*`); `:21118` drops admin routes & SPA hosting (`ClientApiOnly`) |
 
 ---
 
@@ -410,7 +411,9 @@ Note: `total` equals `devices.len()` (page length), while `total_count` is the t
 - On first startup with no admin user, `rc-server` creates the initial admin with a randomly generated password printed to server logs and sets `must_change_password = true`.
 - Until `POST /api/v1/auth/change-password` succeeds, `require_user_auth_allow_pwd_change` only permits `/api/v1/me`, `/api/v1/auth/logout`, and `/api/v1/auth/change-password`, while `require_user_auth_full` and `require_admin_auth` fail closed with `403` (`password_change_required`).
 
-### 7.2 REST Auth, Device Binding, PKI & Admin Routes (`:21118`)
+### 7.2 REST Auth, Device Binding, PKI & Admin Routes (`:21118` / optional `--web-addr`)
+- **Single-port (`RC_WEB_ADDR` unset, `RouterMode::Combined`)**: All routes below plus optional `RC_WEB_DIR` SPA static hosting are served on `:21118`.
+- **Split-port (`--web-addr` / `RC_WEB_ADDR` set)**: `:21118` switches to `RouterMode::ClientApiOnly` (retaining only public client routes, restricted user routes, and full user routes; admin routes and SPA static files return `404`), while `--web-addr` serves plain-HTTP `RouterMode::WebAdminOnly` (`RC_WEB_DIR` SPA static files + `/api/v1/health`, `/api/v1/pki/ca`, `/api/v1/auth/{login,refresh,logout,change-password}`, `/api/v1/me`, and all Admin routes).
 - **Public**: `GET /api/v1/health`, `GET /api/v1/pki/ca`, `POST /api/v1/devices/register`, `GET /api/v1/auth/config`, `POST /api/v1/auth/register` (gated by `allow_registration`), `POST /api/v1/auth/login`, `POST /api/v1/auth/refresh`.
 - **Restricted User (allowed before password change)**: `GET /api/v1/me`, `POST /api/v1/auth/logout` (accepts Bearer token or `refresh_token` fallback with explicit `device_id` ownership pre-check via `verify_explicit_device_owner`), `POST /api/v1/auth/change-password` (revokes other sessions and kicks signaling/relay peers).
 - **Full User**: `GET /api/v1/me/devices`, `POST /api/v1/me/devices/bind` (atomic ownership transfer via `bind_device_to_user_with_prev`), `PATCH / DELETE /api/v1/me/devices/{id}`, `POST /api/v1/certs/issue` (CSR verification -> 7-day device cert with URI SAN `urn:rabbitcontrol:user:{user_id}:device:{device_id}`).

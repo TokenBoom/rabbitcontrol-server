@@ -203,19 +203,16 @@ impl SecureTestCluster {
     }
 }
 
-async fn https_json(
-    addr: SocketAddr,
-    tls_cfg: &Arc<ClientConfig>,
+async fn send_http_request<S>(
+    stream: &mut S,
     method: &str,
     path: &str,
     bearer: Option<&str>,
     body: Option<&Value>,
-) -> (u16, String) {
-    let tcp = TcpStream::connect(addr).await.unwrap();
-    let connector = TlsConnector::from(Arc::clone(tls_cfg));
-    let server_name = ServerName::try_from("localhost").unwrap();
-    let mut tls = connector.connect(server_name, tcp).await.unwrap();
-
+) -> (u16, String)
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
     let payload = body.map(|b| serde_json::to_vec(b).unwrap());
     let mut req = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAccept: application/json\r\n"
@@ -229,14 +226,14 @@ async fn https_json(
     }
     req.push_str("\r\n");
 
-    tls.write_all(req.as_bytes()).await.unwrap();
+    stream.write_all(req.as_bytes()).await.unwrap();
     if let Some(ref bytes) = payload {
-        tls.write_all(bytes).await.unwrap();
+        stream.write_all(bytes).await.unwrap();
     }
-    tls.flush().await.unwrap();
+    stream.flush().await.unwrap();
 
     let mut raw = Vec::new();
-    let _ = tls.read_to_end(&mut raw).await;
+    let _ = stream.read_to_end(&mut raw).await;
 
     let header_end = raw
         .windows(4)
@@ -265,6 +262,32 @@ async fn https_json(
     };
 
     (status, String::from_utf8(decoded).unwrap())
+}
+
+async fn https_json(
+    addr: SocketAddr,
+    tls_cfg: &Arc<ClientConfig>,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    body: Option<&Value>,
+) -> (u16, String) {
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let connector = TlsConnector::from(Arc::clone(tls_cfg));
+    let server_name = ServerName::try_from("localhost").unwrap();
+    let mut tls = connector.connect(server_name, tcp).await.unwrap();
+    send_http_request(&mut tls, method, path, bearer, body).await
+}
+
+async fn http_plain(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    body: Option<&Value>,
+) -> (u16, String) {
+    let mut tcp = TcpStream::connect(addr).await.unwrap();
+    send_http_request(&mut tcp, method, path, bearer, body).await
 }
 
 fn decode_chunked(mut input: &[u8]) -> Vec<u8> {
@@ -1699,4 +1722,349 @@ async fn logout_ownership_refresh_fallback_and_admin_disable_device_revokes_sess
     );
 
     cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn split_web_admin_and_client_api_ports_isolate_routes_and_static_ui() {
+    ensure_crypto_provider();
+
+    let store = Arc::new(MemoryDeviceStore::new());
+    let ephemeral = Arc::new(MemoryEphemeralStore::new());
+    let auth_authority = Arc::new(AuthAuthority::load_or_create(&*store).await.unwrap());
+    let pki_authority = Arc::new(PkiAuthority::load_or_create(&*store).await.unwrap());
+    let server_cert = pki_authority
+        .issue_default_server_tls_cert(Some("127.0.0.1"), &[])
+        .unwrap();
+    let https_tls = pki_authority
+        .build_server_tls_config(&server_cert, false)
+        .unwrap();
+
+    let temp_web_dir = std::env::temp_dir().join(format!(
+        "rc-server-split-web-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&temp_web_dir).unwrap();
+    let marker_html = "<!doctype html><html><body>RC_SPLIT_ADMIN_SPA_OK</body></html>";
+    std::fs::write(temp_web_dir.join("index.html"), marker_html).unwrap();
+
+    let signal_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let signal_addr = signal_listener.local_addr().unwrap();
+    let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = relay_listener.local_addr().unwrap();
+    let client_https_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_https_addr = client_https_listener.local_addr().unwrap();
+    let web_http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let web_http_addr = web_http_listener.local_addr().unwrap();
+
+    let settings_cache = Arc::new(SettingsCache::new(store.clone(), ephemeral.clone()));
+    let hub = Arc::new(SignalHub::with_auth(
+        store.clone(),
+        ephemeral.clone(),
+        auth_authority.clone(),
+        SignalConfig {
+            public_udp_probe_addr: signal_addr.to_string(),
+            public_relay_addr: relay_addr.to_string(),
+            require_auth: true,
+            ..SignalConfig::default()
+        },
+    ));
+    let relay = Arc::new(RelayServer::new(
+        store.clone(),
+        ephemeral.clone(),
+        RelayConfig::default(),
+    ));
+
+    let app_state = AppState {
+        device_store: store.clone(),
+        auth_store: store.clone(),
+        ephemeral: ephemeral.clone(),
+        auth_authority: auth_authority.clone(),
+        pki_authority: pki_authority.clone(),
+        settings_cache,
+        signal_hub: hub.clone(),
+        relay_server: relay.clone(),
+        endpoints: AdvertisedEndpoints {
+            signal_tcp_addr: signal_addr.to_string(),
+            udp_probe_addr: signal_addr.to_string(),
+            tcp_relay_addr: relay_addr.to_string(),
+        },
+        started_at: Instant::now(),
+        admin_token: None,
+        cors_origins: Vec::new(),
+        tls_enabled: true,
+        web_dir: Some(temp_web_dir.clone()),
+        auth_rate_limiter: Arc::new(AuthRateLimiter::default()),
+        allow_unauthenticated_legacy_admin: false,
+    };
+
+    let client_app = api::router_with_mode(app_state.clone(), api::RouterMode::ClientApiOnly);
+    let web_app = api::router_with_mode(app_state, api::RouterMode::WebAdminOnly);
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let https_task = tokio::spawn({
+        let rx = shutdown_rx.clone();
+        async move {
+            let _ = api::serve_https(client_https_listener, https_tls, client_app, rx).await;
+        }
+    });
+    let web_task = tokio::spawn({
+        let mut rx = shutdown_rx.clone();
+        async move {
+            let _ = axum::serve(
+                web_http_listener,
+                web_app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                while !*rx.borrow_and_update() {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+        }
+    });
+
+    let roots = pki_authority.root_cert_store().unwrap();
+    let client_tls = Arc::new(
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+
+    // Bootstrap initial admin and login on WebAdminOnly plain HTTP port.
+    let creds = ensure_initial_admin(&*store, Some("admin@split.test"))
+        .await
+        .unwrap()
+        .unwrap();
+    let (status, body) = http_plain(
+        web_http_addr,
+        "POST",
+        "/api/v1/auth/login",
+        None,
+        Some(&serde_json::json!({ "email": creds.email, "password": creds.password })),
+    )
+    .await;
+    assert_eq!(status, 200, "admin login on web port: {body}");
+    let init_login: AuthTokenResponse = serde_json::from_str(&body).unwrap();
+
+    let (status, body) = http_plain(
+        web_http_addr,
+        "POST",
+        "/api/v1/auth/change-password",
+        Some(&init_login.access_token),
+        Some(&serde_json::json!({
+            "current_password": creds.password,
+            "new_password": "AdminSplitPassword!123",
+        })),
+    )
+    .await;
+    assert_eq!(status, 200, "admin change-password on web port: {body}");
+    let admin: RefreshTokenResponse = serde_json::from_str(&body).unwrap();
+
+    // 1. WebAdminOnly port assertions: SPA static & admin APIs work; client-only APIs return 404.
+    let (status, body) = http_plain(web_http_addr, "GET", "/", None, None).await;
+    assert_eq!(status, 200);
+    assert!(body.contains("RC_SPLIT_ADMIN_SPA_OK"), "{body}");
+
+    let (status, body) = http_plain(web_http_addr, "GET", "/settings", None, None).await;
+    assert_eq!(status, 200);
+    assert!(body.contains("RC_SPLIT_ADMIN_SPA_OK"), "{body}");
+
+    let (status, body) = http_plain(web_http_addr, "GET", "/api/v1/health", None, None).await;
+    assert_eq!(status, 200);
+    let health: HealthResponse = serde_json::from_str(&body).unwrap();
+    assert!(health.tls_enabled);
+
+    let (status, _) = http_plain(web_http_addr, "GET", "/api/v1/pki/ca", None, None).await;
+    assert_eq!(status, 200);
+
+    let (status, _) = http_plain(
+        web_http_addr,
+        "GET",
+        "/api/v1/me",
+        Some(&admin.access_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let (status, body) = http_plain(
+        web_http_addr,
+        "POST",
+        "/api/v1/auth/refresh",
+        None,
+        Some(&serde_json::json!({ "refresh_token": admin.refresh_token })),
+    )
+    .await;
+    assert_eq!(status, 200, "refresh on web port: {body}");
+    let admin_refreshed: RefreshTokenResponse = serde_json::from_str(&body).unwrap();
+
+    for admin_path in [
+        "/api/v1/admin/settings",
+        "/api/v1/admin/users",
+        "/api/v1/stats",
+        "/api/v1/devices",
+        "/api/v1/sessions",
+    ] {
+        let (status, resp) = http_plain(
+            web_http_addr,
+            "GET",
+            admin_path,
+            Some(&admin_refreshed.access_token),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "expected 200 for {admin_path} on web port: {resp}"
+        );
+    }
+
+    let (status, _) = http_plain(
+        web_http_addr,
+        "PATCH",
+        "/api/v1/admin/settings",
+        Some(&admin_refreshed.access_token),
+        Some(&serde_json::json!({ "allow_registration": true })),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    for (method, client_only_path) in [
+        ("GET", "/api/v1/auth/config"),
+        ("POST", "/api/v1/auth/register"),
+        ("POST", "/api/v1/devices/register"),
+        ("GET", "/api/v1/me/devices"),
+        ("POST", "/api/v1/certs/issue"),
+    ] {
+        let (status, resp) = http_plain(
+            web_http_addr,
+            method,
+            client_only_path,
+            Some(&admin_refreshed.access_token),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "expected 404 for {method} {client_only_path} on web port: {resp}"
+        );
+        let err: ErrorBody = serde_json::from_str(&resp).unwrap();
+        assert_eq!(err.error, "not_found");
+    }
+
+    // 2. ClientApiOnly HTTPS port assertions: client APIs work; static UI & admin APIs return 404.
+    let (status, body) = https_json(
+        client_https_addr,
+        &client_tls,
+        "GET",
+        "/api/v1/health",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let health: HealthResponse = serde_json::from_str(&body).unwrap();
+    assert!(health.tls_enabled);
+
+    let (status, _) = https_json(
+        client_https_addr,
+        &client_tls,
+        "GET",
+        "/api/v1/pki/ca",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let (status, body) = https_json(
+        client_https_addr,
+        &client_tls,
+        "GET",
+        "/api/v1/auth/config",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let auth_cfg: AuthConfigResponse = serde_json::from_str(&body).unwrap();
+    assert!(auth_cfg.allow_registration);
+
+    let (status, body) = https_json(
+        client_https_addr,
+        &client_tls,
+        "POST",
+        "/api/v1/auth/register",
+        None,
+        Some(&serde_json::json!({
+            "email": "client@split.test",
+            "password": "ClientPassword!123",
+            "display_name": "Split Client",
+        })),
+    )
+    .await;
+    assert_eq!(status, 200, "client register on client port: {body}");
+    let client_user: AuthTokenResponse = serde_json::from_str(&body).unwrap();
+
+    let (status, _) = https_json(
+        client_https_addr,
+        &client_tls,
+        "GET",
+        "/api/v1/me",
+        Some(&client_user.access_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let (status, _) = https_json(
+        client_https_addr,
+        &client_tls,
+        "GET",
+        "/api/v1/me/devices",
+        Some(&client_user.access_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    // Static SPA is NOT served on ClientApiOnly port.
+    let (status, _) = https_json(client_https_addr, &client_tls, "GET", "/", None, None).await;
+    assert_eq!(status, 404);
+
+    // Admin routes are NOT mounted on ClientApiOnly port (even with valid admin token).
+    for admin_path in [
+        "/api/v1/admin/settings",
+        "/api/v1/admin/users",
+        "/api/v1/stats",
+        "/api/v1/devices",
+        "/api/v1/sessions",
+    ] {
+        let (status, resp) = https_json(
+            client_https_addr,
+            &client_tls,
+            "GET",
+            admin_path,
+            Some(&admin_refreshed.access_token),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "expected 404 for {admin_path} on client port: {resp}"
+        );
+        let err: ErrorBody = serde_json::from_str(&resp).unwrap();
+        assert_eq!(err.error, "not_found");
+    }
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), https_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), web_task).await;
+    drop(signal_listener);
+    drop(relay_listener);
+    let _ = std::fs::remove_dir_all(&temp_web_dir);
 }

@@ -39,10 +39,13 @@ services:
       - "21116:21116/udp"
       - "21117:21117/tcp"
       - "21118:21118/tcp"
+      # Enable with RC_WEB_ADDR=0.0.0.0:21119 to expose Admin Web UI & Admin API only to localhost Nginx reverse proxy:
+      # - "127.0.0.1:21119:21119/tcp"
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-rabbitcontrol}:${POSTGRES_PASSWORD:-change-me-strong-password}@postgres:5432/${POSTGRES_DB:-rabbitcontrol}}
       REDIS_URL: ${REDIS_URL:-}
       RC_HTTP_ADDR: ${RC_HTTP_ADDR:-0.0.0.0:21118}
+      RC_WEB_ADDR: ${RC_WEB_ADDR:-}
       RC_SIGNAL_ADDR: ${RC_SIGNAL_ADDR:-0.0.0.0:21116}
       RC_RELAY_ADDR: ${RC_RELAY_ADDR:-0.0.0.0:21117}
       RC_LISTEN_BACKLOG: ${RC_LISTEN_BACKLOG:-4096}
