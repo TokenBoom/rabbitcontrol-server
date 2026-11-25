@@ -1,0 +1,60 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rabbitcontrol}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-strong-password}
+      POSTGRES_DB: ${POSTGRES_DB:-rabbitcontrol}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rabbitcontrol} -d ${POSTGRES_DB:-rabbitcontrol}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    profiles: ["redis"]
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rc-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${RC_IMAGE:-rabbitcontrol-server:latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "21116:21116/tcp"
+      - "21116:21116/udp"
+      - "21117:21117/tcp"
+      - "21118:21118/tcp"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-rabbitcontrol}:${POSTGRES_PASSWORD:-change-me-strong-password}@postgres:5432/${POSTGRES_DB:-rabbitcontrol}}
+      REDIS_URL: ${REDIS_URL:-}
+      RC_HTTP_ADDR: ${RC_HTTP_ADDR:-0.0.0.0:21118}
+      RC_SIGNAL_ADDR: ${RC_SIGNAL_ADDR:-0.0.0.0:21116}
+      RC_RELAY_ADDR: ${RC_RELAY_ADDR:-0.0.0.0:21117}
+      RC_LISTEN_BACKLOG: ${RC_LISTEN_BACKLOG:-4096}
+      RC_PUBLIC_HOST: ${RC_PUBLIC_HOST:-}
+      RC_TLS_SAN: ${RC_TLS_SAN:-}
+      RC_PLAIN_HTTP: ${RC_PLAIN_HTTP:-false}
+      RC_WEB_DIR: ${RC_WEB_DIR:-/app/web}
+      RC_INIT_ADMIN_EMAIL: ${RC_INIT_ADMIN_EMAIL:-}
+      RC_ADMIN_TOKEN: ${RC_ADMIN_TOKEN:-}
+      RC_CORS_ORIGIN: ${RC_CORS_ORIGIN:-}
+      RUST_LOG: ${RUST_LOG:-info,rc_server=info,tower_http=info}
+      RC_LOG: ${RC_LOG:-}
+
+volumes:
+  pgdata:

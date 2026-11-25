@@ -1,0 +1,12 @@
+.git
+.github
+docs
+backend/target
+web/node_modules
+web/dist
+web/*.tsbuildinfo
+.env
+.env.*
+*.log
+.DS_Store
+docker-compose*.yml
