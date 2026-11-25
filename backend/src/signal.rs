@@ -10,6 +10,7 @@ use dashmap::DashMap;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use socket2::{SockRef, TcpKeepalive};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -54,6 +55,29 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 const UDP_EPHEMERAL_UPDATE_TIMEOUT: Duration = Duration::from_millis(200);
 const UDP_EPHEMERAL_QUEUE_CAPACITY: usize = 1_024;
 const MAX_RATE_LIMIT_TRACKED_KEYS: usize = 16_384;
+const SIGNAL_TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(30);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const SIGNAL_TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const SIGNAL_TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+fn tune_signal_socket(stream: &TcpStream, peer_addr: SocketAddr) {
+    let sock = SockRef::from(stream);
+    if let Err(err) = sock.set_tcp_nodelay(true) {
+        debug!(%peer_addr, error = %err, "failed to set TCP_NODELAY on signaling socket");
+    }
+    if let Err(err) = sock.set_keepalive(true) {
+        debug!(%peer_addr, error = %err, "failed to set SO_KEEPALIVE on signaling socket");
+    }
+    let keepalive = TcpKeepalive::new().with_time(SIGNAL_TCP_KEEPALIVE_TIME);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let keepalive = keepalive
+        .with_interval(SIGNAL_TCP_KEEPALIVE_INTERVAL)
+        .with_retries(SIGNAL_TCP_KEEPALIVE_RETRIES);
+    if let Err(err) = sock.set_tcp_keepalive(&keepalive) {
+        debug!(%peer_addr, error = %err, "failed to configure TCP keepalive on signaling socket");
+    }
+}
 
 /// Canonicalize IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) to native `IpAddr::V4`.
 pub fn canonical_ip(ip: IpAddr) -> IpAddr {
@@ -688,6 +712,10 @@ impl PeerCancel {
         self.tx.borrow().is_some()
     }
 
+    fn kick_reason(&self) -> Option<String> {
+        self.tx.borrow().clone()
+    }
+
     fn subscribe(&self) -> watch::Receiver<Option<String>> {
         self.tx.subscribe()
     }
@@ -1287,9 +1315,7 @@ impl SignalHub {
             let tls_acceptor = tls_acceptor.clone();
             tokio::spawn(async move {
                 let _task_guard = task_guard;
-                if let Err(err) = stream.set_nodelay(true) {
-                    debug!(%peer_addr, error = %err, "failed to set TCP_NODELAY on signaling socket");
-                }
+                tune_signal_socket(&stream, peer_addr);
                 if let Some(acceptor) = tls_acceptor {
                     let tls_res = tokio::select! {
                         biased;
@@ -1329,9 +1355,7 @@ impl SignalHub {
         remote_addr: SocketAddr,
     ) {
         let _task_guard = SignalTaskGuard::enter(Arc::clone(&self));
-        if let Err(err) = stream.set_nodelay(true) {
-            debug!(%remote_addr, error = %err, "failed to set TCP_NODELAY on signaling socket");
-        }
+        tune_signal_socket(&stream, remote_addr);
         self.handle_stream_connection_inner(stream, remote_addr, None)
             .await;
     }
@@ -1866,6 +1890,15 @@ impl SignalHub {
             )
         };
 
+        let connected_instant = Instant::now();
+        info!(
+            %device_id,
+            %remote_addr,
+            conn_id,
+            owner_user_id = ?peer_owner,
+            "signaling peer registered"
+        );
+
         self.broadcast_user_device_status(DeviceStatusBroadcast {
             owner_user_id: peer_owner,
             device_id: &device_id,
@@ -1957,20 +1990,32 @@ impl SignalHub {
         // Reader loop processes incoming framed messages until disconnect, kick, shutdown, or idle timeout.
         let mut reader_cancel_rx = cancel.subscribe();
         let mut abort_writer_immediately = false;
+        let disconnect_reason: String;
         loop {
-            if cancel.is_kicked() || self.shutdown.is_cancelled() {
+            if cancel.is_kicked() {
+                disconnect_reason = cancel
+                    .kick_reason()
+                    .map(|r| format!("kicked:{r}"))
+                    .unwrap_or_else(|| "kicked".to_string());
+                break;
+            }
+            if self.shutdown.is_cancelled() {
+                disconnect_reason = "server_shutdown".to_string();
                 break;
             }
             let next = tokio::select! {
                 biased;
-                _ = wait_kicked(&mut reader_cancel_rx) => {
+                reason = wait_kicked(&mut reader_cancel_rx) => {
+                    disconnect_reason = format!("kicked:{reason}");
                     break;
                 }
                 _ = self.shutdown.cancelled() => {
+                    disconnect_reason = "server_shutdown".to_string();
                     cancel.kick("server_shutdown");
                     break;
                 }
                 _ = &mut writer_done_rx => {
+                    disconnect_reason = "writer_closed".to_string();
                     break;
                 }
                 res = tokio::time::timeout(
@@ -1982,13 +2027,21 @@ impl SignalHub {
             match next {
                 Ok(Ok(Some(msg))) => {
                     if !self.is_active_conn(&device_id, conn_id, &cancel) {
+                        disconnect_reason = cancel
+                            .kick_reason()
+                            .map(|r| format!("kicked:{r}"))
+                            .unwrap_or_else(|| "replaced".to_string());
                         break;
                     }
                     self.handle_peer_message(&device_id, conn_id, &cancel, &tx, msg)
                         .await;
                 }
-                Ok(Ok(None)) => break,
+                Ok(Ok(None)) => {
+                    disconnect_reason = "eof".to_string();
+                    break;
+                }
                 Ok(Err(err)) => {
+                    disconnect_reason = format!("read_error:{err}");
                     debug!(%device_id, %remote_addr, error = %err, "signaling read error");
                     let _ = tx.try_send(SignalMsg::Error {
                         code: "invalid_frame".into(),
@@ -1997,6 +2050,7 @@ impl SignalHub {
                     break;
                 }
                 Err(_) => {
+                    disconnect_reason = "read_idle_timeout".to_string();
                     debug!(%device_id, %remote_addr, "signaling peer idle timeout");
                     abort_writer_immediately = true;
                     break;
@@ -2019,6 +2073,15 @@ impl SignalHub {
             }
             removed
         };
+
+        info!(
+            %device_id,
+            %remote_addr,
+            conn_id,
+            reason = %disconnect_reason,
+            connected_secs = connected_instant.elapsed().as_secs(),
+            "signaling peer disconnected"
+        );
 
         if let Some(peer) = removed_peer {
             self.broadcast_user_device_status(DeviceStatusBroadcast {

@@ -24,8 +24,28 @@ use super::CancellationFlag;
 const PIPE_SIZE: libc::c_int = 256 * 1024;
 const DRAIN_SLICE: usize = 256 * 1024;
 const NOTSENT_LOWAT: u32 = 1024 * 1024;
+pub(super) const MTLS_NOTSENT_LOWAT: u32 = 256 * 1024;
 const BATCH_BYTES: usize = 4 * 1024 * 1024;
 const BATCH_OPS: u32 = 64;
+
+pub(super) fn set_tcp_notsent_lowat(stream: &TcpStream, bytes: u32) -> io::Result<()> {
+    // SAFETY: `stream.as_raw_fd()` is a valid open TCP socket descriptor borrowed for this call,
+    // and `&bytes` points to an initialized `u32` whose byte size matches `size_of::<u32>()`.
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_NOTSENT_LOWAT,
+            (&bytes as *const u32).cast::<libc::c_void>(),
+            std::mem::size_of::<u32>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
 
 struct Pipe {
     r: OwnedFd,

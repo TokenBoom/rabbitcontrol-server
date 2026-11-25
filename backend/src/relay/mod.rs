@@ -46,15 +46,15 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 4096;
 
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 #[cfg(not(target_os = "linux"))]
-const SOCKET_BUF_SIZE: usize = 256 * 1024;
+const SOCKET_BUF_SIZE: usize = 512 * 1024;
 const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(30);
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
-const COPY_BUF_SIZE: usize = 32 * 1024;
+const COPY_BUF_SIZE: usize = 64 * 1024;
 const COPY_POOL_SHARDS: usize = 8;
-const COPY_POOL_SHARD_CAP: usize = 32;
+const COPY_POOL_SHARD_CAP: usize = 16;
 const _: () = assert!(COPY_POOL_SHARDS * COPY_POOL_SHARD_CAP * COPY_BUF_SIZE == 8 * 1024 * 1024);
 const USERSPACE_YIELD_BYTES: usize = 4 * 1024 * 1024;
 
@@ -1531,8 +1531,20 @@ fn tune_socket(stream: &TcpStream, peer_addr: SocketAddr) {
     if let Err(err) = sock.set_tcp_keepalive(&keepalive) {
         debug!(%peer_addr, error = %err, "failed to configure TCP keepalive parameters");
     }
-    // On Linux, skip fixed SO_RCVBUF/SO_SNDBUF so kernel TCP autotuning stays enabled and
-    // TCP_NOTSENT_LOWAT=1MiB in splice.rs is not capped by a fixed 256 KiB send buffer.
+    // On Linux, skip fixed SO_RCVBUF/SO_SNDBUF so kernel TCP autotuning stays enabled, and set
+    // TCP_NOTSENT_LOWAT=256KiB so mandatory mTLS userspace copy does not accumulate multi-MiB
+    // unsent video queues inside the kernel socket buffer.
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(err) = splice::set_tcp_notsent_lowat(stream, splice::MTLS_NOTSENT_LOWAT) {
+            debug!(
+                %peer_addr,
+                lowat = splice::MTLS_NOTSENT_LOWAT,
+                error = %err,
+                "failed to set TCP_NOTSENT_LOWAT on relay socket"
+            );
+        }
+    }
     #[cfg(not(target_os = "linux"))]
     {
         if let Err(err) = sock.set_recv_buffer_size(SOCKET_BUF_SIZE) {
