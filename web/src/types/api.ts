@@ -106,6 +106,8 @@ export interface DeviceView {
   owner_email?: string | null;
   owner_user_id?: string | null;
   alias?: string;
+  allow_remote_assist?: boolean;
+  allow_remote_control?: boolean;
   created_at: string;
   last_seen_at: string;
 }

@@ -19,8 +19,8 @@ use tokio_rustls::TlsConnector;
 use rc_server::api::{
     self, AdminSettingsResponse, AdminUserMutationResponse, AdminUsersResponse,
     AdvertisedEndpoints, AppState, AuthConfigResponse, AuthRateLimiter, AuthTokenResponse,
-    DevicesResponse, ErrorBody, HealthResponse, IssueCertResponse, PkiCaResponse,
-    RefreshTokenResponse,
+    DeviceBindingResponse, DevicesResponse, ErrorBody, HealthResponse, IssueCertResponse,
+    MyDevicesResponse, PkiCaResponse, RefreshTokenResponse,
 };
 use rc_server::auth::{
     ensure_initial_admin, hash_token_sha256_hex, verify_owner_grant_with_pubkey, AuthAuthority,
@@ -484,6 +484,7 @@ async fn initial_admin_must_change_password_gate_and_settings_toggle() {
             access_token: Some(login_res.access_token.clone()),
             device_pubkey: None,
             allow_remote_assist: None,
+            allow_remote_control: None,
         },
     )
     .await
@@ -845,6 +846,7 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             access_token: Some(user_a.access_token.clone()),
             device_pubkey: Some("aa".repeat(32)),
             allow_remote_assist: Some(false),
+            allow_remote_control: None,
         },
     )
     .await
@@ -870,6 +872,7 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             access_token: Some(user_a.access_token.clone()),
             device_pubkey: Some(caller_pk_hex.clone()),
             allow_remote_assist: Some(false),
+            allow_remote_control: None,
         },
     )
     .await
@@ -907,6 +910,7 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             access_token: Some(user_b.access_token.clone()),
             device_pubkey: Some("cc".repeat(32)),
             allow_remote_assist: Some(false),
+            allow_remote_control: None,
         },
     )
     .await
@@ -1195,7 +1199,8 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
     write_signal_frame(
         &mut host_sig,
         &SignalMsg::UpdateAssistState {
-            allow_remote_assist: true,
+            allow_remote_assist: Some(true),
+            allow_remote_control: None,
         },
     )
     .await
@@ -1377,6 +1382,7 @@ async fn admin_disable_and_delete_user_kicks_signal_relay_and_protects_last_admi
             access_token: Some(charlie_login.access_token.clone()),
             device_pubkey: None,
             allow_remote_assist: None,
+            allow_remote_control: None,
         },
     )
     .await
@@ -2077,4 +2083,515 @@ async fn split_web_admin_and_client_api_ports_isolate_routes_and_static_ui() {
     drop(signal_listener);
     drop(relay_listener);
     let _ = std::fs::remove_dir_all(&temp_web_dir);
+}
+
+#[tokio::test]
+async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_rest_patch() {
+    let cluster = SecureTestCluster::start_fresh().await;
+
+    // 1. Register User A (owns desktop controller + Android phone) and User B (stranger).
+    let (status, body) = https_json(
+        cluster.http_addr,
+        &cluster.client_tls_no_cert,
+        "POST",
+        "/api/v1/auth/register",
+        None,
+        Some(&serde_json::json!({
+            "email": "mobile-owner@example.com",
+            "password": "OwnerPassword!2026",
+            "display_name": "Mobile Owner",
+        })),
+    )
+    .await;
+    assert_eq!(status, 200, "register user A: {body}");
+    let user_a: AuthTokenResponse = serde_json::from_str(&body).unwrap();
+
+    let (status, body) = https_json(
+        cluster.http_addr,
+        &cluster.client_tls_no_cert,
+        "POST",
+        "/api/v1/auth/register",
+        None,
+        Some(&serde_json::json!({
+            "email": "mobile-stranger@example.com",
+            "password": "StrangerPassword!2026",
+            "display_name": "Stranger",
+        })),
+    )
+    .await;
+    assert_eq!(status, 200, "register user B: {body}");
+    let user_b: AuthTokenResponse = serde_json::from_str(&body).unwrap();
+
+    // Also bootstrap an active admin to verify GET /api/v1/devices exposes allow_remote_control.
+    let creds = ensure_initial_admin(&*cluster.store, Some("rc-policy-admin@rc.local"))
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, body) = https_json(
+        cluster.http_addr,
+        &cluster.client_tls_no_cert,
+        "POST",
+        "/api/v1/auth/login",
+        None,
+        Some(&serde_json::json!({
+            "email": "rc-policy-admin@rc.local",
+            "password": creds.password,
+        })),
+    )
+    .await;
+    let init_admin: AuthTokenResponse = serde_json::from_str(&body).unwrap();
+    let (_, body) = https_json(
+        cluster.http_addr,
+        &cluster.client_tls_no_cert,
+        "POST",
+        "/api/v1/auth/change-password",
+        Some(&init_admin.access_token),
+        Some(&serde_json::json!({
+            "current_password": creds.password,
+            "new_password": "AdminStrongPassword!2026",
+        })),
+    )
+    .await;
+    let admin: RefreshTokenResponse = serde_json::from_str(&body).unwrap();
+
+    // 2. Register desktop controller (macOS) via legacy raw JSON without `allow_remote_control`
+    // -> defaults to allow_remote_control = true.
+    let controller_pk_hex = "11".repeat(32);
+    let mut desktop_sig =
+        connect_tls_signal(cluster.signal_addr, &cluster.client_tls_no_cert).await;
+    let legacy_desktop_payload = serde_json::json!({
+        "type": "register",
+        "device_key": "dk-desktop-mac-rc",
+        "hostname": "MacBook-Controller",
+        "os": "macos",
+        "access_token": user_a.access_token,
+        "device_pubkey": controller_pk_hex,
+        "allow_remote_assist": false
+    })
+    .to_string()
+    .into_bytes();
+    desktop_sig
+        .write_all(&(legacy_desktop_payload.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    desktop_sig
+        .write_all(&legacy_desktop_payload)
+        .await
+        .unwrap();
+    desktop_sig.flush().await.unwrap();
+    let desktop_id = match read_signal_frame(&mut desktop_sig).await.unwrap().unwrap() {
+        SignalMsg::Registered { device_id, .. } => device_id,
+        other => panic!("expected Registered for desktop, got {other:?}"),
+    };
+    let desktop_rec = cluster.store.get_by_id(&desktop_id).await.unwrap().unwrap();
+    assert!(
+        desktop_rec.allow_remote_control,
+        "desktop device must default allow_remote_control = true"
+    );
+    assert!(!desktop_rec.allow_remote_assist);
+
+    // 3. Register Android host WITHOUT explicit `allow_remote_control` (simulating legacy/default client)
+    // -> defaults to allow_remote_control = false!
+    let mut android_sig =
+        connect_tls_signal(cluster.signal_addr, &cluster.client_tls_no_cert).await;
+    write_signal_frame(
+        &mut android_sig,
+        &SignalMsg::Register {
+            device_id: None,
+            device_key: "dk-android-phone-rc".into(),
+            hostname: "Pixel-9-Pro".into(),
+            os: "Android 15".into(),
+            app_version: "0.1.12".into(),
+            arch: "arm64".into(),
+            device_group: "mobile".into(),
+            lan_addrs: vec!["192.168.1.55:50000".into()],
+            access_token: Some(user_a.access_token.clone()),
+            device_pubkey: Some("22".repeat(32)),
+            allow_remote_assist: Some(false),
+            allow_remote_control: None,
+        },
+    )
+    .await
+    .unwrap();
+    let android_id = match read_signal_frame(&mut android_sig).await.unwrap().unwrap() {
+        SignalMsg::Registered { device_id, .. } => device_id,
+        other => panic!("expected Registered for android, got {other:?}"),
+    };
+    let android_rec = cluster.store.get_by_id(&android_id).await.unwrap().unwrap();
+    assert!(
+        !android_rec.allow_remote_control,
+        "Android device must default allow_remote_control = false"
+    );
+
+    // Same-account desktop must receive DeviceStatusChanged with allow_remote_control = false.
+    let online_evt = read_signal_frame(&mut desktop_sig).await.unwrap().unwrap();
+    assert!(matches!(
+        online_evt,
+        SignalMsg::DeviceStatusChanged {
+            ref device_id,
+            online: true,
+            allow_remote_assist: false,
+            allow_remote_control: false,
+            ..
+        } if device_id == &android_id
+    ));
+
+    // Register User B's stranger device.
+    let mut stranger_sig =
+        connect_tls_signal(cluster.signal_addr, &cluster.client_tls_no_cert).await;
+    write_signal_frame(
+        &mut stranger_sig,
+        &SignalMsg::Register {
+            device_id: None,
+            device_key: "dk-stranger-rc".into(),
+            hostname: "Stranger-PC".into(),
+            os: "windows".into(),
+            app_version: String::new(),
+            arch: String::new(),
+            device_group: String::new(),
+            lan_addrs: vec![],
+            access_token: Some(user_b.access_token.clone()),
+            device_pubkey: Some("33".repeat(32)),
+            allow_remote_assist: Some(false),
+            allow_remote_control: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_signal_frame(&mut stranger_sig).await.unwrap().unwrap(),
+        SignalMsg::Registered { .. }
+    ));
+
+    // 4. While Android has allow_remote_control == false:
+    //    4a. Same-account ConnectRequest MUST be rejected with remote_control_disabled
+    //        and MUST NOT push punch_coord to Android or allocate any relay token!
+    write_signal_frame(
+        &mut desktop_sig,
+        &SignalMsg::ConnectRequest {
+            target_id: android_id.clone(),
+            session_id: Some("sess-android-blocked-punch".into()),
+            lan_addrs: vec![],
+            nonce: Some("n1".into()),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_signal_frame(&mut desktop_sig).await.unwrap().unwrap(),
+        SignalMsg::Error { ref code, .. } if code == "remote_control_disabled"
+    ));
+    assert_eq!(
+        cluster.ephemeral.active_token_count(),
+        0,
+        "rejected ConnectRequest must not allocate any relay token"
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(80),
+            read_signal_frame(&mut android_sig)
+        )
+        .await
+        .is_err(),
+        "Android host must not receive punch_coord when allow_remote_control == false"
+    );
+
+    //    4b. Same-account RelayAlloc MUST ALSO be rejected with remote_control_disabled
+    //        and MUST NOT push relay_ready or allocate any relay token!
+    write_signal_frame(
+        &mut desktop_sig,
+        &SignalMsg::RelayAlloc {
+            target_id: android_id.clone(),
+            session_id: Some("sess-android-blocked-relay".into()),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_signal_frame(&mut desktop_sig).await.unwrap().unwrap(),
+        SignalMsg::Error { ref code, .. } if code == "remote_control_disabled"
+    ));
+    assert_eq!(
+        cluster.ephemeral.active_token_count(),
+        0,
+        "rejected RelayAlloc must not allocate any relay token"
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(80),
+            read_signal_frame(&mut android_sig)
+        )
+        .await
+        .is_err(),
+        "Android host must not receive relay_ready when allow_remote_control == false"
+    );
+
+    //    4c. Legacy UpdateAssistState without allow_remote_control field keeps allow_remote_control == false!
+    let legacy_upd_payload = br#"{"type":"update_assist_state","allow_remote_assist":true}"#;
+    android_sig
+        .write_all(&(legacy_upd_payload.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    android_sig.write_all(legacy_upd_payload).await.unwrap();
+    android_sig.flush().await.unwrap();
+    assert!(matches!(
+        read_signal_frame(&mut desktop_sig).await.unwrap().unwrap(),
+        SignalMsg::DeviceStatusChanged {
+            ref device_id,
+            online: true,
+            allow_remote_assist: true,
+            allow_remote_control: false,
+            ..
+        } if device_id == &android_id
+    ));
+    // Even with allow_remote_assist=true, allow_remote_control=false still blocks stranger & owner!
+    write_signal_frame(
+        &mut stranger_sig,
+        &SignalMsg::ConnectRequest {
+            target_id: android_id.clone(),
+            session_id: Some("sess-stranger-blocked-layer1".into()),
+            lan_addrs: vec![],
+            nonce: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_signal_frame(&mut stranger_sig).await.unwrap().unwrap(),
+        SignalMsg::Error { ref code, .. } if code == "remote_control_disabled"
+    ));
+
+    // 5. Android explicitly enables allow_remote_control=Some(true) with allow_remote_assist=Some(false).
+    write_signal_frame(
+        &mut android_sig,
+        &SignalMsg::UpdateAssistState {
+            allow_remote_assist: Some(false),
+            allow_remote_control: Some(true),
+        },
+    )
+    .await
+    .unwrap();
+    // Same-account desktop receives real-time DeviceStatusChanged { allow_remote_control: true, allow_remote_assist: false }.
+    assert!(matches!(
+        read_signal_frame(&mut desktop_sig).await.unwrap().unwrap(),
+        SignalMsg::DeviceStatusChanged {
+            ref device_id,
+            online: true,
+            allow_remote_assist: false,
+            allow_remote_control: true,
+            ..
+        } if device_id == &android_id
+    ));
+
+    //    5a. Same-account ConnectRequest now succeeds and issues valid OwnerGrantTicket!
+    write_signal_frame(
+        &mut desktop_sig,
+        &SignalMsg::ConnectRequest {
+            target_id: android_id.clone(),
+            session_id: Some("sess-android-owner-ok".into()),
+            lan_addrs: vec![],
+            nonce: Some("n2".into()),
+        },
+    )
+    .await
+    .unwrap();
+    match read_signal_frame(&mut desktop_sig).await.unwrap().unwrap() {
+        SignalMsg::PunchCoord {
+            is_owner_connection,
+            owner_grant,
+            session_id,
+            ..
+        } => {
+            assert!(is_owner_connection);
+            let grant = owner_grant.expect("same-account connection must receive OwnerGrantTicket");
+            assert_eq!(grant.user_id, user_a.user.id);
+            assert_eq!(grant.caller_device_id, desktop_id);
+            assert_eq!(grant.caller_pubkey_hex, controller_pk_hex);
+            assert_eq!(grant.target_device_id, android_id);
+            assert_eq!(grant.session_id, session_id);
+            verify_owner_grant_with_pubkey(
+                &grant,
+                cluster.auth_authority.public_key_bytes(),
+                Utc::now().timestamp(),
+            )
+            .expect("OwnerGrantTicket signature and bindings must verify");
+        }
+        other => panic!("expected PunchCoord for same-account desktop, got {other:?}"),
+    }
+    assert!(matches!(
+        read_signal_frame(&mut android_sig).await.unwrap().unwrap(),
+        SignalMsg::PunchCoord {
+            is_owner_connection: true,
+            owner_grant: None,
+            ..
+        }
+    ));
+
+    //    5b. Non-owner (stranger) ConnectRequest is STILL rejected with assist_disabled!
+    write_signal_frame(
+        &mut stranger_sig,
+        &SignalMsg::ConnectRequest {
+            target_id: android_id.clone(),
+            session_id: Some("sess-stranger-assist-disabled".into()),
+            lan_addrs: vec![],
+            nonce: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_signal_frame(&mut stranger_sig).await.unwrap().unwrap(),
+        SignalMsg::Error { ref code, .. } if code == "assist_disabled"
+    ));
+
+    // 6. REST PATCH /api/v1/me/devices/{id} toggles allow_remote_control = false ->
+    //    persisted in GET /api/v1/me/devices & Admin GET /api/v1/devices, broadcasts DeviceStatusChanged,
+    //    and immediately blocks subsequent same-account ConnectRequest!
+    let (status, body) = https_json(
+        cluster.http_addr,
+        &cluster.client_tls_no_cert,
+        "PATCH",
+        &format!("/api/v1/me/devices/{android_id}"),
+        Some(&user_a.access_token),
+        Some(&serde_json::json!({ "allow_remote_control": false })),
+    )
+    .await;
+    assert_eq!(status, 200, "PATCH allow_remote_control=false: {body}");
+    let patched: DeviceBindingResponse = serde_json::from_str(&body).unwrap();
+    assert!(!patched.device.allow_remote_control);
+
+    // Real-time DeviceStatusChanged broadcast triggered by REST PATCH reaches BOTH
+    // same-account other peers (desktop_sig) AND the target online device itself (android_sig)!
+    assert!(matches!(
+        read_signal_frame(&mut desktop_sig).await.unwrap().unwrap(),
+        SignalMsg::DeviceStatusChanged {
+            ref device_id,
+            online: true,
+            allow_remote_assist: false,
+            allow_remote_control: false,
+            ..
+        } if device_id == &android_id
+    ));
+    assert!(matches!(
+        read_signal_frame(&mut android_sig).await.unwrap().unwrap(),
+        SignalMsg::DeviceStatusChanged {
+            ref device_id,
+            online: true,
+            allow_remote_assist: false,
+            allow_remote_control: false,
+            ..
+        } if device_id == &android_id
+    ));
+
+    // GET /api/v1/me/devices reflects desktop=true, android=false.
+    let (status, body) = https_json(
+        cluster.http_addr,
+        &cluster.client_tls_no_cert,
+        "GET",
+        "/api/v1/me/devices",
+        Some(&user_a.access_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "GET /api/v1/me/devices: {body}");
+    let my_devs: MyDevicesResponse = serde_json::from_str(&body).unwrap();
+    let my_android = my_devs
+        .devices
+        .iter()
+        .find(|d| d.device_id == android_id)
+        .unwrap();
+    let my_desktop = my_devs
+        .devices
+        .iter()
+        .find(|d| d.device_id == desktop_id)
+        .unwrap();
+    assert!(!my_android.allow_remote_control);
+    assert!(my_desktop.allow_remote_control);
+
+    // Admin GET /api/v1/devices also exposes allow_remote_control.
+    let (status, body) = https_json(
+        cluster.http_addr,
+        &cluster.client_tls_no_cert,
+        "GET",
+        "/api/v1/devices",
+        Some(&admin.access_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "GET /api/v1/devices: {body}");
+    let admin_devs: DevicesResponse = serde_json::from_str(&body).unwrap();
+    let admin_android = admin_devs
+        .devices
+        .iter()
+        .find(|d| d.device_id == android_id)
+        .unwrap();
+    assert!(!admin_android.allow_remote_control);
+
+    // Same-account ConnectRequest is blocked again immediately after PATCH false.
+    write_signal_frame(
+        &mut desktop_sig,
+        &SignalMsg::ConnectRequest {
+            target_id: android_id.clone(),
+            session_id: Some("sess-after-patch-false".into()),
+            lan_addrs: vec![],
+            nonce: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_signal_frame(&mut desktop_sig).await.unwrap().unwrap(),
+        SignalMsg::Error { ref code, .. } if code == "remote_control_disabled"
+    ));
+
+    // PATCH back to true -> GET /api/v1/me/devices returns true + broadcasts DeviceStatusChanged.
+    let (status, body) = https_json(
+        cluster.http_addr,
+        &cluster.client_tls_no_cert,
+        "PATCH",
+        &format!("/api/v1/me/devices/{android_id}"),
+        Some(&user_a.access_token),
+        Some(&serde_json::json!({ "allow_remote_control": true })),
+    )
+    .await;
+    assert_eq!(status, 200, "PATCH allow_remote_control=true: {body}");
+    assert!(matches!(
+        read_signal_frame(&mut desktop_sig).await.unwrap().unwrap(),
+        SignalMsg::DeviceStatusChanged {
+            ref device_id,
+            online: true,
+            allow_remote_control: true,
+            ..
+        } if device_id == &android_id
+    ));
+    assert!(matches!(
+        read_signal_frame(&mut android_sig).await.unwrap().unwrap(),
+        SignalMsg::DeviceStatusChanged {
+            ref device_id,
+            online: true,
+            allow_remote_control: true,
+            ..
+        } if device_id == &android_id
+    ));
+    let (status, body) = https_json(
+        cluster.http_addr,
+        &cluster.client_tls_no_cert,
+        "GET",
+        "/api/v1/me/devices",
+        Some(&user_a.access_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let my_devs_after: MyDevicesResponse = serde_json::from_str(&body).unwrap();
+    assert!(
+        my_devs_after
+            .devices
+            .iter()
+            .find(|d| d.device_id == android_id)
+            .unwrap()
+            .allow_remote_control
+    );
+
+    cluster.shutdown().await;
 }

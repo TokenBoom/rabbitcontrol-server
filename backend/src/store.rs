@@ -61,6 +61,18 @@ pub enum StoreError {
     Migration(#[from] sqlx::migrate::MigrateError),
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// Default `allow_remote_control` value inferred from the device's `os` string.
+/// Mobile platforms (`android` / `ios`) default to `false` (require explicit opt-in even for
+/// same-account self-control); desktop platforms default to `true`.
+pub fn default_allow_remote_control_for_os(os: &str) -> bool {
+    let lower = os.to_ascii_lowercase();
+    !(lower.contains("android") || lower.contains("ios"))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceRecord {
     pub device_id: String,
@@ -83,6 +95,8 @@ pub struct DeviceRecord {
     pub device_pubkey: String,
     #[serde(default)]
     pub allow_remote_assist: bool,
+    #[serde(default = "default_true")]
+    pub allow_remote_control: bool,
     #[serde(default)]
     pub bound_at: Option<DateTime<Utc>>,
 }
@@ -488,6 +502,13 @@ pub trait DeviceStore: Send + Sync {
         allow: bool,
     ) -> Result<bool, StoreError>;
 
+    async fn set_device_allow_remote_control(
+        &self,
+        device_id: &str,
+        owner_user_id: Option<Uuid>,
+        allow: bool,
+    ) -> Result<bool, StoreError>;
+
     async fn get_device_owner(&self, device_id: &str) -> Result<Option<Uuid>, StoreError>;
 
     async fn set_device_pubkey(
@@ -674,6 +695,7 @@ struct DeviceRow {
     alias: String,
     device_pubkey: String,
     allow_remote_assist: bool,
+    allow_remote_control: bool,
     bound_at: Option<DateTime<Utc>>,
 }
 
@@ -694,6 +716,7 @@ impl From<DeviceRow> for DeviceRecord {
             alias: row.alias,
             device_pubkey: row.device_pubkey,
             allow_remote_assist: row.allow_remote_assist,
+            allow_remote_control: row.allow_remote_control,
             bound_at: row.bound_at,
         }
     }
@@ -898,7 +921,8 @@ impl From<AuditLogRow> for AuditLogRecord {
 
 const DEVICE_COLUMNS: &str =
     "device_id, device_key, hostname, os, app_version, arch, device_group, disabled, \
-    created_at, last_seen_at, owner_user_id, alias, device_pubkey, allow_remote_assist, bound_at";
+    created_at, last_seen_at, owner_user_id, alias, device_pubkey, allow_remote_assist, \
+    allow_remote_control, bound_at";
 
 const USER_COLUMNS: &str = "id, email, display_name, password_hash, role, status, \
     must_change_password, token_version, created_at, updated_at, last_login_at";
@@ -959,6 +983,10 @@ impl PgDeviceStore {
                  app_version = COALESCE(NULLIF($3, ''), app_version),
                  arch = COALESCE(NULLIF($4, ''), arch),
                  device_group = COALESCE(NULLIF($5, ''), device_group),
+                 allow_remote_control = CASE
+                     WHEN os = '' AND $2 <> '' AND (LOWER($2) LIKE '%android%' OR LOWER($2) LIKE '%ios%') THEN FALSE
+                     ELSE allow_remote_control
+                 END,
                  last_seen_at = NOW()
              WHERE device_key = $6 AND disabled = FALSE
              RETURNING {DEVICE_COLUMNS}"
@@ -996,9 +1024,10 @@ impl DeviceStore for PgDeviceStore {
             return Ok(updated);
         }
 
+        let default_allow_rc = default_allow_remote_control_for_os(&v.os);
         let insert_sql = format!(
-            "INSERT INTO devices (device_id, device_key, hostname, os, app_version, arch, device_group)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "INSERT INTO devices (device_id, device_key, hostname, os, app_version, arch, device_group, allow_remote_control)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT DO NOTHING
              RETURNING {DEVICE_COLUMNS}"
         );
@@ -1013,6 +1042,7 @@ impl DeviceStore for PgDeviceStore {
                 .bind(&v.app_version)
                 .bind(&v.arch)
                 .bind(&v.device_group)
+                .bind(default_allow_rc)
                 .fetch_optional(&self.pool)
                 .await?;
 
@@ -1272,6 +1302,11 @@ impl DeviceStore for PgDeviceStore {
             "UPDATE devices
              SET alias = COALESCE($3, CASE WHEN owner_user_id IS DISTINCT FROM $2 THEN '' ELSE alias END),
                  allow_remote_assist = CASE WHEN owner_user_id IS DISTINCT FROM $2 THEN FALSE ELSE allow_remote_assist END,
+                 allow_remote_control = CASE
+                     WHEN owner_user_id IS DISTINCT FROM $2 THEN
+                         CASE WHEN LOWER(os) LIKE '%android%' OR LOWER(os) LIKE '%ios%' THEN FALSE ELSE TRUE END
+                     ELSE allow_remote_control
+                 END,
                  device_pubkey = COALESCE($4, CASE WHEN owner_user_id IS DISTINCT FROM $2 THEN '' ELSE device_pubkey END),
                  owner_user_id = $2,
                  bound_at = NOW()
@@ -1343,7 +1378,11 @@ impl DeviceStore for PgDeviceStore {
         }
         let res = sqlx::query(
             "UPDATE devices
-             SET owner_user_id = NULL, bound_at = NULL, alias = '', allow_remote_assist = FALSE
+             SET owner_user_id = NULL,
+                 bound_at = NULL,
+                 alias = '',
+                 allow_remote_assist = FALSE,
+                 allow_remote_control = CASE WHEN LOWER(os) LIKE '%android%' OR LOWER(os) LIKE '%ios%' THEN FALSE ELSE TRUE END
              WHERE device_id = $1 AND owner_user_id = $2",
         )
         .bind(&norm)
@@ -1360,7 +1399,11 @@ impl DeviceStore for PgDeviceStore {
         }
         let res = sqlx::query(
             "UPDATE devices
-             SET owner_user_id = NULL, bound_at = NULL, alias = '', allow_remote_assist = FALSE
+             SET owner_user_id = NULL,
+                 bound_at = NULL,
+                 alias = '',
+                 allow_remote_assist = FALSE,
+                 allow_remote_control = CASE WHEN LOWER(os) LIKE '%android%' OR LOWER(os) LIKE '%ios%' THEN FALSE ELSE TRUE END
              WHERE device_id = $1 AND owner_user_id IS NOT NULL",
         )
         .bind(&norm)
@@ -1392,6 +1435,38 @@ impl DeviceStore for PgDeviceStore {
             }
             None => {
                 sqlx::query("UPDATE devices SET allow_remote_assist = $1 WHERE device_id = $2")
+                    .bind(allow)
+                    .bind(&norm)
+                    .execute(&self.pool)
+                    .await?
+            }
+        };
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn set_device_allow_remote_control(
+        &self,
+        device_id: &str,
+        owner_user_id: Option<Uuid>,
+        allow: bool,
+    ) -> Result<bool, StoreError> {
+        let norm = normalize_device_id(device_id);
+        if !is_valid_device_id(&norm) {
+            return Ok(false);
+        }
+        let res = match owner_user_id {
+            Some(uid) => {
+                sqlx::query(
+                    "UPDATE devices SET allow_remote_control = $1 WHERE device_id = $2 AND owner_user_id = $3",
+                )
+                .bind(allow)
+                .bind(&norm)
+                .bind(uid)
+                .execute(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query("UPDATE devices SET allow_remote_control = $1 WHERE device_id = $2")
                     .bind(allow)
                     .bind(&norm)
                     .execute(&self.pool)
@@ -1696,7 +1771,13 @@ impl UserStore for PgDeviceStore {
 
         // Clear bound metadata before ON DELETE SET NULL clears owner_user_id.
         sqlx::query(
-            "UPDATE devices SET owner_user_id = NULL, bound_at = NULL, alias = '', allow_remote_assist = FALSE WHERE owner_user_id = $1",
+            "UPDATE devices
+             SET owner_user_id = NULL,
+                 bound_at = NULL,
+                 alias = '',
+                 allow_remote_assist = FALSE,
+                 allow_remote_control = CASE WHEN LOWER(os) LIKE '%android%' OR LOWER(os) LIKE '%ios%' THEN FALSE ELSE TRUE END
+             WHERE owner_user_id = $1",
         )
         .bind(user_id)
         .execute(&mut *tx)
@@ -2428,8 +2509,12 @@ impl DeviceStore for MemoryDeviceStore {
                 if !v.hostname.is_empty() {
                     existing.hostname = v.hostname;
                 }
+                let prev_os_empty = existing.os.is_empty();
                 if !v.os.is_empty() {
                     existing.os = v.os;
+                    if prev_os_empty && !default_allow_remote_control_for_os(&existing.os) {
+                        existing.allow_remote_control = false;
+                    }
                 }
                 if !v.app_version.is_empty() {
                     existing.app_version = v.app_version;
@@ -2445,6 +2530,7 @@ impl DeviceStore for MemoryDeviceStore {
             }
         }
 
+        let default_allow_rc = default_allow_remote_control_for_os(&v.os);
         for _ in 0..MAX_ID_GENERATION_ATTEMPTS {
             let candidate_id = generate_device_id();
             if !guard.by_id.contains_key(&candidate_id) {
@@ -2463,6 +2549,7 @@ impl DeviceStore for MemoryDeviceStore {
                     alias: String::new(),
                     device_pubkey: String::new(),
                     allow_remote_assist: false,
+                    allow_remote_control: default_allow_rc,
                     bound_at: None,
                 };
                 guard.by_key.insert(v.device_key, candidate_id.clone());
@@ -2645,6 +2732,7 @@ impl DeviceStore for MemoryDeviceStore {
         let prev_owner = rec.owner_user_id;
         if rec.owner_user_id != Some(user_id) {
             rec.allow_remote_assist = false;
+            rec.allow_remote_control = default_allow_remote_control_for_os(&rec.os);
             if alias.is_none() {
                 rec.alias.clear();
             }
@@ -2716,6 +2804,7 @@ impl DeviceStore for MemoryDeviceStore {
                 rec.bound_at = None;
                 rec.alias.clear();
                 rec.allow_remote_assist = false;
+                rec.allow_remote_control = default_allow_remote_control_for_os(&rec.os);
                 return Ok(true);
             }
         }
@@ -2734,6 +2823,7 @@ impl DeviceStore for MemoryDeviceStore {
                 rec.bound_at = None;
                 rec.alias.clear();
                 rec.allow_remote_assist = false;
+                rec.allow_remote_control = default_allow_remote_control_for_os(&rec.os);
                 return Ok(true);
             }
         }
@@ -2754,6 +2844,26 @@ impl DeviceStore for MemoryDeviceStore {
         if let Some(rec) = guard.by_id.get_mut(&norm) {
             if owner_user_id.is_none() || rec.owner_user_id == owner_user_id {
                 rec.allow_remote_assist = allow;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn set_device_allow_remote_control(
+        &self,
+        device_id: &str,
+        owner_user_id: Option<Uuid>,
+        allow: bool,
+    ) -> Result<bool, StoreError> {
+        let norm = normalize_device_id(device_id);
+        if !is_valid_device_id(&norm) {
+            return Ok(false);
+        }
+        let mut guard = self.state.write().expect("MemoryDeviceStore lock poisoned");
+        if let Some(rec) = guard.by_id.get_mut(&norm) {
+            if owner_user_id.is_none() || rec.owner_user_id == owner_user_id {
+                rec.allow_remote_control = allow;
                 return Ok(true);
             }
         }
@@ -3044,6 +3154,7 @@ impl UserStore for MemoryDeviceStore {
                 dev.bound_at = None;
                 dev.alias.clear();
                 dev.allow_remote_assist = false;
+                dev.allow_remote_control = default_allow_remote_control_for_os(&dev.os);
             }
         }
         Ok(true)
@@ -4485,5 +4596,154 @@ mod tests {
             })
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn allow_remote_control_defaults_by_os_and_resets_on_unbind_or_rebind() {
+        assert!(!default_allow_remote_control_for_os("android"));
+        assert!(!default_allow_remote_control_for_os("Android 15"));
+        assert!(!default_allow_remote_control_for_os("iOS 18.1"));
+        assert!(default_allow_remote_control_for_os("macos"));
+        assert!(default_allow_remote_control_for_os("windows"));
+        assert!(default_allow_remote_control_for_os("linux"));
+        assert!(default_allow_remote_control_for_os(""));
+
+        let store = MemoryDeviceStore::new();
+        let u1 = store
+            .create_user(CreateUserInput {
+                email: "u1-rc@example.com".into(),
+                display_name: "U1".into(),
+                password_hash: "hash".into(),
+                role: "user".into(),
+                status: "active".into(),
+                must_change_password: false,
+            })
+            .await
+            .unwrap();
+        let u2 = store
+            .create_user(CreateUserInput {
+                email: "u2-rc@example.com".into(),
+                display_name: "U2".into(),
+                password_hash: "hash".into(),
+                role: "user".into(),
+                status: "active".into(),
+                must_change_password: false,
+            })
+            .await
+            .unwrap();
+
+        let android = store
+            .register_or_get(RegisterInput {
+                device_key: "dk-android-default".into(),
+                hostname: "Pixel-9".into(),
+                os: "Android 15".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!android.allow_remote_control);
+        assert!(!android.allow_remote_assist);
+
+        let desktop = store
+            .register_or_get(RegisterInput {
+                device_key: "dk-macos-default".into(),
+                hostname: "MacBook-Pro".into(),
+                os: "macos".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(desktop.allow_remote_control);
+        assert!(!desktop.allow_remote_assist);
+
+        // Bind android to u1 and enable allow_remote_control + allow_remote_assist.
+        store
+            .bind_device_to_user(&android.device_id, u1.id, Some("Phone"), None)
+            .await
+            .unwrap();
+        assert!(store
+            .set_device_allow_remote_control(&android.device_id, Some(u1.id), true)
+            .await
+            .unwrap());
+        assert!(store
+            .set_device_allow_remote_assist(&android.device_id, Some(u1.id), true)
+            .await
+            .unwrap());
+        // Non-owner cannot flip allow_remote_control.
+        assert!(!store
+            .set_device_allow_remote_control(&android.device_id, Some(u2.id), false)
+            .await
+            .unwrap());
+        let fetched = store.get_by_id(&android.device_id).await.unwrap().unwrap();
+        assert!(fetched.allow_remote_control);
+        assert!(fetched.allow_remote_assist);
+
+        // Re-binding to same owner preserves allow_remote_control.
+        let same_owner = store
+            .bind_device_to_user(&android.device_id, u1.id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(same_owner.allow_remote_control);
+
+        // Transferring ownership to u2 resets android allow_remote_control -> false & assist -> false.
+        let transferred = store
+            .bind_device_to_user(&android.device_id, u2.id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!transferred.allow_remote_control);
+        assert!(!transferred.allow_remote_assist);
+
+        // Enable again then unbind -> resets to false for android.
+        assert!(store
+            .set_device_allow_remote_control(&android.device_id, Some(u2.id), true)
+            .await
+            .unwrap());
+        assert!(store
+            .unbind_device(&android.device_id, u2.id)
+            .await
+            .unwrap());
+        let after_unbind = store.get_by_id(&android.device_id).await.unwrap().unwrap();
+        assert!(!after_unbind.allow_remote_control);
+        assert!(!after_unbind.allow_remote_assist);
+
+        // Desktop device disabled by u1 then unbound -> resets back to OS default true.
+        store
+            .bind_device_to_user(&desktop.device_id, u1.id, None, None)
+            .await
+            .unwrap();
+        assert!(store
+            .set_device_allow_remote_control(&desktop.device_id, Some(u1.id), false)
+            .await
+            .unwrap());
+        assert!(store
+            .unbind_device(&desktop.device_id, u1.id)
+            .await
+            .unwrap());
+        let desktop_after_unbind = store.get_by_id(&desktop.device_id).await.unwrap().unwrap();
+        assert!(desktop_after_unbind.allow_remote_control);
+
+        // Empty-OS stub device later reporting os="android" converges to allow_remote_control=false.
+        let stub = store
+            .register_or_get(RegisterInput {
+                device_key: "dk-late-android".into(),
+                hostname: "phone".into(),
+                os: String::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(stub.allow_remote_control);
+        let updated_stub = store
+            .register_or_get(RegisterInput {
+                device_key: "dk-late-android".into(),
+                hostname: "phone".into(),
+                os: "android".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!updated_stub.allow_remote_control);
     }
 }

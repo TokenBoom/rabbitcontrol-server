@@ -68,14 +68,55 @@ Every message in both directions is length-prefixed:
   "app_version": "0.1.10",
   "arch": "arm64",
   "device_group": "default",
-  "lan_addrs": ["192.168.1.10:50000"]
+  "lan_addrs": ["192.168.1.10:50000"],
+  "access_token": "<optional-jwt>",
+  "device_pubkey": "<optional-ed25519-hex>",
+  "allow_remote_assist": false,
+  "allow_remote_control": true
 }
 ```
 
 - `device_key` (required): stable unique identifier (1–256 chars).
 - `device_id` (optional): if provided, verified against the resolved permanent 9-digit ID.
 - `hostname`, `os`, `app_version` (≤32 UTF-8 bytes), `arch` (≤32 UTF-8 bytes), `device_group` (alias `"group"`), `lan_addrs`: optional metadata (backward-compatible with older clients; empty strings preserve previously stored values).
-- `device_status_changed` broadcasts and `/api/v1/me/devices`, `/api/v1/devices` views also expose `app_version` and `arch`.
+- `allow_remote_control` (optional bool): gates **all** incoming remote control connections (including same-account owner self-control). When explicitly provided (`Some(v)`), persisted immediately. When omitted (`None`, older clients), newly registered devices default via `default_allow_remote_control_for_os(os)` (`false` when `os` contains `android` or `ios` case-insensitively, `true` otherwise), while existing devices preserve their stored DB value (converging to `false` if their previously empty `os` is populated with an Android/iOS OS).
+- `allow_remote_assist` (optional bool): gates non-owner third-party assistance (effective only when `allow_remote_control == true`).
+- `device_status_changed` broadcasts and `/api/v1/me/devices`, `/api/v1/devices` views also expose `app_version`, `arch`, `allow_remote_assist`, and `allow_remote_control`.
+
+#### `update_assist_state` (Client -> Server)
+
+Updates the device's remote-assist and (optionally) remote-control policy in real time, persisting to `DeviceStore`, updating active peer state, and broadcasting `device_status_changed` to same-account online peers.
+
+```json
+{
+  "type": "update_assist_state",
+  "allow_remote_assist": false,
+  "allow_remote_control": true
+}
+```
+
+- `allow_remote_assist` (optional bool): whether non-owner third-party assistance is allowed; when omitted (`None`), preserves the existing stored value without modification.
+- `allow_remote_control` (optional bool): when provided (`Some(v)`), persists and updates `allow_remote_control`; when omitted (`None`, older clients), preserves the existing stored value without modification.
+- At least one of `allow_remote_assist` or `allow_remote_control` must be present (otherwise the server responds with `error` `code = "invalid_payload"`). If persistence fails or affects 0 rows, the server returns an `error` frame without mutating in-memory peer state or broadcasting `device_status_changed`.
+
+#### `device_status_changed` (Server -> Same-Account Online Peers)
+
+```json
+{
+  "type": "device_status_changed",
+  "device_id": "123456789",
+  "online": true,
+  "hostname": "macbook-pro",
+  "alias": "Work Mac",
+  "os": "macos",
+  "app_version": "0.1.10",
+  "arch": "arm64",
+  "allow_remote_assist": false,
+  "allow_remote_control": true
+}
+```
+
+Pushed to other online peers belonging to the same `owner_user_id` on register (online), disconnect/kick (offline), and `update_assist_state`. On REST `PATCH /api/v1/me/devices/{id}`, `device_status_changed` is pushed both to other same-account online peers **and** to the target device itself (if online) so the device can synchronize its local policy cache without stale overwrite on reconnect.
 
 #### `registered` (Server -> Client)
 
@@ -379,6 +420,8 @@ Response (`200 OK`):
       "public_udp_addr": "203.0.113.10:51234",
       "lan_addrs": ["192.168.1.10:50000"],
       "owner_email": "alice@example.com",
+      "allow_remote_assist": false,
+      "allow_remote_control": true,
       "created_at": "2026-11-22T10:00:00Z",
       "last_seen_at": "2026-11-22T10:05:00Z"
     }
@@ -396,9 +439,9 @@ Note: `total` equals `devices.len()` (page length), while `total_count` is the t
 
 ## 6. Storage Architecture
 
-### 6.1 PostgreSQL (`DeviceStore` / `migrations/0001_init.sql` – `0005_device_app_version.sql`)
+### 6.1 PostgreSQL (`DeviceStore` / `migrations/0001_init.sql` – `0006_device_allow_remote_control.sql`)
 
-- `devices`: `device_id CHAR(9) PRIMARY KEY`, `device_key TEXT UNIQUE NOT NULL`, `hostname TEXT NOT NULL`, `os TEXT NOT NULL`, `app_version TEXT NOT NULL DEFAULT ''`, `arch TEXT NOT NULL DEFAULT ''`, `device_group TEXT NOT NULL DEFAULT ''`, `disabled BOOLEAN NOT NULL DEFAULT FALSE`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, `last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, plus `owner_user_id UUID REFERENCES users(id)`, `alias TEXT`, `device_pubkey TEXT`, `allow_remote_assist BOOLEAN` (`0005_device_app_version.sql` adds `app_version` and `arch`).
+- `devices`: `device_id CHAR(9) PRIMARY KEY`, `device_key TEXT UNIQUE NOT NULL`, `hostname TEXT NOT NULL`, `os TEXT NOT NULL`, `app_version TEXT NOT NULL DEFAULT ''`, `arch TEXT NOT NULL DEFAULT ''`, `device_group TEXT NOT NULL DEFAULT ''`, `disabled BOOLEAN NOT NULL DEFAULT FALSE`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, `last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, plus `owner_user_id UUID REFERENCES users(id)`, `alias TEXT`, `device_pubkey TEXT`, `allow_remote_assist BOOLEAN`, `allow_remote_control BOOLEAN NOT NULL DEFAULT TRUE` (`0005_device_app_version.sql` adds `app_version` and `arch`; `0006_device_allow_remote_control.sql` adds `allow_remote_control` and backfills `FALSE` for existing `android`/`ios` rows). On device unbind or owner transfer, `allow_remote_assist` resets to `FALSE` and `allow_remote_control` resets to its OS default (`FALSE` for Android/iOS, `TRUE` for desktop).
 - `relay_sessions_log`: `id BIGSERIAL PRIMARY KEY`, `session_id TEXT NOT NULL`, `host_id CHAR(9) NOT NULL`, `client_id CHAR(9) NOT NULL`, `bytes_up BIGINT NOT NULL DEFAULT 0`, `bytes_down BIGINT NOT NULL DEFAULT 0`, `started_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, `ended_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, indexed on `(started_at DESC)`, `(session_id)`, `(host_id, started_at DESC)`, and `(client_id, started_at DESC)`.
 - `users`, `user_sessions` (refresh family tracking with single-use 15s grace + `retired_token_hashes` multi-generation replay detection), `system_settings` (`allow_registration`), `server_keys`, `pki_ca`, `device_certificates`, and `audit_logs` (`0003_users_auth_pki.sql`, `0004_session_replay_history.sql`).
 
@@ -425,13 +468,17 @@ Note: `total` equals `devices.len()` (page length), while `total_count` is the t
 - **Split-port (`--web-addr` / `RC_WEB_ADDR` set)**: `:21118` switches to `RouterMode::ClientApiOnly` (retaining only public client routes, restricted user routes, and full user routes; admin routes and SPA static files return `404`), while `--web-addr` serves plain-HTTP `RouterMode::WebAdminOnly` (`RC_WEB_DIR` SPA static files + `/api/v1/health`, `/api/v1/pki/ca`, `/api/v1/auth/{login,refresh,logout,change-password}`, `/api/v1/me`, and all Admin routes).
 - **Public**: `GET /api/v1/health`, `GET /api/v1/pki/ca`, `POST /api/v1/devices/register`, `GET /api/v1/auth/config`, `POST /api/v1/auth/register` (gated by `allow_registration`), `POST /api/v1/auth/login`, `POST /api/v1/auth/refresh`.
 - **Restricted User (allowed before password change)**: `GET /api/v1/me`, `POST /api/v1/auth/logout` (accepts Bearer token or `refresh_token` fallback with explicit `device_id` ownership pre-check via `verify_explicit_device_owner`), `POST /api/v1/auth/change-password` (revokes other sessions and kicks signaling/relay peers).
-- **Full User**: `GET /api/v1/me/devices`, `POST /api/v1/me/devices/bind` (atomic ownership transfer via `bind_device_to_user_with_prev`), `PATCH / DELETE /api/v1/me/devices/{id}`, `POST /api/v1/certs/issue` (CSR verification -> 7-day device cert with URI SAN `urn:rabbitcontrol:user:{user_id}:device:{device_id}`).
-- **Admin**: `GET / PATCH /api/v1/admin/settings` (`allow_registration`, `updated_at`), `GET / POST /api/v1/admin/users`, `PATCH / DELETE /api/v1/admin/users/{id}`, `GET /api/v1/stats`, `GET /api/v1/devices`, `GET / DELETE /api/v1/sessions`, `DELETE /api/v1/devices/{id}`.
+- **Full User**: `GET /api/v1/me/devices` (returns `MyDeviceView` including `allow_remote_assist` and `allow_remote_control`), `POST /api/v1/me/devices/bind` (atomic ownership transfer via `bind_device_to_user_with_prev`), `PATCH /api/v1/me/devices/{id}` (accepts optional `alias`, `allow_remote_assist`, and `allow_remote_control`; persists updates, syncs in-memory peer policy, and broadcasts `device_status_changed` to same-account online peers), `DELETE /api/v1/me/devices/{id}`, `POST /api/v1/certs/issue` (CSR verification -> 7-day device cert with URI SAN `urn:rabbitcontrol:user:{user_id}:device:{device_id}`).
+- **Admin**: `GET / PATCH /api/v1/admin/settings` (`allow_registration`, `updated_at`), `GET / POST /api/v1/admin/users`, `PATCH / DELETE /api/v1/admin/users/{id}`, `GET /api/v1/stats`, `GET /api/v1/devices` (returns `DeviceView` including `allow_remote_assist` and `allow_remote_control`), `GET / DELETE /api/v1/sessions`, `DELETE /api/v1/devices/{id}`.
 
-### 7.3 Signaling Extensions (`:21116`) & Owner Self-Control
+### 7.3 Signaling Extensions (`:21116`) & Two-Layer Remote Control Policy
 - **TLS 1.3**: Enabled by default using server leaf cert signed by `pki_ca` (`--no-tls` opt-out for plaintext dev).
-- **`Register`**: Accepts `access_token`, `device_pubkey`, and `allow_remote_assist`. Missing/invalid/revoked sessions return `Error` (`account_disabled`, `user_deleted`, `token_revoked`). Re-binding a device across users atomically transfers ownership (`bind_device_to_user_with_prev`), revokes the previous owner's certificates and sessions for that device, and preserves `effective_owner`.
-- **Owner Self-Control**: `authorize_peer_connection` loads caller record and enforces owner consistency; when caller and target device belong to the same `owner_user_id` and both have verified `device_pubkey`, signaling bypasses `allow_remote_assist == false` and issues a signed `OwnerGrantTicket` (`RC-OWNER-GRANT-V1\0`) in `PunchCoord`/`RelayReady`, paired with client Ed25519 `OwnerTicket` PoP inside `rc-session`.
+- **`Register`**: Accepts `access_token`, `device_pubkey`, `allow_remote_assist`, and `allow_remote_control`. Missing/invalid/revoked sessions return `Error` (`account_disabled`, `user_deleted`, `token_revoked`). Re-binding a device across users atomically transfers ownership (`bind_device_to_user_with_prev`), revokes the previous owner's certificates and sessions for that device, resets `allow_remote_assist = false` and `allow_remote_control` to the OS default, and preserves `effective_owner`.
+- **Two-Layer Authorization (`authorize_peer_connection`)**:
+  1. **Layer 1 (`allow_remote_control`)**: Evaluated **unconditionally before** same-account owner bypass on both `connect_request` and `relay_alloc` (including legacy `require_auth = false` / anonymous mode). Whenever `!target.allow_remote_control`, the server immediately rejects with `Error { code: "remote_control_disabled", message: "对方未开启允许远程控制" }` — even for the same account owner — without issuing `OwnerGrantTicket`, without sending `punch_coord` / `relay_ready`, and without allocating any `relay_token`.
+  2. **Layer 2 (Owner Self-Control vs. `allow_remote_assist`)**: Once `target.allow_remote_control == true`:
+     - If caller and target belong to the same `owner_user_id`, signaling bypasses `allow_remote_assist == false` and issues a signed `OwnerGrantTicket` (`RC-OWNER-GRANT-V1\0`) in `PunchCoord`/`RelayReady` (when `device_pubkey` is valid), paired with client Ed25519 `OwnerTicket` PoP inside `rc-session`.
+     - Otherwise (non-owner), `!target.allow_remote_assist` is rejected with `Error { code: "assist_disabled", message: "对方未开启允许他人远程协助" }`.
 - **Dynamic Kick Reasons**: `account_disabled`, `user_deleted`, `account_updated`, `password_changed`, `token_revoked`, `device_unbound`, `cert_revoked`, `disabled_by_admin`.
 
 ### 7.4 Mandatory Relay mTLS (`:21117`) & Direct P2P/LAN mTLS

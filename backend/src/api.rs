@@ -898,12 +898,18 @@ pub struct BindDeviceRequest {
     pub device_pubkey: Option<String>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize)]
 pub struct UpdateMyDeviceRequest {
     #[serde(default)]
     pub alias: Option<String>,
     #[serde(default)]
     pub allow_remote_assist: Option<bool>,
+    #[serde(default)]
+    pub allow_remote_control: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -919,6 +925,8 @@ pub struct MyDeviceView {
     pub device_group: String,
     pub alias: String,
     pub allow_remote_assist: bool,
+    #[serde(default = "default_true")]
+    pub allow_remote_control: bool,
     pub disabled: bool,
     pub online: bool,
     pub in_session: bool,
@@ -1111,6 +1119,8 @@ pub struct DeviceView {
     pub owner_email: Option<String>,
     #[serde(default)]
     pub allow_remote_assist: bool,
+    #[serde(default = "default_true")]
+    pub allow_remote_control: bool,
     pub disabled: bool,
     pub online: bool,
     pub in_session: bool,
@@ -2386,6 +2396,7 @@ async fn get_my_devices(
             device_group: rec.device_group,
             alias: rec.alias,
             allow_remote_assist: rec.allow_remote_assist,
+            allow_remote_control: rec.allow_remote_control,
             disabled: rec.disabled,
             online,
             in_session,
@@ -2494,8 +2505,8 @@ async fn patch_my_device(
         );
     }
 
-    let existing = match state.device_store.get_by_id(&norm).await {
-        Ok(Some(d)) if d.owner_user_id == Some(authed.user.id) => d,
+    match state.device_store.get_by_id(&norm).await {
+        Ok(Some(d)) if d.owner_user_id == Some(authed.user.id) => {}
         Ok(_) => {
             return api_error(
                 StatusCode::NOT_FOUND,
@@ -2504,7 +2515,7 @@ async fn patch_my_device(
             );
         }
         Err(err) => return map_store_error(err, "get_my_device_patch"),
-    };
+    }
 
     if let Some(ref alias) = req.alias {
         match state
@@ -2525,22 +2536,62 @@ async fn patch_my_device(
     }
 
     if let Some(allow) = req.allow_remote_assist {
-        if let Err(err) = state
+        match state
             .auth_store
             .set_device_allow_remote_assist(&norm, Some(authed.user.id), allow)
             .await
         {
-            return map_store_error(err, "set_device_allow_remote_assist");
+            Ok(true) => {}
+            Ok(false) => {
+                return api_error(
+                    StatusCode::NOT_FOUND,
+                    "device_not_found",
+                    format!("device {norm} not found"),
+                );
+            }
+            Err(err) => return map_store_error(err, "set_device_allow_remote_assist"),
         }
     }
 
-    let updated = state
-        .device_store
-        .get_by_id(&norm)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(existing);
+    if let Some(allow) = req.allow_remote_control {
+        match state
+            .auth_store
+            .set_device_allow_remote_control(&norm, Some(authed.user.id), allow)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return api_error(
+                    StatusCode::NOT_FOUND,
+                    "device_not_found",
+                    format!("device {norm} not found"),
+                );
+            }
+            Err(err) => return map_store_error(err, "set_device_allow_remote_control"),
+        }
+    }
+
+    let updated = match state.device_store.get_by_id(&norm).await {
+        Ok(Some(dev)) => dev,
+        Ok(None) => {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "device_not_found",
+                format!("device {norm} not found"),
+            );
+        }
+        Err(err) => return map_store_error(err, "get_my_device_patch_after_update"),
+    };
+
+    if req.alias.is_some()
+        || req.allow_remote_assist.is_some()
+        || req.allow_remote_control.is_some()
+    {
+        state
+            .signal_hub
+            .sync_device_policy_and_broadcast(&updated)
+            .await;
+    }
 
     (
         StatusCode::OK,
@@ -3472,6 +3523,7 @@ async fn build_device_view_with_state(
         owner_user_id: rec.owner_user_id,
         owner_email,
         allow_remote_assist: rec.allow_remote_assist,
+        allow_remote_control: rec.allow_remote_control,
         disabled: rec.disabled,
         online,
         in_session,

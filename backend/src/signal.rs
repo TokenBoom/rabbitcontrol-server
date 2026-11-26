@@ -241,6 +241,10 @@ impl UdpProbeResponse {
 // Native TCP Framed Signaling Codec (`[u32 BE length (1..=65536)][UTF-8 JSON]`)
 // ─────────────────────────────────────────────────────────────────────────────
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SignalMsg {
@@ -266,6 +270,8 @@ pub enum SignalMsg {
         device_pubkey: Option<String>,
         #[serde(default)]
         allow_remote_assist: Option<bool>,
+        #[serde(default)]
+        allow_remote_control: Option<bool>,
     },
     Registered {
         device_id: String,
@@ -285,7 +291,10 @@ pub enum SignalMsg {
         online_peers: usize,
     },
     UpdateAssistState {
-        allow_remote_assist: bool,
+        #[serde(default)]
+        allow_remote_assist: Option<bool>,
+        #[serde(default)]
+        allow_remote_control: Option<bool>,
     },
     DeviceStatusChanged {
         device_id: String,
@@ -298,6 +307,8 @@ pub enum SignalMsg {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         arch: String,
         allow_remote_assist: bool,
+        #[serde(default = "default_true")]
+        allow_remote_control: bool,
     },
     ConnectRequest {
         target_id: String,
@@ -772,6 +783,7 @@ struct DeviceStatusBroadcast<'a> {
     app_version: &'a str,
     arch: &'a str,
     allow_remote_assist: bool,
+    allow_remote_control: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -785,6 +797,7 @@ struct ActivePeer {
     owner_user_id: Option<Uuid>,
     device_pubkey: String,
     allow_remote_assist: bool,
+    allow_remote_control: bool,
     hostname: String,
     alias: String,
     os: String,
@@ -965,10 +978,57 @@ impl SignalHub {
             app_version: status.app_version.to_string(),
             arch: status.arch.to_string(),
             allow_remote_assist: status.allow_remote_assist,
+            allow_remote_control: status.allow_remote_control,
         };
         for (peer_id, peer_tx) in targets {
             Self::send_nonblocking(&peer_tx, &peer_id, msg.clone());
         }
+    }
+
+    /// Synchronize updated device metadata/policy (`alias`, `allow_remote_assist`,
+    /// `allow_remote_control`) from REST `PATCH /api/v1/me/devices/{id}` into in-memory
+    /// active peer state, notify the target online device itself (preventing stale cache
+    /// overwrite on reconnect), and broadcast `DeviceStatusChanged` to same-account online peers.
+    pub async fn sync_device_policy_and_broadcast(&self, updated: &crate::store::DeviceRecord) {
+        let norm = normalize_device_id(&updated.device_id);
+        let self_tx = {
+            let _guard = self.lock_device(&norm).await;
+            if let Some(mut peer) = self.peers.get_mut(&norm) {
+                peer.alias = updated.alias.clone();
+                peer.allow_remote_assist = updated.allow_remote_assist;
+                peer.allow_remote_control = updated.allow_remote_control;
+                Some(peer.tx.clone())
+            } else {
+                None
+            }
+        };
+        let online = self_tx.is_some();
+        if let Some(peer_tx) = self_tx {
+            let msg = SignalMsg::DeviceStatusChanged {
+                device_id: norm.clone(),
+                online: true,
+                hostname: updated.hostname.clone(),
+                alias: updated.alias.clone(),
+                os: updated.os.clone(),
+                app_version: updated.app_version.clone(),
+                arch: updated.arch.clone(),
+                allow_remote_assist: updated.allow_remote_assist,
+                allow_remote_control: updated.allow_remote_control,
+            };
+            Self::send_nonblocking(&peer_tx, &norm, msg);
+        }
+        self.broadcast_user_device_status(DeviceStatusBroadcast {
+            owner_user_id: updated.owner_user_id,
+            device_id: &norm,
+            online,
+            hostname: &updated.hostname,
+            alias: &updated.alias,
+            os: &updated.os,
+            app_version: &updated.app_version,
+            arch: &updated.arch,
+            allow_remote_assist: updated.allow_remote_assist,
+            allow_remote_control: updated.allow_remote_control,
+        });
     }
 
     /// Kick an online device by signalling its per-connection cancellation handle,
@@ -997,6 +1057,7 @@ impl SignalHub {
                 app_version: &peer.app_version,
                 arch: &peer.arch,
                 allow_remote_assist: peer.allow_remote_assist,
+                allow_remote_control: peer.allow_remote_control,
             });
             true
         } else {
@@ -1518,6 +1579,7 @@ impl SignalHub {
             access_token,
             device_pubkey,
             allow_remote_assist_opt,
+            allow_remote_control_opt,
         ) = match first_frame {
             SignalMsg::Register {
                 device_id,
@@ -1531,6 +1593,7 @@ impl SignalHub {
                 access_token,
                 device_pubkey,
                 allow_remote_assist,
+                allow_remote_control,
             } => {
                 if let Err(reason) = validate_register_fields(
                     &hostname,
@@ -1581,6 +1644,7 @@ impl SignalHub {
                     access_token,
                     device_pubkey,
                     allow_remote_assist,
+                    allow_remote_control,
                 )
             }
             _ => {
@@ -1781,27 +1845,25 @@ impl SignalHub {
                     }
                 }
             }
-            if let Some(allow) = allow_remote_assist_opt {
-                let _ = self
-                    .device_store
-                    .set_device_allow_remote_assist(&device_id, Some(uid), allow)
-                    .await;
-            }
-        } else if let Some(allow) = allow_remote_assist_opt {
-            let _ = self
-                .device_store
-                .set_device_allow_remote_assist(&device_id, None, allow)
-                .await;
         }
 
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::channel::<SignalMsg>(self.config.channel_capacity);
         let cancel = PeerCancel::new();
 
-        // Step 3 (M4): Serialize disabled re-check + peers.insert + ephemeral.set_online
-        // under the per-device stripe lock so concurrent admin disable/kick or reconnect
-        // transitions can never interleave inconsistently.
-        let (peer_owner, peer_hostname, peer_alias, peer_os, peer_ver, peer_arch, peer_assist) = {
+        // Step 3 (M4): Serialize disabled re-check + policy persistence + peers.insert +
+        // ephemeral.set_online under the per-device stripe lock so concurrent admin disable/kick,
+        // REST PATCH, or reconnect transitions can never interleave inconsistently.
+        let (
+            peer_owner,
+            peer_hostname,
+            peer_alias,
+            peer_os,
+            peer_ver,
+            peer_arch,
+            peer_assist,
+            peer_remote_control,
+        ) = {
             let _guard = self.lock_device(&device_id).await;
             if self.shutdown.is_cancelled() {
                 return;
@@ -1824,7 +1886,7 @@ impl SignalHub {
                     return;
                 }
             }
-            let latest = match self.device_store.get_by_id(&device_id).await {
+            let mut latest = match self.device_store.get_by_id(&device_id).await {
                 Ok(Some(latest)) if !latest.disabled => latest,
                 Ok(_) => {
                     drop(_guard);
@@ -1867,13 +1929,105 @@ impl SignalHub {
                 return;
             }
 
+            // Persist optional Register policy flags strictly inside the per-device lock.
+            // Anonymous connections (`authed_user_id.is_none()`) may ONLY update policy on
+            // unbound devices (`latest.owner_user_id.is_none()`).
+            let can_update_policy = authed_user_id.is_some() || latest.owner_user_id.is_none();
+            let mut policy_write_attempted = false;
+            if can_update_policy {
+                if let Some(allow) = allow_remote_assist_opt {
+                    policy_write_attempted = true;
+                    match self
+                        .device_store
+                        .set_device_allow_remote_assist(&device_id, authed_user_id, allow)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            warn!(
+                                %device_id,
+                                "register allow_remote_assist update affected 0 rows"
+                            );
+                        }
+                        Err(err) => {
+                            warn!(
+                                %device_id,
+                                error = %err,
+                                "failed to persist register allow_remote_assist"
+                            );
+                        }
+                    }
+                }
+                if let Some(allow_rc) = allow_remote_control_opt {
+                    policy_write_attempted = true;
+                    match self
+                        .device_store
+                        .set_device_allow_remote_control(&device_id, authed_user_id, allow_rc)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            warn!(
+                                %device_id,
+                                "register allow_remote_control update affected 0 rows"
+                            );
+                        }
+                        Err(err) => {
+                            warn!(
+                                %device_id,
+                                error = %err,
+                                "failed to persist register allow_remote_control"
+                            );
+                        }
+                    }
+                }
+            } else if allow_remote_assist_opt.is_some() || allow_remote_control_opt.is_some() {
+                warn!(
+                    %device_id,
+                    "ignoring policy flags from unauthenticated register on bound device"
+                );
+            }
+
+            if policy_write_attempted {
+                latest = match self.device_store.get_by_id(&device_id).await {
+                    Ok(Some(rec)) if !rec.disabled => rec,
+                    Ok(_) => {
+                        drop(_guard);
+                        write_frame_with_timeout(
+                            &mut writer,
+                            &SignalMsg::Error {
+                                code: "device_disabled".into(),
+                                message: format!("device {device_id} is disabled"),
+                            },
+                            self.config.write_timeout,
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(err) => {
+                        drop(_guard);
+                        write_frame_with_timeout(
+                            &mut writer,
+                            &SignalMsg::Error {
+                                code: "register_failed".into(),
+                                message: err.to_string(),
+                            },
+                            self.config.write_timeout,
+                        )
+                        .await;
+                        return;
+                    }
+                };
+            }
+
             let effective_owner = authed_user_id;
             let effective_pubkey = if !latest.device_pubkey.is_empty() {
                 latest.device_pubkey.clone()
             } else {
                 device_pubkey.unwrap_or_default()
             };
-            let effective_assist = allow_remote_assist_opt.unwrap_or(latest.allow_remote_assist);
+            let effective_assist = latest.allow_remote_assist;
+            let effective_remote_control = latest.allow_remote_control;
 
             if let Some(old_peer) = self.peers.insert(
                 device_id.clone(),
@@ -1887,6 +2041,7 @@ impl SignalHub {
                     owner_user_id: effective_owner,
                     device_pubkey: effective_pubkey,
                     allow_remote_assist: effective_assist,
+                    allow_remote_control: effective_remote_control,
                     hostname: latest.hostname.clone(),
                     alias: latest.alias.clone(),
                     os: latest.os.clone(),
@@ -1922,6 +2077,7 @@ impl SignalHub {
                 latest.app_version,
                 latest.arch,
                 effective_assist,
+                effective_remote_control,
             )
         };
 
@@ -1944,6 +2100,7 @@ impl SignalHub {
             app_version: &peer_ver,
             arch: &peer_arch,
             allow_remote_assist: peer_assist,
+            allow_remote_control: peer_remote_control,
         });
 
         // Writer task drains bounded channel with per-frame write timeout and immediate kick wakeup.
@@ -2131,6 +2288,7 @@ impl SignalHub {
                 app_version: &peer.app_version,
                 arch: &peer.arch,
                 allow_remote_assist: peer.allow_remote_assist,
+                allow_remote_control: peer.allow_remote_control,
             });
         }
 
@@ -2273,8 +2431,11 @@ impl SignalHub {
                 return Err(("internal_error", "校验当前设备状态失败".to_string()));
             }
         };
-        let in_peers = self.peers.contains_key(target_device_id);
-        let (target_uid, target_allow_assist) = match self
+        let target_peer_rc = self
+            .peers
+            .get(target_device_id)
+            .map(|p| p.allow_remote_control);
+        let (target_uid, target_allow_assist, target_allow_remote_control) = match self
             .device_store
             .get_by_id(target_device_id)
             .await
@@ -2283,10 +2444,18 @@ impl SignalHub {
                 if rec.disabled {
                     return Err(("peer_disabled", "目标设备已被禁用".to_string()));
                 }
-                (rec.owner_user_id, rec.allow_remote_assist)
+                (
+                    rec.owner_user_id,
+                    rec.allow_remote_assist,
+                    rec.allow_remote_control,
+                )
             }
-            Ok(None) if in_peers && !self.config.require_auth && caller_uid.is_none() => {
-                (None, false)
+            Ok(None)
+                if target_peer_rc.is_some()
+                    && !self.config.require_auth
+                    && caller_uid.is_none() =>
+            {
+                (None, false, target_peer_rc.unwrap_or(true))
             }
             Ok(None) => return Err(("peer_not_found", "目标设备不存在".to_string())),
             Err(err) => {
@@ -2294,6 +2463,13 @@ impl SignalHub {
                 return Err(("internal_error", "校验目标设备状态失败".to_string()));
             }
         };
+
+        if !target_allow_remote_control {
+            return Err((
+                "remote_control_disabled",
+                "对方未开启允许远程控制".to_string(),
+            ));
+        }
 
         if let (Some(c_uid), Some(t_uid)) = (caller_uid, target_uid) {
             if c_uid == t_uid {
@@ -2398,23 +2574,144 @@ impl SignalHub {
 
             SignalMsg::UpdateAssistState {
                 allow_remote_assist,
+                allow_remote_control,
             } => {
+                if allow_remote_assist.is_none() && allow_remote_control.is_none() {
+                    Self::send_nonblocking(
+                        self_tx,
+                        device_id,
+                        SignalMsg::Error {
+                            code: "invalid_payload".into(),
+                            message:
+                                "at least one of allow_remote_assist or allow_remote_control is required"
+                                    .into(),
+                        },
+                    );
+                    return;
+                }
+
                 let updated_peer = {
                     let _guard = self.lock_device(device_id).await;
                     if !self.is_active_conn(device_id, conn_id, cancel) {
                         return;
                     }
                     let owner = self.peers.get(device_id).and_then(|p| p.owner_user_id);
-                    if let Err(err) = self
-                        .device_store
-                        .set_device_allow_remote_assist(device_id, owner, allow_remote_assist)
-                        .await
-                    {
-                        warn!(%device_id, error = %err, "failed to persist allow_remote_assist");
+                    if owner.is_none() {
+                        match self.device_store.get_by_id(device_id).await {
+                            Ok(Some(rec)) if rec.owner_user_id.is_some() => {
+                                Self::send_nonblocking(
+                                    self_tx,
+                                    device_id,
+                                    SignalMsg::Error {
+                                        code: "unauthorized".into(),
+                                        message: "device ownership changed".into(),
+                                    },
+                                );
+                                return;
+                            }
+                            Ok(Some(_)) => {}
+                            Ok(None) => {
+                                Self::send_nonblocking(
+                                    self_tx,
+                                    device_id,
+                                    SignalMsg::Error {
+                                        code: "update_failed".into(),
+                                        message: "device not found".into(),
+                                    },
+                                );
+                                return;
+                            }
+                            Err(err) => {
+                                warn!(%device_id, error = %err, "failed to verify device owner before UpdateAssistState");
+                                Self::send_nonblocking(
+                                    self_tx,
+                                    device_id,
+                                    SignalMsg::Error {
+                                        code: "internal_error".into(),
+                                        message: "failed to verify device ownership".into(),
+                                    },
+                                );
+                                return;
+                            }
+                        }
                     }
+
+                    if let Some(allow_assist) = allow_remote_assist {
+                        match self
+                            .device_store
+                            .set_device_allow_remote_assist(device_id, owner, allow_assist)
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                warn!(%device_id, "UpdateAssistState allow_remote_assist affected 0 rows");
+                                Self::send_nonblocking(
+                                    self_tx,
+                                    device_id,
+                                    SignalMsg::Error {
+                                        code: "update_failed".into(),
+                                        message: "failed to update allow_remote_assist".into(),
+                                    },
+                                );
+                                return;
+                            }
+                            Err(err) => {
+                                warn!(%device_id, error = %err, "failed to persist allow_remote_assist");
+                                Self::send_nonblocking(
+                                    self_tx,
+                                    device_id,
+                                    SignalMsg::Error {
+                                        code: "internal_error".into(),
+                                        message: "failed to persist allow_remote_assist".into(),
+                                    },
+                                );
+                                return;
+                            }
+                        }
+                    }
+
+                    if let Some(allow_rc) = allow_remote_control {
+                        match self
+                            .device_store
+                            .set_device_allow_remote_control(device_id, owner, allow_rc)
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                warn!(%device_id, "UpdateAssistState allow_remote_control affected 0 rows");
+                                Self::send_nonblocking(
+                                    self_tx,
+                                    device_id,
+                                    SignalMsg::Error {
+                                        code: "update_failed".into(),
+                                        message: "failed to update allow_remote_control".into(),
+                                    },
+                                );
+                                return;
+                            }
+                            Err(err) => {
+                                warn!(%device_id, error = %err, "failed to persist allow_remote_control");
+                                Self::send_nonblocking(
+                                    self_tx,
+                                    device_id,
+                                    SignalMsg::Error {
+                                        code: "internal_error".into(),
+                                        message: "failed to persist allow_remote_control".into(),
+                                    },
+                                );
+                                return;
+                            }
+                        }
+                    }
+
                     self.peers.get_mut(device_id).and_then(|mut peer| {
                         if peer.conn_id == conn_id {
-                            peer.allow_remote_assist = allow_remote_assist;
+                            if let Some(allow_assist) = allow_remote_assist {
+                                peer.allow_remote_assist = allow_assist;
+                            }
+                            if let Some(allow_rc) = allow_remote_control {
+                                peer.allow_remote_control = allow_rc;
+                            }
                             Some((
                                 peer.owner_user_id,
                                 peer.hostname.clone(),
@@ -2422,6 +2719,8 @@ impl SignalHub {
                                 peer.os.clone(),
                                 peer.app_version.clone(),
                                 peer.arch.clone(),
+                                peer.allow_remote_assist,
+                                peer.allow_remote_control,
                             ))
                         } else {
                             None
@@ -2429,7 +2728,17 @@ impl SignalHub {
                     })
                 };
 
-                if let Some((owner, hostname, alias, os, app_version, arch)) = updated_peer {
+                if let Some((
+                    owner,
+                    hostname,
+                    alias,
+                    os,
+                    app_version,
+                    arch,
+                    effective_assist,
+                    effective_remote_control,
+                )) = updated_peer
+                {
                     self.broadcast_user_device_status(DeviceStatusBroadcast {
                         owner_user_id: owner,
                         device_id,
@@ -2439,7 +2748,8 @@ impl SignalHub {
                         os: &os,
                         app_version: &app_version,
                         arch: &arch,
-                        allow_remote_assist,
+                        allow_remote_assist: effective_assist,
+                        allow_remote_control: effective_remote_control,
                     });
                 }
             }
@@ -3096,6 +3406,7 @@ mod tests {
                 access_token: None,
                 device_pubkey: None,
                 allow_remote_assist: None,
+                allow_remote_control: None,
             },
         )
         .await
@@ -3194,6 +3505,7 @@ mod tests {
                 access_token: None,
                 device_pubkey: None,
                 allow_remote_assist: None,
+                allow_remote_control: None,
             },
         )
         .await
@@ -3218,6 +3530,7 @@ mod tests {
                 access_token: None,
                 device_pubkey: None,
                 allow_remote_assist: None,
+                allow_remote_control: None,
             },
         )
         .await
@@ -3404,6 +3717,7 @@ mod tests {
                 access_token: None,
                 device_pubkey: None,
                 allow_remote_assist: None,
+                allow_remote_control: None,
             },
         )
         .await
@@ -3445,6 +3759,7 @@ mod tests {
                 access_token: None,
                 device_pubkey: None,
                 allow_remote_assist: None,
+                allow_remote_control: None,
             },
         )
         .await
@@ -3475,6 +3790,7 @@ mod tests {
                 access_token: None,
                 device_pubkey: None,
                 allow_remote_assist: None,
+                allow_remote_control: None,
             },
         )
         .await
@@ -3500,6 +3816,7 @@ mod tests {
                 access_token: None,
                 device_pubkey: None,
                 allow_remote_assist: None,
+                allow_remote_control: None,
             },
         )
         .await
@@ -3580,6 +3897,7 @@ mod tests {
                 access_token: None,
                 device_pubkey: None,
                 allow_remote_assist: None,
+                allow_remote_control: None,
             },
         )
         .await
@@ -3610,6 +3928,7 @@ mod tests {
                 access_token: None,
                 device_pubkey: None,
                 allow_remote_assist: None,
+                allow_remote_control: None,
             },
         )
         .await
@@ -3667,6 +3986,7 @@ mod tests {
                 access_token: None,
                 device_pubkey: None,
                 allow_remote_assist: None,
+                allow_remote_control: None,
             },
         )
         .await
@@ -3695,6 +4015,7 @@ mod tests {
                 access_token: None,
                 device_pubkey: None,
                 allow_remote_assist: None,
+                allow_remote_control: None,
             },
         )
         .await
@@ -3765,6 +4086,7 @@ mod tests {
                 access_token: None,
                 device_pubkey: None,
                 allow_remote_assist: None,
+                allow_remote_control: None,
             },
         )
         .await
@@ -3842,6 +4164,7 @@ mod tests {
                     access_token: None,
                     device_pubkey: None,
                     allow_remote_assist: None,
+                    allow_remote_control: None,
                 },
             )
             .await
@@ -3869,6 +4192,7 @@ mod tests {
                     access_token: None,
                     device_pubkey: None,
                     allow_remote_assist: None,
+                    allow_remote_control: None,
                 },
             )
             .await
@@ -3896,6 +4220,7 @@ mod tests {
                     access_token: None,
                     device_pubkey: None,
                     allow_remote_assist: None,
+                    allow_remote_control: None,
                 },
             )
             .await
@@ -4058,6 +4383,7 @@ mod tests {
                 access_token: None,
                 device_pubkey: None,
                 allow_remote_assist: None,
+                allow_remote_control: None,
             },
         )
         .await
@@ -4109,6 +4435,7 @@ mod tests {
                 access_token: None,
                 device_pubkey: None,
                 allow_remote_assist: None,
+                allow_remote_control: None,
             },
         )
         .await
@@ -4176,6 +4503,7 @@ mod tests {
                 access_token: None,
                 device_pubkey: None,
                 allow_remote_assist: None,
+                allow_remote_control: None,
             },
         )
         .await
@@ -4226,6 +4554,7 @@ mod tests {
                 access_token: None,
                 device_pubkey: None,
                 allow_remote_assist: None,
+                allow_remote_control: None,
             },
         )
         .await
@@ -4501,6 +4830,7 @@ mod tests {
                 access_token: None,
                 device_pubkey: None,
                 allow_remote_assist: None,
+                allow_remote_control: None,
             },
             SignalMsg::Register {
                 device_id: None,
@@ -4514,6 +4844,7 @@ mod tests {
                 access_token: None,
                 device_pubkey: None,
                 allow_remote_assist: None,
+                allow_remote_control: None,
             },
             SignalMsg::Register {
                 device_id: None,
@@ -4527,6 +4858,7 @@ mod tests {
                 access_token: None,
                 device_pubkey: None,
                 allow_remote_assist: None,
+                allow_remote_control: None,
             },
         ] {
             let mut s = TcpStream::connect(tcp_addr).await.unwrap();
@@ -4807,6 +5139,7 @@ mod tests {
                     owner_user_id: None,
                     device_pubkey: String::new(),
                     allow_remote_assist: false,
+                    allow_remote_control: true,
                     hostname: String::new(),
                     alias: String::new(),
                     os: String::new(),
@@ -4929,6 +5262,7 @@ mod tests {
                 access_token: None,
                 device_pubkey: None,
                 allow_remote_assist: None,
+                allow_remote_control: None,
             },
         )
         .await
@@ -5003,6 +5337,7 @@ mod tests {
                         access_token: None,
                         device_pubkey: None,
                         allow_remote_assist: None,
+                        allow_remote_control: None,
                     },
                 )
                 .await;
@@ -5056,6 +5391,7 @@ mod tests {
                         access_token: None,
                         device_pubkey: None,
                         allow_remote_assist: None,
+                        allow_remote_control: None,
                     },
                 )
                 .await;
@@ -5225,5 +5561,241 @@ mod tests {
             0,
             "MemoryEphemeralStore reports exact counts so fallback issued_relay_tokens must not accumulate"
         );
+    }
+
+    #[test]
+    fn legacy_wire_frames_without_allow_remote_control_deserialize_cleanly() {
+        let reg_json = br#"{"type":"register","device_key":"ed25519:legacy-k","hostname":"old-box","os":"macos","allow_remote_assist":false}"#;
+        let reg: SignalMsg = serde_json::from_slice(reg_json).unwrap();
+        assert!(matches!(
+            reg,
+            SignalMsg::Register {
+                allow_remote_assist: Some(false),
+                allow_remote_control: None,
+                ..
+            }
+        ));
+
+        let upd_json = br#"{"type":"update_assist_state","allow_remote_assist":true}"#;
+        let upd: SignalMsg = serde_json::from_slice(upd_json).unwrap();
+        assert_eq!(
+            upd,
+            SignalMsg::UpdateAssistState {
+                allow_remote_assist: Some(true),
+                allow_remote_control: None,
+            }
+        );
+
+        let upd_rc_only_json = br#"{"type":"update_assist_state","allow_remote_control":false}"#;
+        let upd_rc_only: SignalMsg = serde_json::from_slice(upd_rc_only_json).unwrap();
+        assert_eq!(
+            upd_rc_only,
+            SignalMsg::UpdateAssistState {
+                allow_remote_assist: None,
+                allow_remote_control: Some(false),
+            }
+        );
+
+        let upd_full_json =
+            br#"{"type":"update_assist_state","allow_remote_assist":false,"allow_remote_control":true}"#;
+        let upd_full: SignalMsg = serde_json::from_slice(upd_full_json).unwrap();
+        assert_eq!(
+            upd_full,
+            SignalMsg::UpdateAssistState {
+                allow_remote_assist: Some(false),
+                allow_remote_control: Some(true),
+            }
+        );
+
+        let status_json = br#"{"type":"device_status_changed","device_id":"123456789","online":true,"hostname":"h","alias":"","os":"macos","allow_remote_assist":false}"#;
+        let status: SignalMsg = serde_json::from_slice(status_json).unwrap();
+        assert!(matches!(
+            status,
+            SignalMsg::DeviceStatusChanged {
+                allow_remote_assist: false,
+                allow_remote_control: true,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn anonymous_no_auth_mode_still_blocks_remote_control_disabled_and_partial_update_preserves_assist(
+    ) {
+        let store = Arc::new(MemoryDeviceStore::new());
+        let ephemeral = Arc::new(MemoryEphemeralStore::new());
+        // Legacy constructor forces `require_auth = false`.
+        let hub = Arc::new(SignalHub::new(
+            store.clone(),
+            ephemeral.clone(),
+            SignalConfig::default(),
+        ));
+        assert!(!hub.config().require_auth);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(hub.clone().serve_tcp_signaling_on_listener(listener));
+
+        // 1. Register anonymous desktop client and anonymous Android host (allow_remote_control defaults to false).
+        let (mut desktop, _) = register_peer_helper(tcp_addr, "ed25519:anon-desktop", vec![]).await;
+
+        let mut android = TcpStream::connect(tcp_addr).await.unwrap();
+        write_signal_frame(
+            &mut android,
+            &SignalMsg::Register {
+                device_id: None,
+                device_key: "ed25519:anon-android".into(),
+                hostname: "Pixel-Anon".into(),
+                os: "Android 15".into(),
+                app_version: String::new(),
+                arch: String::new(),
+                device_group: String::new(),
+                lan_addrs: vec![],
+                access_token: None,
+                device_pubkey: None,
+                allow_remote_assist: Some(true),
+                allow_remote_control: None,
+            },
+        )
+        .await
+        .unwrap();
+        let android_id = match read_signal_frame(&mut android).await.unwrap().unwrap() {
+            SignalMsg::Registered { device_id, .. } => device_id,
+            other => panic!("expected Registered for android, got {other:?}"),
+        };
+        let android_rec = store.get_by_id(&android_id).await.unwrap().unwrap();
+        assert!(android_rec.allow_remote_assist);
+        assert!(!android_rec.allow_remote_control);
+
+        // Even with require_auth == false and both peers anonymous, ConnectRequest & RelayAlloc MUST be rejected!
+        write_signal_frame(
+            &mut desktop,
+            &SignalMsg::ConnectRequest {
+                target_id: android_id.clone(),
+                session_id: Some("anon-blocked-punch".into()),
+                lan_addrs: vec![],
+                nonce: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut desktop).await.unwrap().unwrap(),
+            SignalMsg::Error { ref code, .. } if code == "remote_control_disabled"
+        ));
+        assert_eq!(ephemeral.active_token_count(), 0);
+
+        write_signal_frame(
+            &mut desktop,
+            &SignalMsg::RelayAlloc {
+                target_id: android_id.clone(),
+                session_id: Some("anon-blocked-relay".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut desktop).await.unwrap().unwrap(),
+            SignalMsg::Error { ref code, .. } if code == "remote_control_disabled"
+        ));
+        assert_eq!(ephemeral.active_token_count(), 0);
+
+        // Synthetic in-peers-only target (no DB row) with allow_remote_control = false MUST also be rejected!
+        let (synth_tx, _synth_rx) = mpsc::channel::<SignalMsg>(4);
+        let synth_id = "777666555".to_string();
+        hub.peers.insert(
+            synth_id.clone(),
+            ActivePeer {
+                conn_id: 777_777,
+                tx: synth_tx,
+                cancel: PeerCancel::new(),
+                lan_addrs: vec![],
+                remote_addr: "127.0.0.1:50000".parse().unwrap(),
+                connected_at: Utc::now(),
+                owner_user_id: None,
+                device_pubkey: String::new(),
+                allow_remote_assist: true,
+                allow_remote_control: false,
+                hostname: "synth".into(),
+                alias: String::new(),
+                os: "android".into(),
+                app_version: String::new(),
+                arch: String::new(),
+            },
+        );
+        write_signal_frame(
+            &mut desktop,
+            &SignalMsg::ConnectRequest {
+                target_id: synth_id.clone(),
+                session_id: Some("synth-blocked".into()),
+                lan_addrs: vec![],
+                nonce: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut desktop).await.unwrap().unwrap(),
+            SignalMsg::Error { ref code, .. } if code == "remote_control_disabled"
+        ));
+        hub.peers.remove(&synth_id);
+
+        // 2. Partial UpdateAssistState with ONLY allow_remote_control=Some(true) (allow_remote_assist omitted)
+        //    must preserve existing allow_remote_assist=true without overwriting it!
+        write_signal_frame(
+            &mut android,
+            &SignalMsg::UpdateAssistState {
+                allow_remote_assist: None,
+                allow_remote_control: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+        // Wait briefly for server loop to persist, then verify via ConnectRequest + DB.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let after_enable = store.get_by_id(&android_id).await.unwrap().unwrap();
+        assert!(after_enable.allow_remote_control);
+        assert!(
+            after_enable.allow_remote_assist,
+            "omitting allow_remote_assist must preserve existing true value"
+        );
+
+        // Now turn off allow_remote_control ONLY (allow_remote_assist omitted) -> assist stays true, rc becomes false!
+        write_signal_frame(
+            &mut android,
+            &SignalMsg::UpdateAssistState {
+                allow_remote_assist: None,
+                allow_remote_control: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let after_disable = store.get_by_id(&android_id).await.unwrap().unwrap();
+        assert!(!after_disable.allow_remote_control);
+        assert!(
+            after_disable.allow_remote_assist,
+            "partial UpdateAssistState with only allow_remote_control=Some(false) must not overwrite allow_remote_assist"
+        );
+
+        // Empty UpdateAssistState (both None) returns invalid_payload error.
+        write_signal_frame(
+            &mut android,
+            &SignalMsg::UpdateAssistState {
+                allow_remote_assist: None,
+                allow_remote_control: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut android).await.unwrap().unwrap(),
+            SignalMsg::Error { ref code, .. } if code == "invalid_payload"
+        ));
+
+        drop(desktop);
+        drop(android);
+        hub.shutdown_all().await;
+        let _ = server_task.await;
     }
 }

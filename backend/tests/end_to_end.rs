@@ -329,6 +329,7 @@ async fn full_flow_register_udp_signal_relay_2mib_and_api_stats() {
             access_token: None,
             device_pubkey: None,
             allow_remote_assist: None,
+            allow_remote_control: None,
         },
     )
     .await
@@ -353,6 +354,7 @@ async fn full_flow_register_udp_signal_relay_2mib_and_api_stats() {
             access_token: None,
             device_pubkey: None,
             allow_remote_assist: None,
+            allow_remote_control: None,
         },
     )
     .await
@@ -857,6 +859,7 @@ async fn admin_disable_device_kicks_online_peer_and_blocks_reregister() {
             access_token: None,
             device_pubkey: None,
             allow_remote_assist: None,
+            allow_remote_control: None,
         },
     )
     .await
@@ -918,6 +921,7 @@ async fn admin_disable_device_kicks_online_peer_and_blocks_reregister() {
             access_token: None,
             device_pubkey: None,
             allow_remote_assist: None,
+            allow_remote_control: None,
         },
     )
     .await

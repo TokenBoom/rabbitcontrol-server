@@ -210,21 +210,28 @@ export function DevicesPage() {
                       )}
                     </td>
                     <td>
-                      {d.disabled ? (
-                        <span className="badge badge-danger">已禁用</span>
-                      ) : d.in_session ? (
-                        <span className="badge badge-primary">
-                          <span className="badge-dot" />
-                          会话中
-                        </span>
-                      ) : d.online ? (
-                        <span className="badge badge-success">
-                          <span className="badge-dot" />
-                          在线
-                        </span>
-                      ) : (
-                        <span className="badge badge-neutral">离线</span>
-                      )}
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
+                        {d.disabled ? (
+                          <span className="badge badge-danger">已禁用</span>
+                        ) : d.in_session ? (
+                          <span className="badge badge-primary">
+                            <span className="badge-dot" />
+                            会话中
+                          </span>
+                        ) : d.online ? (
+                          <span className="badge badge-success">
+                            <span className="badge-dot" />
+                            在线
+                          </span>
+                        ) : (
+                          <span className="badge badge-neutral">离线</span>
+                        )}
+                        {!d.disabled && d.allow_remote_control === false && (
+                          <span className="badge badge-warning" title="该设备未开启允许被远程控制（含本人自控）">
+                            禁止远控
+                          </span>
+                        )}
+                      </div>
                     </td>
                     <td>
                       <div style={{ fontSize: 12.5 }}>{formatRelativeTime(d.last_seen_at)}</div>
