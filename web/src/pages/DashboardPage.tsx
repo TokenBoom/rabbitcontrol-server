@@ -11,10 +11,11 @@ import {
   ShieldCheck,
   Wifi,
 } from 'lucide-react';
-import { ApiError, apiClient } from '../api/client';
+import { apiClient } from '../api/client';
 import { useToast } from '../components/Toast';
 import type { NavTab } from '../components/AdminLayout';
 import type { DeviceView, HealthResponse, RelaySessionInfo, StatsResponse } from '../types/api';
+import { formatApiErrorToast } from '../utils/errorDisplay';
 import { formatBytes, formatDeviceId, formatDuration, formatRelativeTime } from '../utils/format';
 
 interface DashboardPageProps {
@@ -46,9 +47,12 @@ export function DashboardPage({ onNavigate }: DashboardPageProps) {
       setSessions(sess.sessions.slice(0, 5));
       setDevices(devs.devices.slice(0, 5));
     } catch (err) {
-      const msg = err instanceof ApiError ? err.message : '加载运行指标失败';
-      setErrorMsg(msg);
-      if (!silent) pushToast('error', '数据刷新失败', msg);
+      const { title, detail } = formatApiErrorToast(err, {
+        fallbackTitle: '数据刷新失败',
+        fallbackMessage: '加载运行指标失败，请稍后重试。',
+      });
+      setErrorMsg(`${title}：${detail}`);
+      if (!silent) pushToast('error', title, detail);
     } finally {
       setLoading(false);
     }

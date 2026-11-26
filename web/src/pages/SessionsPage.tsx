@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Activity, AlertTriangle, RefreshCw, Unplug } from 'lucide-react';
-import { ApiError, apiClient } from '../api/client';
+import { apiClient } from '../api/client';
 import { Modal } from '../components/Modal';
 import { useToast } from '../components/Toast';
 import type { RelaySessionInfo } from '../types/api';
+import { formatApiErrorToast } from '../utils/errorDisplay';
 import { formatBytes, formatDateTime, formatDeviceId, formatDuration } from '../utils/format';
 
 export function SessionsPage() {
@@ -21,8 +22,11 @@ export function SessionsPage() {
         const res = await apiClient.listSessions();
         setSessions(res.sessions);
       } catch (err) {
-        const msg = err instanceof ApiError ? err.message : '获取中继会话失败';
-        if (!silent) pushToast('error', '加载失败', msg);
+        const { title, detail } = formatApiErrorToast(err, {
+          fallbackTitle: '加载失败',
+          fallbackMessage: '获取中继会话失败，请稍后重试。',
+        });
+        if (!silent) pushToast('error', title, detail);
       } finally {
         setLoading(false);
       }
@@ -51,8 +55,11 @@ export function SessionsPage() {
       setKickTarget(null);
       await loadSessions();
     } catch (err) {
-      const msg = err instanceof ApiError ? err.message : '强断会话失败';
-      pushToast('error', '操作失败', msg);
+      const { title, detail } = formatApiErrorToast(err, {
+        fallbackTitle: '操作失败',
+        fallbackMessage: '强断会话失败，请稍后重试。',
+      });
+      pushToast('error', title, detail);
     } finally {
       setKicking(false);
     }

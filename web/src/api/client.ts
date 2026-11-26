@@ -17,6 +17,7 @@ import type {
   UsersListResponse,
 } from '../types/api';
 import { MockApiError, mockServer } from './mockServer';
+import { formatApiErrorMessage } from '../utils/errorDisplay';
 
 const SESSION_STORAGE_KEY = 'rc_admin_session';
 const MODE_STORAGE_KEY = 'rc_admin_api_mode';
@@ -156,7 +157,7 @@ async function refreshRealSession(
           return null;
         }
         saveStoredSession(null);
-        handlers.onAuthExpired?.(parsed.message || '登录凭证已过期，请重新登录');
+        handlers.onAuthExpired?.(formatApiErrorMessage(parsed));
         return null;
       }
 
@@ -248,7 +249,7 @@ async function realRequest<T>(
         handlers.onPasswordChangeRequired?.();
       } else if (res.status === 403 && err.code === 'account_disabled' && auth) {
         saveStoredSession(null);
-        handlers.onAuthExpired?.(err.message || '当前账号已被禁用');
+        handlers.onAuthExpired?.(formatApiErrorMessage(err));
       }
     }
     throw err;
@@ -266,15 +267,16 @@ async function realRequest<T>(
 
 function wrapMockError(err: unknown, startGen?: number): never {
   if (err instanceof MockApiError) {
+    const apiErr = new ApiError(err.status, err.code, err.message);
     const sameGen = startGen === undefined || startGen === authGeneration;
     if (sameGen && err.status === 403 && err.code === 'password_change_required') {
       handlers.onPasswordChangeRequired?.();
     }
     if (sameGen && err.status === 401) {
       saveStoredSession(null);
-      handlers.onAuthExpired?.(err.message);
+      handlers.onAuthExpired?.(formatApiErrorMessage(apiErr));
     }
-    throw new ApiError(err.status, err.code, err.message);
+    throw apiErr;
   }
   throw err;
 }

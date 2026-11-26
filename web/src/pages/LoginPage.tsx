@@ -1,9 +1,11 @@
 import React, { useState } from 'react';
 import { AlertCircle, Eye, EyeOff, FlaskConical, Lock, Mail, Server } from 'lucide-react';
-import { ApiError, apiClient, type StoredSession } from '../api/client';
+import { apiClient, type StoredSession } from '../api/client';
 import { BrandMark } from '../components/BrandMark';
 import { useToast } from '../components/Toast';
+import type { UiError } from '../generated/errorCatalog';
 import type { ApiMode } from '../types/api';
+import { resolveUiError } from '../utils/errorDisplay';
 import { isValidEmail } from '../utils/format';
 
 interface LoginPageProps {
@@ -25,10 +27,12 @@ export function LoginPage({
   const [showPassword, setShowPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(initialNotice ?? null);
+  const [uiError, setUiError] = useState<UiError | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
+    setUiError(null);
 
     if (!isValidEmail(email)) {
       setErrorMsg('请输入有效的管理员邮箱地址');
@@ -49,11 +53,13 @@ export function LoginPage({
       }
       onLoginSuccess(session);
     } catch (err) {
-      if (err instanceof ApiError) {
-        setErrorMsg(err.message);
-      } else {
-        setErrorMsg('登录失败，请稍后重试');
-      }
+      setUiError(
+        resolveUiError(err, {
+          context: 'unauthenticated',
+          fallbackTitle: '登录失败',
+          fallbackMessage: '登录请求未能完成，请稍后重试。',
+        }),
+      );
     } finally {
       setSubmitting(false);
     }
@@ -63,6 +69,7 @@ export function LoginPage({
     setEmail(demoEmail);
     setPassword(demoPwd);
     setErrorMsg(null);
+    setUiError(null);
   };
 
   return (
@@ -85,10 +92,22 @@ export function LoginPage({
           使用管理员邮箱与密码登录；首次使用初始凭证将强制引导修改密码。
         </p>
 
-        {errorMsg && (
+        {(uiError || errorMsg) && (
           <div className="alert alert-danger" style={{ marginBottom: 16 }}>
             <AlertCircle size={17} style={{ flexShrink: 0, marginTop: 1 }} />
-            <span>{errorMsg}</span>
+            {uiError ? (
+              <div>
+                <div style={{ fontWeight: 600 }}>{uiError.title}</div>
+                <div style={{ marginTop: 2 }}>{uiError.message}</div>
+                {uiError.suggestion && (
+                  <div style={{ marginTop: 4, fontSize: 12.5, opacity: 0.9 }}>
+                    {uiError.suggestion}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <span>{errorMsg}</span>
+            )}
           </div>
         )}
 

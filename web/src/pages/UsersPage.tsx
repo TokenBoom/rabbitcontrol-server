@@ -13,10 +13,11 @@ import {
   UserX,
   Wand2,
 } from 'lucide-react';
-import { ApiError, apiClient } from '../api/client';
+import { apiClient } from '../api/client';
 import { Modal } from '../components/Modal';
 import { useToast } from '../components/Toast';
 import type { AdminUser, AuthUser, UserRole, UserStatus } from '../types/api';
+import { formatApiErrorMessage, formatApiErrorToast } from '../utils/errorDisplay';
 import { formatDateTime, formatRelativeTime, generateStrongPassword, isValidEmail } from '../utils/format';
 
 interface UsersPageProps {
@@ -78,8 +79,11 @@ export function UsersPage({ currentUser }: UsersPageProps) {
       setUsers(res.users);
       setTotal(res.total);
     } catch (err) {
-      const msg = err instanceof ApiError ? err.message : '获取用户列表失败';
-      pushToast('error', '加载用户失败', msg);
+      const { title, detail } = formatApiErrorToast(err, {
+        fallbackTitle: '加载用户失败',
+        fallbackMessage: '获取用户列表失败，请稍后重试。',
+      });
+      pushToast('error', title, detail);
     } finally {
       setLoading(false);
     }
@@ -143,7 +147,12 @@ export function UsersPage({ currentUser }: UsersPageProps) {
       setOffset(0);
       await loadUsers();
     } catch (err) {
-      setCreateError(err instanceof ApiError ? err.message : '创建用户失败');
+      setCreateError(
+        formatApiErrorMessage(err, {
+          fallbackTitle: '创建用户失败',
+          fallbackMessage: '创建用户失败，请检查输入后重试。',
+        }),
+      );
     } finally {
       setCreateSubmitting(false);
     }
@@ -201,7 +210,12 @@ export function UsersPage({ currentUser }: UsersPageProps) {
       setEditTarget(null);
       await loadUsers();
     } catch (err) {
-      setEditError(err instanceof ApiError ? err.message : '保存修改失败');
+      setEditError(
+        formatApiErrorMessage(err, {
+          fallbackTitle: '保存修改失败',
+          fallbackMessage: '保存用户信息失败，请稍后重试。',
+        }),
+      );
     } finally {
       setEditSubmitting(false);
     }
@@ -220,8 +234,11 @@ export function UsersPage({ currentUser }: UsersPageProps) {
       );
       await loadUsers();
     } catch (err) {
-      const msg = err instanceof ApiError ? err.message : '更新状态失败';
-      pushToast('error', '操作失败', msg);
+      const { title, detail } = formatApiErrorToast(err, {
+        fallbackTitle: '操作失败',
+        fallbackMessage: '更新用户状态失败，请稍后重试。',
+      });
+      pushToast('error', title, detail);
     }
   };
 
@@ -242,8 +259,11 @@ export function UsersPage({ currentUser }: UsersPageProps) {
         await loadUsers();
       }
     } catch (err) {
-      const msg = err instanceof ApiError ? err.message : '删除用户失败';
-      pushToast('error', '删除失败', msg);
+      const { title, detail } = formatApiErrorToast(err, {
+        fallbackTitle: '删除失败',
+        fallbackMessage: '删除用户失败，请稍后重试。',
+      });
+      pushToast('error', title, detail);
     } finally {
       setDeleteSubmitting(false);
     }

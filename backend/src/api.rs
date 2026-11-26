@@ -36,6 +36,7 @@ use crate::auth::{
     AccessTokenClaims, AuthAuthority, AuthError, ACCESS_TOKEN_TTL, REFRESH_TOKEN_TTL,
 };
 use crate::ephemeral::{EphemeralStore, SettingsCache};
+use crate::generated::error_codes::wire as err_code;
 use crate::pki::{PkiAuthority, PkiError};
 use crate::relay::{RelayServer, RelaySessionInfo};
 use crate::signal::{canonical_ip, SignalHub};
@@ -216,21 +217,25 @@ fn api_error(status: StatusCode, error: impl Into<String>, message: impl Into<St
 
 fn map_store_error(err: StoreError, context: &'static str) -> Response {
     match err {
-        StoreError::InvalidInput(msg) => api_error(StatusCode::BAD_REQUEST, "invalid_input", msg),
-        StoreError::Conflict(msg) => api_error(StatusCode::CONFLICT, "conflict", msg),
-        StoreError::NotFound(msg) => api_error(StatusCode::NOT_FOUND, "not_found", msg),
-        StoreError::Forbidden(msg) => api_error(StatusCode::FORBIDDEN, "forbidden", msg),
-        StoreError::Unauthorized(msg) => api_error(StatusCode::UNAUTHORIZED, "unauthorized", msg),
+        StoreError::InvalidInput(msg) => {
+            api_error(StatusCode::BAD_REQUEST, err_code::INVALID_INPUT, msg)
+        }
+        StoreError::Conflict(msg) => api_error(StatusCode::CONFLICT, err_code::CONFLICT, msg),
+        StoreError::NotFound(msg) => api_error(StatusCode::NOT_FOUND, err_code::NOT_FOUND, msg),
+        StoreError::Forbidden(msg) => api_error(StatusCode::FORBIDDEN, err_code::FORBIDDEN, msg),
+        StoreError::Unauthorized(msg) => {
+            api_error(StatusCode::UNAUTHORIZED, err_code::UNAUTHORIZED, msg)
+        }
         StoreError::DeviceDisabled(id) => api_error(
             StatusCode::FORBIDDEN,
-            "device_disabled",
+            err_code::DEVICE_DISABLED,
             format!("device {id} is disabled"),
         ),
         StoreError::Cache(msg) => {
             warn!(error = %msg, context, "ephemeral cache coherence operation failed");
             api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "cache_unavailable",
+                err_code::CACHE_UNAVAILABLE,
                 "settings cache temporarily unavailable",
             )
         }
@@ -238,7 +243,7 @@ fn map_store_error(err: StoreError, context: &'static str) -> Response {
             warn!(error = %other, context, "store operation failed");
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "database_error",
+                err_code::DATABASE_ERROR,
                 "internal storage error",
             )
         }
@@ -262,17 +267,17 @@ where
             Err(rejection) => {
                 let status = rejection.status();
                 let code = match rejection {
-                    JsonRejection::JsonDataError(_) => "invalid_json_data",
-                    JsonRejection::JsonSyntaxError(_) => "invalid_json_syntax",
-                    JsonRejection::MissingJsonContentType(_) => "missing_json_content_type",
+                    JsonRejection::JsonDataError(_) => err_code::INVALID_JSON_DATA,
+                    JsonRejection::JsonSyntaxError(_) => err_code::INVALID_JSON_SYNTAX,
+                    JsonRejection::MissingJsonContentType(_) => err_code::MISSING_JSON_CONTENT_TYPE,
                     JsonRejection::BytesRejection(_) => {
                         if status == StatusCode::PAYLOAD_TOO_LARGE {
-                            "payload_too_large"
+                            err_code::PAYLOAD_TOO_LARGE
                         } else {
-                            "invalid_body"
+                            err_code::INVALID_BODY
                         }
                     }
-                    _ => "invalid_json",
+                    _ => err_code::INVALID_JSON,
                 };
                 Err(api_error(status, code, rejection.body_text()))
             }
@@ -354,7 +359,7 @@ async fn authenticate_bearer_user(
 ) -> Result<AuthenticatedUser, Box<Response>> {
     let Some(token) = extract_bearer_token(headers) else {
         return Err(Box::new(unauthorized_response(
-            "unauthorized",
+            err_code::UNAUTHORIZED,
             "missing bearer token",
         )));
     };
@@ -363,13 +368,13 @@ async fn authenticate_bearer_user(
         Ok(c) => c,
         Err(AuthError::TokenExpired) => {
             return Err(Box::new(unauthorized_response(
-                "token_expired",
+                err_code::TOKEN_EXPIRED,
                 "access token expired",
             )));
         }
         Err(_) => {
             return Err(Box::new(unauthorized_response(
-                "unauthorized",
+                err_code::UNAUTHORIZED,
                 "invalid access token",
             )));
         }
@@ -379,7 +384,7 @@ async fn authenticate_bearer_user(
         Ok(Some(u)) => u,
         Ok(None) => {
             return Err(Box::new(unauthorized_response(
-                "unauthorized",
+                err_code::UNAUTHORIZED,
                 "user account not found",
             )));
         }
@@ -387,7 +392,7 @@ async fn authenticate_bearer_user(
             warn!(error = %err, "failed to load authenticated user");
             return Err(Box::new(api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "database_error",
+                err_code::DATABASE_ERROR,
                 "failed to verify user",
             )));
         }
@@ -396,13 +401,13 @@ async fn authenticate_bearer_user(
     if user.status != STATUS_ACTIVE {
         return Err(Box::new(api_error(
             StatusCode::FORBIDDEN,
-            "account_disabled",
+            err_code::ACCOUNT_DISABLED,
             "user account is disabled",
         )));
     }
     if user.token_version != claims.ver {
         return Err(Box::new(unauthorized_response(
-            "token_revoked",
+            err_code::TOKEN_REVOKED,
             "access token has been revoked",
         )));
     }
@@ -410,14 +415,14 @@ async fn authenticate_bearer_user(
         Ok(Some(sess)) => {
             if sess.revoked_at.is_some() {
                 return Err(Box::new(unauthorized_response(
-                    "token_revoked",
+                    err_code::TOKEN_REVOKED,
                     "session has been revoked",
                 )));
             }
         }
         Ok(None) => {
             return Err(Box::new(unauthorized_response(
-                "token_revoked",
+                err_code::TOKEN_REVOKED,
                 "session not found or expired",
             )));
         }
@@ -425,7 +430,7 @@ async fn authenticate_bearer_user(
             warn!(error = %err, "failed to verify user session");
             return Err(Box::new(api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "database_error",
+                err_code::DATABASE_ERROR,
                 "failed to verify session",
             )));
         }
@@ -458,7 +463,7 @@ async fn require_user_auth_full(
             if authed.user.must_change_password || authed.claims.pwd_change_only {
                 return api_error(
                     StatusCode::FORBIDDEN,
-                    "password_change_required",
+                    err_code::PASSWORD_CHANGE_REQUIRED,
                     "initial password must be changed before accessing this endpoint",
                 );
             }
@@ -487,14 +492,14 @@ async fn require_admin_auth(
                 if authed.user.must_change_password || authed.claims.pwd_change_only {
                     return api_error(
                         StatusCode::FORBIDDEN,
-                        "password_change_required",
+                        err_code::PASSWORD_CHANGE_REQUIRED,
                         "initial password must be changed before accessing admin endpoints",
                     );
                 }
                 if authed.user.role != ROLE_ADMIN {
                     return api_error(
                         StatusCode::FORBIDDEN,
-                        "forbidden",
+                        err_code::FORBIDDEN,
                         "administrator privileges required",
                     );
                 }
@@ -512,7 +517,10 @@ async fn require_admin_auth(
         return next.run(request).await;
     }
 
-    unauthorized_response("unauthorized", "missing or invalid admin bearer token")
+    unauthorized_response(
+        err_code::UNAUTHORIZED,
+        "missing or invalid admin bearer token",
+    )
 }
 
 fn validate_password_policy(password: &str) -> Result<(), &'static str> {
@@ -681,7 +689,7 @@ async fn register_and_bind_device_for_user(
         .ok_or_else(|| {
             Box::new(api_error(
                 StatusCode::NOT_FOUND,
-                "device_not_found",
+                err_code::DEVICE_NOT_FOUND,
                 "device vanished",
             ))
         })?;
@@ -692,7 +700,7 @@ async fn register_and_bind_device_for_user(
                 state,
                 &bound.device_id,
                 prev_uid,
-                "device_rebound_to_another_user",
+                err_code::DEVICE_REBOUND_TO_ANOTHER_USER,
             )
             .await;
         }
@@ -1300,7 +1308,11 @@ pub fn router_with_mode(state: AppState, mode: RouterMode) -> Router {
 }
 
 async fn api_not_found() -> Response {
-    api_error(StatusCode::NOT_FOUND, "not_found", "API route not found")
+    api_error(
+        StatusCode::NOT_FOUND,
+        err_code::NOT_FOUND,
+        "API route not found",
+    )
 }
 
 /// Serve `app` over TLS (`tokio_rustls::TlsAcceptor`) with `ConnectInfo<SocketAddr>`
@@ -1484,7 +1496,7 @@ async fn post_auth_register(
     if !state.auth_rate_limiter.check_ip(client_ip) {
         return api_error(
             StatusCode::TOO_MANY_REQUESTS,
-            "rate_limited",
+            err_code::RATE_LIMITED,
             "too many authentication attempts from this IP",
         );
     }
@@ -1494,7 +1506,7 @@ async fn post_auth_register(
         Ok(false) => {
             return api_error(
                 StatusCode::FORBIDDEN,
-                "registration_disabled",
+                err_code::REGISTRATION_DISABLED,
                 "self-service user registration is currently disabled",
             );
         }
@@ -1508,13 +1520,13 @@ async fn post_auth_register(
     if !state.auth_rate_limiter.check_email(&email) {
         return api_error(
             StatusCode::TOO_MANY_REQUESTS,
-            "rate_limited",
+            err_code::RATE_LIMITED,
             "too many authentication attempts for this email",
         );
     }
 
     if let Err(msg) = validate_password_policy(&req.password) {
-        return api_error(StatusCode::BAD_REQUEST, "invalid_input", msg);
+        return api_error(StatusCode::BAD_REQUEST, err_code::INVALID_INPUT, msg);
     }
 
     if let Err(resp) = validate_optional_auth_device_fields(OptionalAuthDeviceFields {
@@ -1540,7 +1552,7 @@ async fn post_auth_register(
             if existing_dev.disabled {
                 return api_error(
                     StatusCode::FORBIDDEN,
-                    "device_disabled",
+                    err_code::DEVICE_DISABLED,
                     format!("device {} is disabled", existing_dev.device_id),
                 );
             }
@@ -1553,7 +1565,7 @@ async fn post_auth_register(
             warn!(error = %err, "password hashing failed");
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
+                err_code::INTERNAL_ERROR,
                 "failed to process password",
             );
         }
@@ -1638,7 +1650,7 @@ async fn post_auth_register(
             warn!(error = %err, "failed to sign JWT");
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
+                err_code::INTERNAL_ERROR,
                 "failed to issue access token",
             );
         }
@@ -1676,7 +1688,7 @@ async fn post_auth_login(
     if !state.auth_rate_limiter.check_ip(client_ip) {
         return api_error(
             StatusCode::TOO_MANY_REQUESTS,
-            "rate_limited",
+            err_code::RATE_LIMITED,
             "too many authentication attempts from this IP",
         );
     }
@@ -1685,14 +1697,14 @@ async fn post_auth_login(
     if email.is_empty() {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "invalid_input",
+            err_code::INVALID_INPUT,
             "email is required",
         );
     }
     if !state.auth_rate_limiter.check_email(&email) {
         return api_error(
             StatusCode::TOO_MANY_REQUESTS,
-            "rate_limited",
+            err_code::RATE_LIMITED,
             "too many authentication attempts for this email",
         );
     }
@@ -1702,7 +1714,7 @@ async fn post_auth_login(
         Ok(None) => {
             return api_error(
                 StatusCode::UNAUTHORIZED,
-                "invalid_credentials",
+                err_code::INVALID_CREDENTIALS,
                 "invalid email or password",
             );
         }
@@ -1713,7 +1725,7 @@ async fn post_auth_login(
     if !password_ok {
         return api_error(
             StatusCode::UNAUTHORIZED,
-            "invalid_credentials",
+            err_code::INVALID_CREDENTIALS,
             "invalid email or password",
         );
     }
@@ -1721,7 +1733,7 @@ async fn post_auth_login(
     if user.status != STATUS_ACTIVE {
         return api_error(
             StatusCode::FORBIDDEN,
-            "account_disabled",
+            err_code::ACCOUNT_DISABLED,
             "user account is disabled",
         );
     }
@@ -1815,7 +1827,7 @@ async fn post_auth_login(
             warn!(error = %err, "failed to sign JWT");
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
+                err_code::INTERNAL_ERROR,
                 "failed to issue access token",
             );
         }
@@ -1855,7 +1867,7 @@ async fn post_auth_refresh(
     if presented.is_empty() {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "invalid_input",
+            err_code::INVALID_INPUT,
             "refresh_token is required",
         );
     }
@@ -1889,12 +1901,16 @@ async fn post_auth_refresh(
                 .await;
             return api_error(
                 StatusCode::UNAUTHORIZED,
-                "token_reuse_detected",
+                err_code::TOKEN_REUSE_DETECTED,
                 "refresh token replay detected; session family revoked",
             );
         }
         Err(StoreError::Unauthorized(msg)) => {
-            return api_error(StatusCode::UNAUTHORIZED, "invalid_refresh_token", msg);
+            return api_error(
+                StatusCode::UNAUTHORIZED,
+                err_code::INVALID_REFRESH_TOKEN,
+                msg,
+            );
         }
         Err(err) => return map_store_error(err, "rotate_refresh_token"),
     };
@@ -1905,7 +1921,7 @@ async fn post_auth_refresh(
             let _ = state.auth_store.revoke_session(session.id).await;
             return api_error(
                 StatusCode::UNAUTHORIZED,
-                "invalid_refresh_token",
+                err_code::INVALID_REFRESH_TOKEN,
                 "user account not found",
             );
         }
@@ -1919,7 +1935,7 @@ async fn post_auth_refresh(
             .await;
         return api_error(
             StatusCode::FORBIDDEN,
-            "account_disabled",
+            err_code::ACCOUNT_DISABLED,
             "user account is disabled",
         );
     }
@@ -1935,7 +1951,7 @@ async fn post_auth_refresh(
             warn!(error = %err, "failed to sign JWT during refresh");
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
+                err_code::INTERNAL_ERROR,
                 "failed to issue access token",
             );
         }
@@ -1965,7 +1981,7 @@ async fn logout_cleanup_owned_device(
             Ok(_) => {
                 return Err(Box::new(api_error(
                     StatusCode::FORBIDDEN,
-                    "forbidden",
+                    err_code::FORBIDDEN,
                     "device is not owned by the authenticated user",
                 )));
             }
@@ -2004,7 +2020,10 @@ async fn logout_cleanup_owned_device(
             }
         }
         let _ = state.auth_store.revoke_device_sessions(user_id, did).await;
-        let _ = state.signal_hub.kick_device(did, "user_logout").await;
+        let _ = state
+            .signal_hub
+            .kick_device(did, err_code::USER_LOGOUT)
+            .await;
         let _ = state.relay_server.kick_device_sessions(did);
     }
 
@@ -2021,7 +2040,7 @@ async fn verify_explicit_device_owner(
             Ok(Some(owner)) if owner == user_id => Ok(()),
             Ok(_) => Err(Box::new(api_error(
                 StatusCode::FORBIDDEN,
-                "forbidden",
+                err_code::FORBIDDEN,
                 "device is not owned by the authenticated user",
             ))),
             Err(err) => Err(Box::new(map_store_error(err, "verify_logout_device_owner"))),
@@ -2080,7 +2099,7 @@ async fn post_auth_logout(
             Err(err) => {
                 return api_error(
                     StatusCode::BAD_REQUEST,
-                    "invalid_json_syntax",
+                    err_code::INVALID_JSON_SYNTAX,
                     err.to_string(),
                 );
             }
@@ -2101,7 +2120,7 @@ async fn post_auth_logout(
     {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "invalid_input",
+            err_code::INVALID_INPUT,
             "device_id must be a valid 9-digit device id",
         );
     }
@@ -2148,7 +2167,7 @@ async fn post_auth_logout(
                 .filter(|s| !s.is_empty())
             else {
                 return unauthorized_response(
-                    "unauthorized",
+                    err_code::UNAUTHORIZED,
                     "missing bearer token or refresh_token",
                 );
             };
@@ -2156,7 +2175,7 @@ async fn post_auth_logout(
                 Ok(Some(res)) => res,
                 Ok(None) => {
                     return unauthorized_response(
-                        "unauthorized",
+                        err_code::UNAUTHORIZED,
                         "invalid or expired refresh_token",
                     );
                 }
@@ -2203,18 +2222,18 @@ async fn post_change_password(
     if !current_ok {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "invalid_current_password",
+            err_code::INVALID_CURRENT_PASSWORD,
             "current password is incorrect",
         );
     }
 
     if let Err(msg) = validate_password_policy(&req.new_password) {
-        return api_error(StatusCode::BAD_REQUEST, "invalid_input", msg);
+        return api_error(StatusCode::BAD_REQUEST, err_code::INVALID_INPUT, msg);
     }
     if req.new_password == req.current_password {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "invalid_input",
+            err_code::INVALID_INPUT,
             "new password must differ from current password",
         );
     }
@@ -2225,7 +2244,7 @@ async fn post_change_password(
             warn!(error = %err, "password hashing failed");
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
+                err_code::INTERNAL_ERROR,
                 "failed to process password",
             );
         }
@@ -2246,7 +2265,11 @@ async fn post_change_password(
     {
         Ok(Some(u)) => u,
         Ok(None) => {
-            return api_error(StatusCode::NOT_FOUND, "user_not_found", "user not found");
+            return api_error(
+                StatusCode::NOT_FOUND,
+                err_code::USER_NOT_FOUND,
+                "user not found",
+            );
         }
         Err(err) => return map_store_error(err, "update_user_password"),
     };
@@ -2266,7 +2289,7 @@ async fn post_change_password(
             if caller_did != Some(dev.device_id.as_str()) {
                 let _ = state
                     .signal_hub
-                    .kick_device(&dev.device_id, "password_changed")
+                    .kick_device(&dev.device_id, err_code::PASSWORD_CHANGED)
                     .await;
             }
         }
@@ -2304,7 +2327,7 @@ async fn post_change_password(
             warn!(error = %err, "failed to sign JWT after password change");
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
+                err_code::INTERNAL_ERROR,
                 "failed to issue access token",
             );
         }
@@ -2426,7 +2449,7 @@ async fn post_bind_my_device(
     if dk.is_empty() {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "invalid_input",
+            err_code::INVALID_INPUT,
             "device_key is required",
         );
     }
@@ -2436,7 +2459,7 @@ async fn post_bind_my_device(
         if !is_valid_device_id(&norm_did) {
             return api_error(
                 StatusCode::BAD_REQUEST,
-                "invalid_input",
+                err_code::INVALID_INPUT,
                 "invalid device_id",
             );
         }
@@ -2445,7 +2468,7 @@ async fn post_bind_my_device(
                 if existing.disabled {
                     return api_error(
                         StatusCode::FORBIDDEN,
-                        "device_disabled",
+                        err_code::DEVICE_DISABLED,
                         format!("device {norm_did} is disabled"),
                     );
                 }
@@ -2453,7 +2476,7 @@ async fn post_bind_my_device(
             Ok(Some(_)) | Ok(None) => {
                 return api_error(
                     StatusCode::FORBIDDEN,
-                    "invalid_device_key",
+                    err_code::INVALID_DEVICE_KEY,
                     "device_id does not match device_key",
                 );
             }
@@ -2504,7 +2527,7 @@ async fn patch_my_device(
     if !is_valid_device_id(&norm) {
         return api_error(
             StatusCode::NOT_FOUND,
-            "device_not_found",
+            err_code::DEVICE_NOT_FOUND,
             format!("device {id} not found"),
         );
     }
@@ -2514,7 +2537,7 @@ async fn patch_my_device(
         Ok(_) => {
             return api_error(
                 StatusCode::NOT_FOUND,
-                "device_not_found",
+                err_code::DEVICE_NOT_FOUND,
                 format!("device {norm} not found"),
             );
         }
@@ -2531,7 +2554,7 @@ async fn patch_my_device(
             Ok(false) => {
                 return api_error(
                     StatusCode::NOT_FOUND,
-                    "device_not_found",
+                    err_code::DEVICE_NOT_FOUND,
                     format!("device {norm} not found"),
                 );
             }
@@ -2549,7 +2572,7 @@ async fn patch_my_device(
             Ok(false) => {
                 return api_error(
                     StatusCode::NOT_FOUND,
-                    "device_not_found",
+                    err_code::DEVICE_NOT_FOUND,
                     format!("device {norm} not found"),
                 );
             }
@@ -2567,7 +2590,7 @@ async fn patch_my_device(
             Ok(false) => {
                 return api_error(
                     StatusCode::NOT_FOUND,
-                    "device_not_found",
+                    err_code::DEVICE_NOT_FOUND,
                     format!("device {norm} not found"),
                 );
             }
@@ -2580,7 +2603,7 @@ async fn patch_my_device(
         Ok(None) => {
             return api_error(
                 StatusCode::NOT_FOUND,
-                "device_not_found",
+                err_code::DEVICE_NOT_FOUND,
                 format!("device {norm} not found"),
             );
         }
@@ -2613,7 +2636,7 @@ async fn delete_my_device(
     if !is_valid_device_id(&norm) {
         return api_error(
             StatusCode::NOT_FOUND,
-            "device_not_found",
+            err_code::DEVICE_NOT_FOUND,
             format!("device {id} not found"),
         );
     }
@@ -2623,7 +2646,7 @@ async fn delete_my_device(
         Ok(false) => {
             return api_error(
                 StatusCode::NOT_FOUND,
-                "device_not_found",
+                err_code::DEVICE_NOT_FOUND,
                 format!("device {norm} not found"),
             );
         }
@@ -2641,7 +2664,10 @@ async fn delete_my_device(
         .auth_store
         .revoke_device_sessions(authed.user.id, &norm)
         .await;
-    let _ = state.signal_hub.kick_device(&norm, "device_unbound").await;
+    let _ = state
+        .signal_hub
+        .kick_device(&norm, err_code::DEVICE_UNBOUND)
+        .await;
     let _ = state.relay_server.kick_device_sessions(&norm);
 
     let _ = state
@@ -2673,7 +2699,7 @@ async fn post_issue_cert(
     if !is_valid_device_id(&norm) {
         return api_error(
             StatusCode::BAD_REQUEST,
-            "invalid_input",
+            err_code::INVALID_INPUT,
             "invalid device_id",
         );
     }
@@ -2683,14 +2709,14 @@ async fn post_issue_cert(
             if dev.disabled {
                 return api_error(
                     StatusCode::FORBIDDEN,
-                    "device_disabled",
+                    err_code::DEVICE_DISABLED,
                     format!("device {norm} is disabled"),
                 );
             }
             if dev.owner_user_id != Some(authed.user.id) {
                 return api_error(
                     StatusCode::FORBIDDEN,
-                    "device_not_owned",
+                    err_code::DEVICE_NOT_OWNED,
                     "device is not bound to the current user",
                 );
             }
@@ -2698,7 +2724,7 @@ async fn post_issue_cert(
         Ok(None) => {
             return api_error(
                 StatusCode::NOT_FOUND,
-                "device_not_found",
+                err_code::DEVICE_NOT_FOUND,
                 format!("device {norm} not found"),
             );
         }
@@ -2717,14 +2743,14 @@ async fn post_issue_cert(
     {
         Ok(c) => c,
         Err(PkiError::InvalidCsr(msg)) | Err(PkiError::InvalidInput(msg)) => {
-            return api_error(StatusCode::BAD_REQUEST, "invalid_csr", msg);
+            return api_error(StatusCode::BAD_REQUEST, err_code::INVALID_CSR, msg);
         }
         Err(PkiError::Store(err)) => return map_store_error(err, "persist_device_cert"),
         Err(err) => {
             warn!(error = %err, "failed to issue device certificate");
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "pki_error",
+                err_code::PKI_ERROR,
                 "failed to issue device certificate",
             );
         }
@@ -2846,7 +2872,7 @@ async fn get_admin_users(
         Some(r) => match validate_role(r) {
             Ok(v) => Some(v),
             Err(StoreError::InvalidInput(msg)) => {
-                return api_error(StatusCode::BAD_REQUEST, "invalid_input", msg);
+                return api_error(StatusCode::BAD_REQUEST, err_code::INVALID_INPUT, msg);
             }
             Err(err) => return map_store_error(err, "validate_role_filter"),
         },
@@ -2861,7 +2887,7 @@ async fn get_admin_users(
         Some(s) => match validate_status(s) {
             Ok(v) => Some(v),
             Err(StoreError::InvalidInput(msg)) => {
-                return api_error(StatusCode::BAD_REQUEST, "invalid_input", msg);
+                return api_error(StatusCode::BAD_REQUEST, err_code::INVALID_INPUT, msg);
             }
             Err(err) => return map_store_error(err, "validate_status_filter"),
         },
@@ -2968,7 +2994,7 @@ async fn post_admin_user(
         Err(err) => return map_store_error(err, "admin_create_user_email"),
     };
     if let Err(msg) = validate_password_policy(&req.password) {
-        return api_error(StatusCode::BAD_REQUEST, "invalid_input", msg);
+        return api_error(StatusCode::BAD_REQUEST, err_code::INVALID_INPUT, msg);
     }
     let role = match validate_role(req.role.as_deref().unwrap_or(ROLE_USER)) {
         Ok(r) => r,
@@ -2984,7 +3010,7 @@ async fn post_admin_user(
             warn!(error = %err, "password hashing failed");
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
+                err_code::INTERNAL_ERROR,
                 "failed to process password",
             );
         }
@@ -3042,14 +3068,18 @@ async fn patch_admin_user(
     let existing = match state.auth_store.get_user_by_id(user_id).await {
         Ok(Some(u)) => u,
         Ok(None) => {
-            return api_error(StatusCode::NOT_FOUND, "user_not_found", "user not found");
+            return api_error(
+                StatusCode::NOT_FOUND,
+                err_code::USER_NOT_FOUND,
+                "user not found",
+            );
         }
         Err(err) => return map_store_error(err, "get_user_patch"),
     };
 
     let password_hash = if let Some(ref raw_pw) = req.reset_password {
         if let Err(msg) = validate_password_policy(raw_pw) {
-            return api_error(StatusCode::BAD_REQUEST, "invalid_input", msg);
+            return api_error(StatusCode::BAD_REQUEST, err_code::INVALID_INPUT, msg);
         }
         match hash_password(raw_pw) {
             Ok(h) => Some(h),
@@ -3057,7 +3087,7 @@ async fn patch_admin_user(
                 warn!(error = %err, "password hashing failed");
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
+                    err_code::INTERNAL_ERROR,
                     "failed to process password",
                 );
             }
@@ -3103,7 +3133,11 @@ async fn patch_admin_user(
     {
         Ok(Some(u)) => u,
         Ok(None) => {
-            return api_error(StatusCode::NOT_FOUND, "user_not_found", "user not found");
+            return api_error(
+                StatusCode::NOT_FOUND,
+                err_code::USER_NOT_FOUND,
+                "user not found",
+            );
         }
         Err(err) => return map_store_error(err, "admin_update_user"),
     };
@@ -3119,7 +3153,7 @@ async fn patch_admin_user(
         }
         let _ = state
             .signal_hub
-            .kick_user_devices(user_id, "account_updated")
+            .kick_user_devices(user_id, err_code::ACCOUNT_UPDATED)
             .await;
         if let Ok(devs) = state.auth_store.list_user_devices(user_id).await {
             for dev in devs {
@@ -3185,7 +3219,11 @@ async fn delete_admin_user(
     };
 
     if !deleted {
-        return api_error(StatusCode::NOT_FOUND, "user_not_found", "user not found");
+        return api_error(
+            StatusCode::NOT_FOUND,
+            err_code::USER_NOT_FOUND,
+            "user not found",
+        );
     }
 
     // Cascade-deleted certs in DB must immediately enter ephemeral revocation cache,
@@ -3193,12 +3231,12 @@ async fn delete_admin_user(
     revoke_cert_list_in_ephemeral(&*state.ephemeral, &user_certs).await;
     let _ = state
         .signal_hub
-        .kick_user_devices(user_id, "user_deleted")
+        .kick_user_devices(user_id, err_code::USER_DELETED)
         .await;
     for dev in user_devices {
         let _ = state
             .signal_hub
-            .kick_device(&dev.device_id, "user_deleted")
+            .kick_device(&dev.device_id, err_code::USER_DELETED)
             .await;
         let _ = state.relay_server.kick_device_sessions(&dev.device_id);
     }
@@ -3252,18 +3290,18 @@ async fn post_register_device(
             (StatusCode::OK, Json(resp)).into_response()
         }
         Err(StoreError::InvalidInput(msg)) => {
-            api_error(StatusCode::BAD_REQUEST, "invalid_input", msg)
+            api_error(StatusCode::BAD_REQUEST, err_code::INVALID_INPUT, msg)
         }
         Err(StoreError::DeviceDisabled(id)) => api_error(
             StatusCode::FORBIDDEN,
-            "device_disabled",
+            err_code::DEVICE_DISABLED,
             format!("device {id} is disabled"),
         ),
         Err(err) => {
             warn!(error = %err, "device registration failed");
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
+                err_code::INTERNAL_ERROR,
                 "failed to register device",
             )
         }
@@ -3277,7 +3315,7 @@ async fn get_stats(State(state): State<AppState>) -> Response {
             warn!(error = %err, "failed to count registered devices");
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "database_error",
+                err_code::DATABASE_ERROR,
                 "failed to query device count",
             );
         }
@@ -3317,7 +3355,7 @@ async fn get_devices(State(state): State<AppState>, Query(query): Query<DevicesQ
     // always yields 400 Bad Request even on an empty database.
     let status_filter = match DeviceStatusFilter::parse(query.status.as_deref()) {
         Ok(filter) => filter,
-        Err(msg) => return api_error(StatusCode::BAD_REQUEST, "invalid_status", msg),
+        Err(msg) => return api_error(StatusCode::BAD_REQUEST, err_code::INVALID_STATUS, msg),
     };
 
     let limit = query
@@ -3349,7 +3387,7 @@ async fn get_devices(State(state): State<AppState>, Query(query): Query<DevicesQ
                 warn!(error = %err, "failed to list devices");
                 return api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "database_error",
+                    err_code::DATABASE_ERROR,
                     "failed to list devices",
                 );
             }
@@ -3391,7 +3429,7 @@ async fn get_devices(State(state): State<AppState>, Query(query): Query<DevicesQ
                     warn!(error = %err, "failed to list devices");
                     return api_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "database_error",
+                        err_code::DATABASE_ERROR,
                         "failed to list devices",
                     );
                 }
@@ -3558,7 +3596,7 @@ async fn delete_session(State(state): State<AppState>, Path(id): Path<String>) -
     } else {
         api_error(
             StatusCode::NOT_FOUND,
-            "session_not_found",
+            err_code::SESSION_NOT_FOUND,
             format!("active relay session {id} not found"),
         )
     }
@@ -3569,7 +3607,7 @@ async fn delete_device(State(state): State<AppState>, Path(id): Path<String>) ->
     if norm.len() != 9 {
         return api_error(
             StatusCode::NOT_FOUND,
-            "device_not_found",
+            err_code::DEVICE_NOT_FOUND,
             format!("device {id} not found"),
         );
     }
@@ -3580,7 +3618,7 @@ async fn delete_device(State(state): State<AppState>, Path(id): Path<String>) ->
             warn!(device_id = %norm, error = %err, "failed to disable device");
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "database_error",
+                err_code::DATABASE_ERROR,
                 "failed to disable device",
             );
         }
@@ -3589,7 +3627,7 @@ async fn delete_device(State(state): State<AppState>, Path(id): Path<String>) ->
     if !updated {
         return api_error(
             StatusCode::NOT_FOUND,
-            "device_not_found",
+            err_code::DEVICE_NOT_FOUND,
             format!("device {norm} not found"),
         );
     }
@@ -3614,7 +3652,7 @@ async fn delete_device(State(state): State<AppState>, Path(id): Path<String>) ->
 
     let kicked_signal = state
         .signal_hub
-        .kick_device(&norm, "disabled_by_admin")
+        .kick_device(&norm, err_code::DISABLED_BY_ADMIN)
         .await;
     let kicked_sessions = state.relay_server.kick_device_sessions(&norm);
 
@@ -3676,5 +3714,143 @@ mod tests {
         assert!(build_cors_layer(&["*".to_string()]).is_ok());
         assert!(build_cors_layer(&["https://admin.example.com".to_string()]).is_ok());
         assert!(build_cors_layer(&["bad\norigin".to_string()]).is_err());
+    }
+
+    #[test]
+    fn all_rest_emitted_wire_codes_exist_in_spec() {
+        use crate::generated::error_codes;
+
+        // Every wire error code and kick reason emitted by api.rs, paired with its
+        // expected legacy snake_case wire string to guarantee 100% wire compatibility.
+        let emitted: &[(&str, &str)] = &[
+            (err_code::ACCOUNT_DISABLED, "account_disabled"),
+            (err_code::ACCOUNT_UPDATED, "account_updated"),
+            (err_code::CACHE_UNAVAILABLE, "cache_unavailable"),
+            (err_code::CONFLICT, "conflict"),
+            (err_code::DATABASE_ERROR, "database_error"),
+            (err_code::DEVICE_DISABLED, "device_disabled"),
+            (err_code::DEVICE_NOT_FOUND, "device_not_found"),
+            (err_code::DEVICE_NOT_OWNED, "device_not_owned"),
+            (
+                err_code::DEVICE_REBOUND_TO_ANOTHER_USER,
+                "device_rebound_to_another_user",
+            ),
+            (err_code::DEVICE_UNBOUND, "device_unbound"),
+            (err_code::DISABLED_BY_ADMIN, "disabled_by_admin"),
+            (err_code::FORBIDDEN, "forbidden"),
+            (err_code::INTERNAL_ERROR, "internal_error"),
+            (err_code::INVALID_BODY, "invalid_body"),
+            (err_code::INVALID_CREDENTIALS, "invalid_credentials"),
+            (err_code::INVALID_CSR, "invalid_csr"),
+            (
+                err_code::INVALID_CURRENT_PASSWORD,
+                "invalid_current_password",
+            ),
+            (err_code::INVALID_DEVICE_KEY, "invalid_device_key"),
+            (err_code::INVALID_INPUT, "invalid_input"),
+            (err_code::INVALID_JSON, "invalid_json"),
+            (err_code::INVALID_JSON_DATA, "invalid_json_data"),
+            (err_code::INVALID_JSON_SYNTAX, "invalid_json_syntax"),
+            (err_code::INVALID_REFRESH_TOKEN, "invalid_refresh_token"),
+            (err_code::INVALID_STATUS, "invalid_status"),
+            (
+                err_code::MISSING_JSON_CONTENT_TYPE,
+                "missing_json_content_type",
+            ),
+            (err_code::NOT_FOUND, "not_found"),
+            (
+                err_code::PASSWORD_CHANGE_REQUIRED,
+                "password_change_required",
+            ),
+            (err_code::PASSWORD_CHANGED, "password_changed"),
+            (err_code::PAYLOAD_TOO_LARGE, "payload_too_large"),
+            (err_code::PKI_ERROR, "pki_error"),
+            (err_code::RATE_LIMITED, "rate_limited"),
+            (err_code::REGISTRATION_DISABLED, "registration_disabled"),
+            (err_code::SESSION_NOT_FOUND, "session_not_found"),
+            (err_code::TOKEN_EXPIRED, "token_expired"),
+            (err_code::TOKEN_REUSE_DETECTED, "token_reuse_detected"),
+            (err_code::TOKEN_REVOKED, "token_revoked"),
+            (err_code::UNAUTHORIZED, "unauthorized"),
+            (err_code::USER_DELETED, "user_deleted"),
+            (err_code::USER_LOGOUT, "user_logout"),
+            (err_code::USER_NOT_FOUND, "user_not_found"),
+        ];
+
+        for &(constant, expected_wire) in emitted {
+            assert_eq!(
+                constant, expected_wire,
+                "wire code drift for {expected_wire}"
+            );
+            assert!(
+                error_codes::WIRE_ALIAS_MAP
+                    .iter()
+                    .any(|&(alias, _)| alias == constant),
+                "REST wire code {constant} missing from WIRE_ALIAS_MAP"
+            );
+            assert!(
+                error_codes::canonical_for_wire(constant).is_some(),
+                "REST wire code {constant} failed canonical_for_wire lookup"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_error_response_json_and_status_backward_compatible() {
+        let cases: Vec<(Response, StatusCode, &str)> = vec![
+            (
+                map_store_error(StoreError::InvalidInput("bad field".into()), "test"),
+                StatusCode::BAD_REQUEST,
+                "invalid_input",
+            ),
+            (
+                map_store_error(StoreError::Conflict("duplicate".into()), "test"),
+                StatusCode::CONFLICT,
+                "conflict",
+            ),
+            (
+                map_store_error(StoreError::NotFound("missing".into()), "test"),
+                StatusCode::NOT_FOUND,
+                "not_found",
+            ),
+            (
+                map_store_error(StoreError::Forbidden("denied".into()), "test"),
+                StatusCode::FORBIDDEN,
+                "forbidden",
+            ),
+            (
+                map_store_error(StoreError::Unauthorized("unauth".into()), "test"),
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+            ),
+            (
+                map_store_error(StoreError::DeviceDisabled("123456789".into()), "test"),
+                StatusCode::FORBIDDEN,
+                "device_disabled",
+            ),
+            (
+                map_store_error(StoreError::Cache("redis down".into()), "test"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "cache_unavailable",
+            ),
+            (
+                map_store_error(StoreError::IdAllocationExhausted, "test"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "database_error",
+            ),
+            (
+                unauthorized_response(err_code::TOKEN_EXPIRED, "access token expired"),
+                StatusCode::UNAUTHORIZED,
+                "token_expired",
+            ),
+        ];
+
+        for (resp, expected_status, expected_code) in cases {
+            assert_eq!(resp.status(), expected_status);
+            let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(parsed["error"], expected_code);
+            assert!(parsed["message"].is_string());
+        }
     }
 }

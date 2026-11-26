@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from 'react';
 import { CheckCircle2, Cpu, RefreshCw, ShieldCheck, UserPlus } from 'lucide-react';
-import { ApiError, apiClient } from '../api/client';
+import { apiClient } from '../api/client';
 import { useToast } from '../components/Toast';
 import type { AdminSettings, PkiCaInfo } from '../types/api';
+import { formatApiErrorToast } from '../utils/errorDisplay';
 import { formatDateTime } from '../utils/format';
 
 export function SettingsPage() {
@@ -19,8 +20,11 @@ export function SettingsPage() {
       setSettings(s);
       setPkiCa(ca);
     } catch (err) {
-      const msg = err instanceof ApiError ? err.message : '加载系统设置失败';
-      pushToast('error', '加载失败', msg);
+      const { title, detail } = formatApiErrorToast(err, {
+        fallbackTitle: '加载失败',
+        fallbackMessage: '加载系统设置失败，请稍后重试。',
+      });
+      pushToast('error', title, detail);
     } finally {
       setLoading(false);
     }
@@ -43,8 +47,11 @@ export function SettingsPage() {
         `配置已写入数据库并即时同步至 ${updated.cache_backend.toUpperCase()} 缓存`,
       );
     } catch (err) {
-      const msg = err instanceof ApiError ? err.message : '更新注册开关失败';
-      pushToast('error', '保存失败', msg);
+      const { title, detail } = formatApiErrorToast(err, {
+        fallbackTitle: '保存失败',
+        fallbackMessage: '更新注册开关失败，请稍后重试。',
+      });
+      pushToast('error', title, detail);
     } finally {
       setSaving(false);
     }

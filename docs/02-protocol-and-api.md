@@ -11,6 +11,8 @@ This document defines the exact wire protocols, storage contracts, and HTTP REST
 4. **Zero-Copy TCP Relay Protocol** (`:21117/tcp`, `RCR1` handshake + Linux `splice(2)` raw stream)
 5. **Axum 0.8 REST API** (`:21118/tcp`, `/api/v1/*`)
 6. **Storage Architecture** (PostgreSQL `sqlx` + Optional Redis / Default `DashMap`)
+7. **Account Auth, Admin Bootstrapping, Owner Self-Control & Mandatory Relay mTLS**
+8. **Unified Error Code Contract** (`TokenBoom/rabbitcontrol-spec`)
 
 ---
 
@@ -246,6 +248,8 @@ Sent before the server terminates the TCP signaling connection (e.g., admin disa
 }
 ```
 
+`code` uses the `snake_case` wire aliases generated from `TokenBoom/rabbitcontrol-spec` (`backend/src/generated/error_codes.rs::wire::*`); see **§8 Unified Error Code Contract** for the canonical mapping and backward-compatibility guarantees.
+
 ---
 
 ## 3. UDP STUN-lite Probe Protocol (`:21116/udp`)
@@ -327,7 +331,7 @@ Immediately after TCP connect, each peer sends the handshake frame within the ha
 
 ## 5. Axum 0.8 REST API (`:21118/tcp`, `/api/v1/*`)
 
-All responses — including malformed JSON, body-limit (`413`), and auth (`401`) errors — return `Content-Type: application/json` (`{"error": "<code>", "message": "<detail>"}`).
+All responses — including malformed JSON, body-limit (`413`), and auth (`401`) errors — return `Content-Type: application/json` (`{"error": "<code>", "message": "<detail>"}`), where `<code>` is a `snake_case` wire alias defined in `TokenBoom/rabbitcontrol-spec` (see **§8 Unified Error Code Contract**).
 
 ### 5.1 Admin Authentication & CORS
 
@@ -484,3 +488,22 @@ Note: `total` equals `devices.len()` (page length), while `total_count` is the t
 ### 7.4 Mandatory Relay mTLS (`:21117`) & Direct P2P/LAN mTLS
 - `:21117` enforces TLS 1.3 `WebPkiClientVerifier` client authentication against the Root CA, extracts SAN `urn:rabbitcontrol:user:{uid}:device:{did}` (`eq_ignore_ascii_case` for user ID), verifies `device_id == RelayTokenRecord.peer_id`, and checks `rc:revoked_cert:{serial_hex}` + PostgreSQL `device_certificates`.
 - Direct P2P QUIC and Relay inner E2EE both support mutual TLS with `DEFAULT_ENCRYPT_CONNECTION = true`.
+
+---
+
+## 8. Unified Error Code Contract (`TokenBoom/rabbitcontrol-spec`)
+
+### 8.1 Single Source of Truth & Synced Artifacts
+- **`TokenBoom/rabbitcontrol-spec`** is the cross-platform single source of truth for all RabbitControl error codes, wire aliases, `zh-CN` user copy, severity, presentation, and recovery actions across server, core, desktop, mobile, and Admin Web.
+- `rabbitcontrol-server` pins the synced spec version and SHA-256 digests in root `spec-lock.json` and consumes two **read-only generated artifacts** (zero Cargo dependency on `rabbitcontrol-core`):
+  - `backend/src/generated/error_codes.rs` (`rust-server` target: canonical constants, `wire::*` `snake_case` aliases, `WIRE_ALIAS_MAP`, and `canonical_for_wire` / `primary_wire_alias`).
+  - `web/src/generated/errorCatalog.ts` (`ts-web` target: `ERROR_CATALOG`, `WIRE_ALIASES`, `resolveWireAlias`, `lookupErrorEntry`, `buildUiError`).
+- **Never hand-edit generated files.** All contract changes must be authored in `TokenBoom/rabbitcontrol-spec` first, regenerated there, and synced via `rabbitcontrol-spec/scripts/sync-to-repo.py`.
+- CI enforces offline integrity via `python3 scripts/verify-spec-lock.py` (verifying `spec-lock.json` metadata, file SHA-256 digests, and rejecting untracked files in `generated/` directories without network access).
+
+### 8.2 Wire Protocol Backward-Compatibility Principles
+- **Wire envelope stability**:
+  - REST API (`:21118` / `--web-addr`) preserves HTTP status codes and JSON body `{"error": "<wire_snake_case>", "message": "<detail>"}`.
+  - TCP signaling (`:21116`) preserves `{"type": "error", "code": "<wire_snake_case>", "message": "<detail>"}` and `{"type": "kicked", "reason": "<wire_snake_case>"}`.
+- **No spelling drift**: `backend/src/api.rs` and `backend/src/signal.rs` emit wire codes exclusively via `crate::generated::error_codes::wire::*` constants, guarded by unit tests asserting every emitted REST and signaling code exists in `WIRE_ALIAS_MAP` and resolves through `canonical_for_wire`.
+- **Canonical normalization on clients & Admin Web**: Clients and Admin Web (`web/src/utils/errorDisplay.ts`) normalize incoming `snake_case` wire aliases (including client-side codes such as `network_error` and `auth_superseded`) to canonical dot-separated codes (e.g. `invalid_credentials` → `auth.invalid_credentials`, `network_error` → `network.unreachable`, `auth_superseded` → `auth.superseded`) to render structured localized Chinese titles, messages, and remediation suggestions instead of raw English server details.

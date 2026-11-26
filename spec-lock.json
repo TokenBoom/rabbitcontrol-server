@@ -1,0 +1,18 @@
+{
+  "spec_repo": "TokenBoom/rabbitcontrol-spec",
+  "spec_version": "1.0.0",
+  "files": [
+    {
+      "artifact": "rust-server",
+      "source": "dist/rust-server/error_codes.rs",
+      "target": "backend/src/generated/error_codes.rs",
+      "sha256": "64588fa42f5a03eb3aa514865748babc943113b6aa3ff60b5f04bf6ed9577b6d"
+    },
+    {
+      "artifact": "ts-web",
+      "source": "dist/ts-web/errorCatalog.ts",
+      "target": "web/src/generated/errorCatalog.ts",
+      "sha256": "4a1e0aac6773ffa0c8d49c4000beadccd24256d53722d2e35fb0051726f4cd66"
+    }
+  ]
+}

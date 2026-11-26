@@ -23,6 +23,7 @@ use crate::auth::{AuthAuthority, AuthError, OwnerGrantTicket, OWNER_GRANT_DEFAUL
 use crate::ephemeral::{
     EphemeralError, EphemeralStore, RelayTokenRecord, DEFAULT_MAX_RELAY_TOKENS,
 };
+use crate::generated::error_codes::wire as err_code;
 use crate::store::{
     format_device_id, is_valid_device_id, normalize_device_id, AuthStore, DeviceStore,
     RegisterInput, StoreError, MAX_DEVICE_PUBKEY_LEN, STATUS_ACTIVE,
@@ -936,7 +937,7 @@ impl SignalHub {
         self.shutdown.cancel();
         let peer_ids: Vec<String> = self.peers.iter().map(|e| e.key().clone()).collect();
         for id in peer_ids {
-            self.kick_device(&id, "server_shutdown").await;
+            self.kick_device(&id, err_code::SERVER_SHUTDOWN).await;
         }
         loop {
             let notified = self.tasks_drained.notified();
@@ -948,7 +949,7 @@ impl SignalHub {
             }
             let remaining: Vec<String> = self.peers.iter().map(|e| e.key().clone()).collect();
             for id in remaining {
-                self.kick_device(&id, "server_shutdown").await;
+                self.kick_device(&id, err_code::SERVER_SHUTDOWN).await;
             }
             notified.await;
         }
@@ -1450,7 +1451,7 @@ impl SignalHub {
         let token = access_token.map(str::trim).filter(|s| !s.is_empty());
         let Some(token) = token else {
             if self.config.require_auth {
-                return Err(("unauthorized", "access_token is required".into()));
+                return Err((err_code::UNAUTHORIZED, "access_token is required".into()));
             }
             return Ok(None);
         };
@@ -1460,7 +1461,7 @@ impl SignalHub {
         else {
             if self.config.require_auth {
                 return Err((
-                    "server_misconfigured",
+                    err_code::SERVER_MISCONFIGURED,
                     "signaling auth authority is not configured".into(),
                 ));
             }
@@ -1470,49 +1471,58 @@ impl SignalHub {
         let claims = match auth_authority.verify_access_token(token) {
             Ok(c) => c,
             Err(AuthError::TokenExpired) => {
-                return Err(("token_expired", "access token expired".into()));
+                return Err((err_code::TOKEN_EXPIRED, "access token expired".into()));
             }
             Err(_) => {
-                return Err(("unauthorized", "invalid access token".into()));
+                return Err((err_code::UNAUTHORIZED, "invalid access token".into()));
             }
         };
 
         if claims.pwd_change_only {
             return Err((
-                "password_change_required",
+                err_code::PASSWORD_CHANGE_REQUIRED,
                 "password change is required before connecting signaling".into(),
             ));
         }
 
         let user = match auth_store.get_user_by_id(claims.sub).await {
             Ok(Some(u)) => u,
-            Ok(None) => return Err(("unauthorized", "user not found".into())),
-            Err(err) => return Err(("register_failed", err.to_string())),
+            Ok(None) => return Err((err_code::UNAUTHORIZED, "user not found".into())),
+            Err(err) => return Err((err_code::REGISTER_FAILED, err.to_string())),
         };
 
         if user.status != STATUS_ACTIVE {
-            return Err(("account_disabled", "user account is disabled".into()));
+            return Err((
+                err_code::ACCOUNT_DISABLED,
+                "user account is disabled".into(),
+            ));
         }
         if user.token_version != claims.ver {
-            return Err(("token_revoked", "access token has been revoked".into()));
+            return Err((
+                err_code::TOKEN_REVOKED,
+                "access token has been revoked".into(),
+            ));
         }
         if user.must_change_password {
             return Err((
-                "password_change_required",
+                err_code::PASSWORD_CHANGE_REQUIRED,
                 "password change is required before connecting signaling".into(),
             ));
         }
         match auth_store.get_user_session(claims.sid).await {
             Ok(Some(sess)) => {
                 if sess.revoked_at.is_some() {
-                    return Err(("token_revoked", "session has been revoked".into()));
+                    return Err((err_code::TOKEN_REVOKED, "session has been revoked".into()));
                 }
             }
             Ok(None) => {
-                return Err(("token_revoked", "session not found or expired".into()));
+                return Err((
+                    err_code::TOKEN_REVOKED,
+                    "session not found or expired".into(),
+                ));
             }
             Err(err) => {
-                return Err(("service_unavailable", err.to_string()));
+                return Err((err_code::SERVICE_UNAVAILABLE, err.to_string()));
             }
         }
 
@@ -1549,7 +1559,7 @@ impl SignalHub {
                     write_frame_with_timeout(
                         &mut writer,
                         &SignalMsg::Error {
-                            code: "invalid_frame".into(),
+                            code: err_code::INVALID_FRAME.into(),
                             message: err.to_string(),
                         },
                         self.config.write_timeout,
@@ -1561,7 +1571,7 @@ impl SignalHub {
                     write_frame_with_timeout(
                         &mut writer,
                         &SignalMsg::Error {
-                            code: "handshake_timeout".into(),
+                            code: err_code::HANDSHAKE_TIMEOUT.into(),
                             message: "register frame timed out".into(),
                         },
                         self.config.write_timeout,
@@ -1606,7 +1616,7 @@ impl SignalHub {
                     write_frame_with_timeout(
                         &mut writer,
                         &SignalMsg::Error {
-                            code: "invalid_payload".into(),
+                            code: err_code::INVALID_PAYLOAD.into(),
                             message: reason,
                         },
                         self.config.write_timeout,
@@ -1621,7 +1631,7 @@ impl SignalHub {
                         write_frame_with_timeout(
                             &mut writer,
                             &SignalMsg::Error {
-                                code: "invalid_payload".into(),
+                                code: err_code::INVALID_PAYLOAD.into(),
                                 message: reason,
                             },
                             self.config.write_timeout,
@@ -1651,7 +1661,7 @@ impl SignalHub {
                 write_frame_with_timeout(
                     &mut writer,
                     &SignalMsg::Error {
-                        code: "expected_register".into(),
+                        code: err_code::EXPECTED_REGISTER.into(),
                         message: "first signaling frame must be register".into(),
                     },
                     self.config.write_timeout,
@@ -1695,7 +1705,7 @@ impl SignalHub {
                         write_frame_with_timeout(
                             &mut writer,
                             &SignalMsg::Error {
-                                code: "device_disabled".into(),
+                                code: err_code::DEVICE_DISABLED.into(),
                                 message: format!("device {} is disabled", existing.device_id),
                             },
                             self.config.write_timeout,
@@ -1708,7 +1718,7 @@ impl SignalHub {
                     write_frame_with_timeout(
                         &mut writer,
                         &SignalMsg::Error {
-                            code: "device_id_mismatch".into(),
+                            code: err_code::DEVICE_ID_MISMATCH.into(),
                             message: "provided device_id does not match device_key".into(),
                         },
                         self.config.write_timeout,
@@ -1720,7 +1730,7 @@ impl SignalHub {
                     write_frame_with_timeout(
                         &mut writer,
                         &SignalMsg::Error {
-                            code: "register_failed".into(),
+                            code: err_code::REGISTER_FAILED.into(),
                             message: err.to_string(),
                         },
                         self.config.write_timeout,
@@ -1737,7 +1747,7 @@ impl SignalHub {
                 write_frame_with_timeout(
                     &mut writer,
                     &SignalMsg::Error {
-                        code: "device_disabled".into(),
+                        code: err_code::DEVICE_DISABLED.into(),
                         message: format!("device {id} is disabled"),
                     },
                     self.config.write_timeout,
@@ -1749,7 +1759,7 @@ impl SignalHub {
                 write_frame_with_timeout(
                     &mut writer,
                     &SignalMsg::Error {
-                        code: "register_failed".into(),
+                        code: err_code::REGISTER_FAILED.into(),
                         message: err.to_string(),
                     },
                     self.config.write_timeout,
@@ -1764,7 +1774,7 @@ impl SignalHub {
                 write_frame_with_timeout(
                     &mut writer,
                     &SignalMsg::Error {
-                        code: "device_id_mismatch".into(),
+                        code: err_code::DEVICE_ID_MISMATCH.into(),
                         message: "provided device_id does not match device_key".into(),
                     },
                     self.config.write_timeout,
@@ -1791,7 +1801,7 @@ impl SignalHub {
                     write_frame_with_timeout(
                         &mut writer,
                         &SignalMsg::Error {
-                            code: "register_failed".into(),
+                            code: err_code::REGISTER_FAILED.into(),
                             message: format!("device {device_id} disappeared during bind"),
                         },
                         self.config.write_timeout,
@@ -1803,7 +1813,7 @@ impl SignalHub {
                     write_frame_with_timeout(
                         &mut writer,
                         &SignalMsg::Error {
-                            code: "register_failed".into(),
+                            code: err_code::REGISTER_FAILED.into(),
                             message: err.to_string(),
                         },
                         self.config.write_timeout,
@@ -1893,7 +1903,7 @@ impl SignalHub {
                     write_frame_with_timeout(
                         &mut writer,
                         &SignalMsg::Error {
-                            code: "device_disabled".into(),
+                            code: err_code::DEVICE_DISABLED.into(),
                             message: format!("device {device_id} is disabled"),
                         },
                         self.config.write_timeout,
@@ -1906,7 +1916,7 @@ impl SignalHub {
                     write_frame_with_timeout(
                         &mut writer,
                         &SignalMsg::Error {
-                            code: "register_failed".into(),
+                            code: err_code::REGISTER_FAILED.into(),
                             message: err.to_string(),
                         },
                         self.config.write_timeout,
@@ -1920,7 +1930,7 @@ impl SignalHub {
                 write_frame_with_timeout(
                     &mut writer,
                     &SignalMsg::Error {
-                        code: "device_unbound".into(),
+                        code: err_code::DEVICE_UNBOUND.into(),
                         message: format!("device {device_id} ownership changed"),
                     },
                     self.config.write_timeout,
@@ -1996,7 +2006,7 @@ impl SignalHub {
                         write_frame_with_timeout(
                             &mut writer,
                             &SignalMsg::Error {
-                                code: "device_disabled".into(),
+                                code: err_code::DEVICE_DISABLED.into(),
                                 message: format!("device {device_id} is disabled"),
                             },
                             self.config.write_timeout,
@@ -2009,7 +2019,7 @@ impl SignalHub {
                         write_frame_with_timeout(
                             &mut writer,
                             &SignalMsg::Error {
-                                code: "register_failed".into(),
+                                code: err_code::REGISTER_FAILED.into(),
                                 message: err.to_string(),
                             },
                             self.config.write_timeout,
@@ -2049,7 +2059,7 @@ impl SignalHub {
                     arch: latest.arch.clone(),
                 },
             ) {
-                old_peer.cancel.kick("replaced_by_new_connection");
+                old_peer.cancel.kick(err_code::REPLACED_BY_NEW_CONNECTION);
             }
 
             if let Err(err) = self
@@ -2205,7 +2215,7 @@ impl SignalHub {
                 }
                 _ = self.shutdown.cancelled() => {
                     disconnect_reason = "server_shutdown".to_string();
-                    cancel.kick("server_shutdown");
+                    cancel.kick(err_code::SERVER_SHUTDOWN);
                     break;
                 }
                 _ = &mut writer_done_rx => {
@@ -2238,7 +2248,7 @@ impl SignalHub {
                     disconnect_reason = format!("read_error:{err}");
                     debug!(%device_id, %remote_addr, error = %err, "signaling read error");
                     let _ = tx.try_send(SignalMsg::Error {
-                        code: "invalid_frame".into(),
+                        code: err_code::INVALID_FRAME.into(),
                         message: err.to_string(),
                     });
                     break;
@@ -2341,12 +2351,12 @@ impl SignalHub {
     ) -> Result<(), &'static str> {
         let max_tokens = self.config.max_relay_tokens;
         if max_tokens == 0 {
-            return Err("relay_capacity_exceeded");
+            return Err(err_code::RELAY_CAPACITY_EXCEEDED);
         }
         let use_local_tracker = match self.ephemeral.active_relay_token_count().await {
             Ok(Some(active)) => {
                 if active >= max_tokens {
-                    return Err("relay_capacity_exceeded");
+                    return Err(err_code::RELAY_CAPACITY_EXCEEDED);
                 }
                 false
             }
@@ -2356,7 +2366,7 @@ impl SignalHub {
                 if self.issued_relay_tokens.len() >= max_tokens {
                     self.issued_relay_tokens.retain(|_, exp| *exp > now);
                     if self.issued_relay_tokens.len() >= max_tokens {
-                        return Err("relay_capacity_exceeded");
+                        return Err(err_code::RELAY_CAPACITY_EXCEEDED);
                     }
                 }
                 true
@@ -2376,10 +2386,12 @@ impl SignalHub {
                 }
                 Ok(())
             }
-            Err(EphemeralError::RelayTokenCapacityExceeded(_)) => Err("relay_capacity_exceeded"),
+            Err(EphemeralError::RelayTokenCapacityExceeded(_)) => {
+                Err(err_code::RELAY_CAPACITY_EXCEEDED)
+            }
             Err(err) => {
                 warn!(error = %err, "failed to store relay token in ephemeral store");
-                Err("relay_token_error")
+                Err(err_code::RELAY_TOKEN_ERROR)
             }
         }
     }
@@ -2408,10 +2420,13 @@ impl SignalHub {
         {
             Ok(Some(rec)) => {
                 if rec.disabled {
-                    return Err(("peer_disabled", "当前设备已被禁用".to_string()));
+                    return Err((err_code::PEER_DISABLED, "当前设备已被禁用".to_string()));
                 }
                 if caller_in_peers && peer_owner_uid != rec.owner_user_id {
-                    return Err(("unauthorized", "设备归属已变更，请重新登录认证".to_string()));
+                    return Err((
+                        err_code::UNAUTHORIZED,
+                        "设备归属已变更，请重新登录认证".to_string(),
+                    ));
                 }
                 let pk = if !rec.device_pubkey.trim().is_empty() {
                     rec.device_pubkey
@@ -2425,10 +2440,10 @@ impl SignalHub {
             {
                 (None, peer_pubkey)
             }
-            Ok(None) => return Err(("unauthorized", "当前设备未注册或已失效".to_string())),
+            Ok(None) => return Err((err_code::UNAUTHORIZED, "当前设备未注册或已失效".to_string())),
             Err(err) => {
                 warn!(caller = %caller_device_id, error = %err, "failed to load caller device for authorization");
-                return Err(("internal_error", "校验当前设备状态失败".to_string()));
+                return Err((err_code::INTERNAL_ERROR, "校验当前设备状态失败".to_string()));
             }
         };
         let target_peer_rc = self
@@ -2442,7 +2457,7 @@ impl SignalHub {
         {
             Ok(Some(rec)) => {
                 if rec.disabled {
-                    return Err(("peer_disabled", "目标设备已被禁用".to_string()));
+                    return Err((err_code::PEER_DISABLED, "目标设备已被禁用".to_string()));
                 }
                 (
                     rec.owner_user_id,
@@ -2457,16 +2472,16 @@ impl SignalHub {
             {
                 (None, false, target_peer_rc.unwrap_or(true))
             }
-            Ok(None) => return Err(("peer_not_found", "目标设备不存在".to_string())),
+            Ok(None) => return Err((err_code::PEER_NOT_FOUND, "目标设备不存在".to_string())),
             Err(err) => {
                 warn!(target = %target_device_id, error = %err, "failed to load target device for authorization");
-                return Err(("internal_error", "校验目标设备状态失败".to_string()));
+                return Err((err_code::INTERNAL_ERROR, "校验目标设备状态失败".to_string()));
             }
         };
 
         if !target_allow_remote_control {
             return Err((
-                "remote_control_disabled",
+                err_code::REMOTE_CONTROL_DISABLED,
                 "对方未开启允许远程控制".to_string(),
             ));
         }
@@ -2505,7 +2520,10 @@ impl SignalHub {
         if (self.config.require_auth || caller_uid.is_some() || target_uid.is_some())
             && !target_allow_assist
         {
-            return Err(("assist_disabled", "对方未开启允许他人远程协助".to_string()));
+            return Err((
+                err_code::ASSIST_DISABLED,
+                "对方未开启允许他人远程协助".to_string(),
+            ));
         }
 
         Ok((None, false))
@@ -2530,7 +2548,7 @@ impl SignalHub {
                         self_tx,
                         device_id,
                         SignalMsg::Error {
-                            code: "invalid_payload".into(),
+                            code: err_code::INVALID_PAYLOAD.into(),
                             message: reason,
                         },
                     );
@@ -2581,7 +2599,7 @@ impl SignalHub {
                         self_tx,
                         device_id,
                         SignalMsg::Error {
-                            code: "invalid_payload".into(),
+                            code: err_code::INVALID_PAYLOAD.into(),
                             message:
                                 "at least one of allow_remote_assist or allow_remote_control is required"
                                     .into(),
@@ -2603,7 +2621,7 @@ impl SignalHub {
                                     self_tx,
                                     device_id,
                                     SignalMsg::Error {
-                                        code: "unauthorized".into(),
+                                        code: err_code::UNAUTHORIZED.into(),
                                         message: "device ownership changed".into(),
                                     },
                                 );
@@ -2615,7 +2633,7 @@ impl SignalHub {
                                     self_tx,
                                     device_id,
                                     SignalMsg::Error {
-                                        code: "update_failed".into(),
+                                        code: err_code::UPDATE_FAILED.into(),
                                         message: "device not found".into(),
                                     },
                                 );
@@ -2627,7 +2645,7 @@ impl SignalHub {
                                     self_tx,
                                     device_id,
                                     SignalMsg::Error {
-                                        code: "internal_error".into(),
+                                        code: err_code::INTERNAL_ERROR.into(),
                                         message: "failed to verify device ownership".into(),
                                     },
                                 );
@@ -2649,7 +2667,7 @@ impl SignalHub {
                                     self_tx,
                                     device_id,
                                     SignalMsg::Error {
-                                        code: "update_failed".into(),
+                                        code: err_code::UPDATE_FAILED.into(),
                                         message: "failed to update allow_remote_assist".into(),
                                     },
                                 );
@@ -2661,7 +2679,7 @@ impl SignalHub {
                                     self_tx,
                                     device_id,
                                     SignalMsg::Error {
-                                        code: "internal_error".into(),
+                                        code: err_code::INTERNAL_ERROR.into(),
                                         message: "failed to persist allow_remote_assist".into(),
                                     },
                                 );
@@ -2683,7 +2701,7 @@ impl SignalHub {
                                     self_tx,
                                     device_id,
                                     SignalMsg::Error {
-                                        code: "update_failed".into(),
+                                        code: err_code::UPDATE_FAILED.into(),
                                         message: "failed to update allow_remote_control".into(),
                                     },
                                 );
@@ -2695,7 +2713,7 @@ impl SignalHub {
                                     self_tx,
                                     device_id,
                                     SignalMsg::Error {
-                                        code: "internal_error".into(),
+                                        code: err_code::INTERNAL_ERROR.into(),
                                         message: "failed to persist allow_remote_control".into(),
                                     },
                                 );
@@ -2766,7 +2784,7 @@ impl SignalHub {
                         self_tx,
                         device_id,
                         SignalMsg::Error {
-                            code: "invalid_payload".into(),
+                            code: err_code::INVALID_PAYLOAD.into(),
                             message: "target_id is required".into(),
                         },
                     );
@@ -2777,7 +2795,7 @@ impl SignalHub {
                         self_tx,
                         device_id,
                         SignalMsg::Error {
-                            code: "self_connect".into(),
+                            code: err_code::SELF_CONNECT.into(),
                             message: "cannot connect to self".into(),
                         },
                     );
@@ -2788,7 +2806,7 @@ impl SignalHub {
                         self_tx,
                         device_id,
                         SignalMsg::Error {
-                            code: "invalid_payload".into(),
+                            code: err_code::INVALID_PAYLOAD.into(),
                             message: reason,
                         },
                     );
@@ -2806,7 +2824,7 @@ impl SignalHub {
                             self_tx,
                             device_id,
                             SignalMsg::Error {
-                                code: "invalid_payload".into(),
+                                code: err_code::INVALID_PAYLOAD.into(),
                                 message: reason,
                             },
                         );
@@ -2820,7 +2838,7 @@ impl SignalHub {
                             self_tx,
                             device_id,
                             SignalMsg::Error {
-                                code: "invalid_payload".into(),
+                                code: err_code::INVALID_PAYLOAD.into(),
                                 message: reason,
                             },
                         );
@@ -2839,7 +2857,7 @@ impl SignalHub {
                         self_tx,
                         device_id,
                         SignalMsg::Error {
-                            code: "rate_limited".into(),
+                            code: err_code::RATE_LIMITED.into(),
                             message: "too many connect/relay requests".into(),
                         },
                     );
@@ -2958,7 +2976,7 @@ impl SignalHub {
                         self_tx,
                         device_id,
                         SignalMsg::Error {
-                            code: "frame_too_large".into(),
+                            code: err_code::FRAME_TOO_LARGE.into(),
                             message: "punch_coord frame exceeds maximum length".into(),
                         },
                     );
@@ -3011,7 +3029,7 @@ impl SignalHub {
                             self_tx,
                             device_id,
                             SignalMsg::Error {
-                                code: "peer_busy".into(),
+                                code: err_code::PEER_BUSY.into(),
                                 message: "target peer signaling queue is full".into(),
                             },
                         );
@@ -3022,7 +3040,7 @@ impl SignalHub {
                             self_tx,
                             device_id,
                             SignalMsg::Error {
-                                code: "frame_too_large".into(),
+                                code: err_code::FRAME_TOO_LARGE.into(),
                                 message: "punch_coord frame exceeds maximum length".into(),
                             },
                         );
@@ -3040,7 +3058,7 @@ impl SignalHub {
                         self_tx,
                         device_id,
                         SignalMsg::Error {
-                            code: "invalid_payload".into(),
+                            code: err_code::INVALID_PAYLOAD.into(),
                             message: "target_id is required".into(),
                         },
                     );
@@ -3051,7 +3069,7 @@ impl SignalHub {
                         self_tx,
                         device_id,
                         SignalMsg::Error {
-                            code: "self_connect".into(),
+                            code: err_code::SELF_CONNECT.into(),
                             message: "cannot relay to self".into(),
                         },
                     );
@@ -3069,7 +3087,7 @@ impl SignalHub {
                             self_tx,
                             device_id,
                             SignalMsg::Error {
-                                code: "invalid_payload".into(),
+                                code: err_code::INVALID_PAYLOAD.into(),
                                 message: reason,
                             },
                         );
@@ -3088,7 +3106,7 @@ impl SignalHub {
                         self_tx,
                         device_id,
                         SignalMsg::Error {
-                            code: "rate_limited".into(),
+                            code: err_code::RATE_LIMITED.into(),
                             message: "too many connect/relay requests".into(),
                         },
                     );
@@ -3169,7 +3187,7 @@ impl SignalHub {
                         self_tx,
                         device_id,
                         SignalMsg::Error {
-                            code: "frame_too_large".into(),
+                            code: err_code::FRAME_TOO_LARGE.into(),
                             message: "relay_ready frame exceeds maximum length".into(),
                         },
                     );
@@ -3220,7 +3238,7 @@ impl SignalHub {
                             self_tx,
                             device_id,
                             SignalMsg::Error {
-                                code: "peer_busy".into(),
+                                code: err_code::PEER_BUSY.into(),
                                 message: "target peer signaling queue is full".into(),
                             },
                         );
@@ -3231,7 +3249,7 @@ impl SignalHub {
                             self_tx,
                             device_id,
                             SignalMsg::Error {
-                                code: "frame_too_large".into(),
+                                code: err_code::FRAME_TOO_LARGE.into(),
                                 message: "relay_ready frame exceeds maximum length".into(),
                             },
                         );
@@ -3244,7 +3262,7 @@ impl SignalHub {
                     self_tx,
                     device_id,
                     SignalMsg::Error {
-                        code: "already_registered".into(),
+                        code: err_code::ALREADY_REGISTERED.into(),
                         message: "connection is already registered".into(),
                     },
                 );
@@ -3255,7 +3273,7 @@ impl SignalHub {
                     self_tx,
                     device_id,
                     SignalMsg::Error {
-                        code: "unexpected_message".into(),
+                        code: err_code::UNEXPECTED_MESSAGE.into(),
                         message: "unsupported client-to-server signaling message".into(),
                     },
                 );
@@ -5797,5 +5815,86 @@ mod tests {
         drop(android);
         hub.shutdown_all().await;
         let _ = server_task.await;
+    }
+
+    #[test]
+    fn all_signal_emitted_wire_codes_exist_in_spec() {
+        use crate::generated::error_codes;
+
+        // Every SignalMsg::Error.code and SignalMsg::Kicked.reason emitted by signal.rs,
+        // paired with its legacy snake_case string to enforce 100% wire compatibility.
+        let emitted: &[(&str, &str)] = &[
+            (err_code::ACCOUNT_DISABLED, "account_disabled"),
+            (err_code::ALREADY_REGISTERED, "already_registered"),
+            (err_code::ASSIST_DISABLED, "assist_disabled"),
+            (err_code::DEVICE_DISABLED, "device_disabled"),
+            (err_code::DEVICE_ID_MISMATCH, "device_id_mismatch"),
+            (err_code::DEVICE_UNBOUND, "device_unbound"),
+            (err_code::EXPECTED_REGISTER, "expected_register"),
+            (err_code::FRAME_TOO_LARGE, "frame_too_large"),
+            (err_code::HANDSHAKE_TIMEOUT, "handshake_timeout"),
+            (err_code::INTERNAL_ERROR, "internal_error"),
+            (err_code::INVALID_FRAME, "invalid_frame"),
+            (err_code::INVALID_PAYLOAD, "invalid_payload"),
+            (
+                err_code::PASSWORD_CHANGE_REQUIRED,
+                "password_change_required",
+            ),
+            (err_code::PEER_BUSY, "peer_busy"),
+            (err_code::PEER_DISABLED, "peer_disabled"),
+            (err_code::PEER_NOT_FOUND, "peer_not_found"),
+            (err_code::RATE_LIMITED, "rate_limited"),
+            (err_code::REGISTER_FAILED, "register_failed"),
+            (err_code::RELAY_CAPACITY_EXCEEDED, "relay_capacity_exceeded"),
+            (err_code::RELAY_TOKEN_ERROR, "relay_token_error"),
+            (err_code::REMOTE_CONTROL_DISABLED, "remote_control_disabled"),
+            (
+                err_code::REPLACED_BY_NEW_CONNECTION,
+                "replaced_by_new_connection",
+            ),
+            (err_code::SELF_CONNECT, "self_connect"),
+            (err_code::SERVER_MISCONFIGURED, "server_misconfigured"),
+            (err_code::SERVER_SHUTDOWN, "server_shutdown"),
+            (err_code::SERVICE_UNAVAILABLE, "service_unavailable"),
+            (err_code::TOKEN_EXPIRED, "token_expired"),
+            (err_code::TOKEN_REVOKED, "token_revoked"),
+            (err_code::UNAUTHORIZED, "unauthorized"),
+            (err_code::UNEXPECTED_MESSAGE, "unexpected_message"),
+            (err_code::UPDATE_FAILED, "update_failed"),
+        ];
+
+        for &(constant, expected_wire) in emitted {
+            assert_eq!(
+                constant, expected_wire,
+                "wire code drift for {expected_wire}"
+            );
+            assert!(
+                error_codes::WIRE_ALIAS_MAP
+                    .iter()
+                    .any(|&(alias, _)| alias == constant),
+                "signaling wire code {constant} missing from WIRE_ALIAS_MAP"
+            );
+            assert!(
+                error_codes::canonical_for_wire(constant).is_some(),
+                "signaling wire code {constant} failed canonical_for_wire lookup"
+            );
+        }
+
+        // Verify JSON serialization format of Error and Kicked frames stays backward compatible.
+        let err_json = serde_json::to_value(SignalMsg::Error {
+            code: err_code::REMOTE_CONTROL_DISABLED.into(),
+            message: "对方未开启允许远程控制".into(),
+        })
+        .unwrap();
+        assert_eq!(err_json["type"], "error");
+        assert_eq!(err_json["code"], "remote_control_disabled");
+        assert_eq!(err_json["message"], "对方未开启允许远程控制");
+
+        let kicked_json = serde_json::to_value(SignalMsg::Kicked {
+            reason: err_code::REPLACED_BY_NEW_CONNECTION.into(),
+        })
+        .unwrap();
+        assert_eq!(kicked_json["type"], "kicked");
+        assert_eq!(kicked_json["reason"], "replaced_by_new_connection");
     }
 }

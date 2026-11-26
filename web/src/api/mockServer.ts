@@ -404,7 +404,7 @@ export const mockServer = {
     await delay();
     const user = requireMockAuth(token, true);
     if (user.password !== currentPassword) {
-      throw new MockApiError(400, 'invalid_password', '当前密码校验失败');
+      throw new MockApiError(400, 'invalid_current_password', '当前密码校验失败');
     }
     if (newPassword.length < 8 || newPassword.length > 128) {
       throw new MockApiError(400, 'invalid_input', '新密码长度需在 8 到 128 位之间');

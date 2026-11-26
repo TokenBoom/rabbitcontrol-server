@@ -1,9 +1,11 @@
 import React, { useMemo, useState } from 'react';
 import { AlertCircle, CheckCircle2, Eye, EyeOff, KeyRound, LogOut, ShieldAlert } from 'lucide-react';
-import { ApiError, apiClient, type StoredSession } from '../api/client';
+import { apiClient, type StoredSession } from '../api/client';
 import { BrandMark } from '../components/BrandMark';
 import { useToast } from '../components/Toast';
+import type { UiError } from '../generated/errorCatalog';
 import type { AuthUser } from '../types/api';
+import { resolveUiError } from '../utils/errorDisplay';
 
 interface ForceChangePasswordPageProps {
   user: AuthUser;
@@ -38,12 +40,14 @@ export function ForceChangePasswordPage({
   const [showPwd, setShowPwd] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [uiError, setUiError] = useState<UiError | null>(null);
 
   const strength = useMemo(() => getPasswordStrength(newPassword), [newPassword]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
+    setUiError(null);
 
     if (!currentPassword) {
       setErrorMsg('请输入当前密码（即首次启动时生成的初始密码）');
@@ -68,11 +72,12 @@ export function ForceChangePasswordPage({
       pushToast('success', '密码已更新', '已签发全权限访问令牌，正在进入管理后台');
       onSuccess(updated);
     } catch (err) {
-      if (err instanceof ApiError) {
-        setErrorMsg(err.message);
-      } else {
-        setErrorMsg('修改密码失败，请稍后重试');
-      }
+      setUiError(
+        resolveUiError(err, {
+          fallbackTitle: '修改密码失败',
+          fallbackMessage: '密码修改未能完成，请稍后重试。',
+        }),
+      );
     } finally {
       setSubmitting(false);
     }
@@ -112,10 +117,22 @@ export function ForceChangePasswordPage({
           </div>
         </div>
 
-        {errorMsg && (
+        {(uiError || errorMsg) && (
           <div className="alert alert-danger" style={{ marginBottom: 16 }}>
             <AlertCircle size={17} style={{ flexShrink: 0, marginTop: 1 }} />
-            <span>{errorMsg}</span>
+            {uiError ? (
+              <div>
+                <div style={{ fontWeight: 600 }}>{uiError.title}</div>
+                <div style={{ marginTop: 2 }}>{uiError.message}</div>
+                {uiError.suggestion && (
+                  <div style={{ marginTop: 4, fontSize: 12.5, opacity: 0.9 }}>
+                    {uiError.suggestion}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <span>{errorMsg}</span>
+            )}
           </div>
         )}
 

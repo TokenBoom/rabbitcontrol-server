@@ -8,10 +8,11 @@ import {
   RefreshCw,
   Search,
 } from 'lucide-react';
-import { ApiError, apiClient } from '../api/client';
+import { apiClient } from '../api/client';
 import { Modal } from '../components/Modal';
 import { useToast } from '../components/Toast';
 import type { DeviceView } from '../types/api';
+import { formatApiErrorToast } from '../utils/errorDisplay';
 import { formatDateTime, formatDeviceId, formatRelativeTime } from '../utils/format';
 
 const PAGE_SIZE = 15;
@@ -41,8 +42,11 @@ export function DevicesPage() {
       setDevices(res.devices);
       setTotal(res.total_count ?? res.total);
     } catch (err) {
-      const msg = err instanceof ApiError ? err.message : '加载设备列表失败';
-      pushToast('error', '加载设备失败', msg);
+      const { title, detail } = formatApiErrorToast(err, {
+        fallbackTitle: '加载设备失败',
+        fallbackMessage: '加载设备列表失败，请稍后重试。',
+      });
+      pushToast('error', title, detail);
     } finally {
       setLoading(false);
     }
@@ -71,8 +75,14 @@ export function DevicesPage() {
       setDisableTarget(null);
       await loadDevices();
     } catch (err) {
-      const msg = err instanceof ApiError ? err.message : '禁用设备失败';
-      pushToast('error', '操作失败', msg);
+      const { title, detail } = formatApiErrorToast(err, {
+        fallbackTitle: '操作失败',
+        fallbackMessage: '禁用设备失败，请稍后重试。',
+        params: {
+          device_id: formatDeviceId(disableTarget.device_id),
+        },
+      });
+      pushToast('error', title, detail);
     } finally {
       setDisabling(false);
     }
