@@ -2409,6 +2409,10 @@ async fn get_my_devices(
         });
     }
 
+    // Keep online devices at the top and offline devices at the bottom,
+    // preserving the store's `last_seen_at DESC, device_id ASC` tie-break order.
+    devices.sort_by_key(|d| std::cmp::Reverse(d.online));
+
     let total = devices.len();
     (StatusCode::OK, Json(MyDevicesResponse { devices, total })).into_response()
 }

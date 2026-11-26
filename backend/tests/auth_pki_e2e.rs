@@ -2595,3 +2595,119 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
 
     cluster.shutdown().await;
 }
+
+#[tokio::test]
+async fn my_devices_orders_online_before_offline_even_when_offline_seen_later() {
+    let cluster = SecureTestCluster::start_fresh().await;
+
+    let (status, body) = https_json(
+        cluster.http_addr,
+        &cluster.client_tls_no_cert,
+        "POST",
+        "/api/v1/auth/register",
+        None,
+        Some(&serde_json::json!({
+            "email": "sort-owner@example.com",
+            "password": "SortPassword!2026",
+            "display_name": "Sort Owner",
+        })),
+    )
+    .await;
+    assert_eq!(status, 200, "register user: {body}");
+    let user: AuthTokenResponse = serde_json::from_str(&body).unwrap();
+
+    // 1. Register online device FIRST (older last_seen_at) and keep it connected.
+    let mut online_sig = connect_tls_signal(cluster.signal_addr, &cluster.client_tls_no_cert).await;
+    write_signal_frame(
+        &mut online_sig,
+        &SignalMsg::Register {
+            device_id: None,
+            device_key: "dk-sort-online-older".into(),
+            hostname: "Online-Mac".into(),
+            os: "macos".into(),
+            app_version: "0.1.12".into(),
+            arch: "arm64".into(),
+            device_group: "default".into(),
+            lan_addrs: vec![],
+            access_token: Some(user.access_token.clone()),
+            device_pubkey: None,
+            allow_remote_assist: Some(false),
+            allow_remote_control: Some(true),
+        },
+    )
+    .await
+    .unwrap();
+    let online_id = match read_signal_frame(&mut online_sig).await.unwrap().unwrap() {
+        SignalMsg::Registered { device_id, .. } => device_id,
+        other => panic!("expected Registered for online device, got {other:?}"),
+    };
+
+    // Wait briefly so the second device gets a strictly newer `last_seen_at`.
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    // 2. Register second device LATER (newer last_seen_at), then disconnect it so it becomes offline.
+    let mut offline_sig =
+        connect_tls_signal(cluster.signal_addr, &cluster.client_tls_no_cert).await;
+    write_signal_frame(
+        &mut offline_sig,
+        &SignalMsg::Register {
+            device_id: None,
+            device_key: "dk-sort-offline-newer".into(),
+            hostname: "Offline-Mac".into(),
+            os: "macos".into(),
+            app_version: "0.1.12".into(),
+            arch: "arm64".into(),
+            device_group: "default".into(),
+            lan_addrs: vec![],
+            access_token: Some(user.access_token.clone()),
+            device_pubkey: None,
+            allow_remote_assist: Some(false),
+            allow_remote_control: Some(true),
+        },
+    )
+    .await
+    .unwrap();
+    let offline_id = match read_signal_frame(&mut offline_sig).await.unwrap().unwrap() {
+        SignalMsg::Registered { device_id, .. } => device_id,
+        other => panic!("expected Registered for offline device, got {other:?}"),
+    };
+    // Drain the online broadcast on `online_sig`.
+    let _ = read_signal_frame(&mut online_sig).await.unwrap().unwrap();
+
+    // Disconnect the newer device and wait for its offline broadcast on `online_sig`.
+    drop(offline_sig);
+    assert!(matches!(
+        read_signal_frame(&mut online_sig).await.unwrap().unwrap(),
+        SignalMsg::DeviceStatusChanged {
+            ref device_id,
+            online: false,
+            ..
+        } if device_id == &offline_id
+    ));
+
+    // 3. GET /api/v1/me/devices MUST return the online device first and the offline device last,
+    //    even though the offline device has a newer `last_seen_at`.
+    let (status, body) = https_json(
+        cluster.http_addr,
+        &cluster.client_tls_no_cert,
+        "GET",
+        "/api/v1/me/devices",
+        Some(&user.access_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "GET /api/v1/me/devices: {body}");
+    let my_devs: MyDevicesResponse = serde_json::from_str(&body).unwrap();
+    assert_eq!(my_devs.devices.len(), 2);
+    assert_eq!(my_devs.devices[0].device_id, online_id);
+    assert!(my_devs.devices[0].online);
+    assert_eq!(my_devs.devices[1].device_id, offline_id);
+    assert!(!my_devs.devices[1].online);
+    assert!(
+        my_devs.devices[1].last_seen_at >= my_devs.devices[0].last_seen_at,
+        "sanity check: offline device had newer last_seen_at yet must still sort after online"
+    );
+
+    drop(online_sig);
+    cluster.shutdown().await;
+}
