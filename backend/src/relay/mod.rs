@@ -3865,6 +3865,8 @@ mod tests {
                     device_key: "host-mtls-key".into(),
                     hostname: "host-mtls".into(),
                     os: "macos".into(),
+                    app_version: String::new(),
+                    arch: String::new(),
                     device_group: "test".into(),
                 })
                 .await
@@ -3879,6 +3881,8 @@ mod tests {
                     device_key: "client-mtls-key".into(),
                     hostname: "client-mtls".into(),
                     os: "macos".into(),
+                    app_version: String::new(),
+                    arch: String::new(),
                     device_group: "test".into(),
                 })
                 .await

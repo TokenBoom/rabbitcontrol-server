@@ -15,6 +15,8 @@ use uuid::Uuid;
 pub const MAX_DEVICE_KEY_LEN: usize = 256;
 pub const MAX_HOSTNAME_LEN: usize = 128;
 pub const MAX_OS_LEN: usize = 128;
+pub const MAX_APP_VERSION_LEN: usize = 32;
+pub const MAX_ARCH_LEN: usize = 32;
 pub const MAX_DEVICE_GROUP_LEN: usize = 64;
 pub const MAX_DEVICE_ALIAS_LEN: usize = 128;
 pub const MAX_DEVICE_PUBKEY_LEN: usize = 256;
@@ -65,6 +67,10 @@ pub struct DeviceRecord {
     pub device_key: String,
     pub hostname: String,
     pub os: String,
+    #[serde(default)]
+    pub app_version: String,
+    #[serde(default)]
+    pub arch: String,
     pub device_group: String,
     pub disabled: bool,
     pub created_at: DateTime<Utc>,
@@ -81,13 +87,17 @@ pub struct DeviceRecord {
     pub bound_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RegisterInput {
     pub device_key: String,
     #[serde(default)]
     pub hostname: String,
     #[serde(default)]
     pub os: String,
+    #[serde(default)]
+    pub app_version: String,
+    #[serde(default)]
+    pub arch: String,
     #[serde(default, alias = "group")]
     pub device_group: String,
 }
@@ -340,9 +350,16 @@ pub fn validate_text_field(
     Ok(trimmed.to_string())
 }
 
-fn validate_register_input(
-    input: &RegisterInput,
-) -> Result<(String, String, String, String), StoreError> {
+struct ValidatedRegisterInput {
+    device_key: String,
+    hostname: String,
+    os: String,
+    app_version: String,
+    arch: String,
+    device_group: String,
+}
+
+fn validate_register_input(input: &RegisterInput) -> Result<ValidatedRegisterInput, StoreError> {
     let device_key = validate_text_field(&input.device_key, MAX_DEVICE_KEY_LEN, "device_key")?;
     if device_key.is_empty() {
         return Err(StoreError::InvalidInput(format!(
@@ -351,9 +368,18 @@ fn validate_register_input(
     }
     let hostname = validate_text_field(&input.hostname, MAX_HOSTNAME_LEN, "hostname")?;
     let os = validate_text_field(&input.os, MAX_OS_LEN, "os")?;
+    let app_version = validate_text_field(&input.app_version, MAX_APP_VERSION_LEN, "app_version")?;
+    let arch = validate_text_field(&input.arch, MAX_ARCH_LEN, "arch")?;
     let device_group =
         validate_text_field(&input.device_group, MAX_DEVICE_GROUP_LEN, "device_group")?;
-    Ok((device_key, hostname, os, device_group))
+    Ok(ValidatedRegisterInput {
+        device_key,
+        hostname,
+        os,
+        app_version,
+        arch,
+        device_group,
+    })
 }
 
 fn validate_optional_device_id(raw: Option<&str>) -> Result<Option<String>, StoreError> {
@@ -638,6 +664,8 @@ struct DeviceRow {
     device_key: String,
     hostname: String,
     os: String,
+    app_version: String,
+    arch: String,
     device_group: String,
     disabled: bool,
     created_at: DateTime<Utc>,
@@ -656,6 +684,8 @@ impl From<DeviceRow> for DeviceRecord {
             device_key: row.device_key,
             hostname: row.hostname,
             os: row.os,
+            app_version: row.app_version,
+            arch: row.arch,
             device_group: row.device_group,
             disabled: row.disabled,
             created_at: row.created_at,
@@ -866,7 +896,8 @@ impl From<AuditLogRow> for AuditLogRecord {
     }
 }
 
-const DEVICE_COLUMNS: &str = "device_id, device_key, hostname, os, device_group, disabled, \
+const DEVICE_COLUMNS: &str =
+    "device_id, device_key, hostname, os, app_version, arch, device_group, disabled, \
     created_at, last_seen_at, owner_user_id, alias, device_pubkey, allow_remote_assist, bound_at";
 
 const USER_COLUMNS: &str = "id, email, display_name, password_hash, role, status, \
@@ -919,25 +950,26 @@ impl PgDeviceStore {
 
     async fn update_existing_metadata(
         &self,
-        device_key: &str,
-        hostname: &str,
-        os: &str,
-        device_group: &str,
+        v: &ValidatedRegisterInput,
     ) -> Result<Option<DeviceRecord>, StoreError> {
         let sql = format!(
             "UPDATE devices
              SET hostname = COALESCE(NULLIF($1, ''), hostname),
                  os = COALESCE(NULLIF($2, ''), os),
-                 device_group = COALESCE(NULLIF($3, ''), device_group),
+                 app_version = COALESCE(NULLIF($3, ''), app_version),
+                 arch = COALESCE(NULLIF($4, ''), arch),
+                 device_group = COALESCE(NULLIF($5, ''), device_group),
                  last_seen_at = NOW()
-             WHERE device_key = $4 AND disabled = FALSE
+             WHERE device_key = $6 AND disabled = FALSE
              RETURNING {DEVICE_COLUMNS}"
         );
         let row: Option<DeviceRow> = sqlx::query_as(&sql)
-            .bind(hostname)
-            .bind(os)
-            .bind(device_group)
-            .bind(device_key)
+            .bind(&v.hostname)
+            .bind(&v.os)
+            .bind(&v.app_version)
+            .bind(&v.arch)
+            .bind(&v.device_group)
+            .bind(&v.device_key)
             .fetch_optional(&self.pool)
             .await?;
 
@@ -946,7 +978,7 @@ impl PgDeviceStore {
         }
 
         // Distinguish disabled device from concurrently deleted/absent device.
-        if let Some(existing) = self.fetch_by_key(device_key).await? {
+        if let Some(existing) = self.fetch_by_key(&v.device_key).await? {
             if existing.disabled {
                 return Err(StoreError::DeviceDisabled(existing.device_id));
             }
@@ -958,18 +990,15 @@ impl PgDeviceStore {
 #[async_trait]
 impl DeviceStore for PgDeviceStore {
     async fn register_or_get(&self, input: RegisterInput) -> Result<DeviceRecord, StoreError> {
-        let (device_key, hostname, os, device_group) = validate_register_input(&input)?;
+        let v = validate_register_input(&input)?;
 
-        if let Some(updated) = self
-            .update_existing_metadata(&device_key, &hostname, &os, &device_group)
-            .await?
-        {
+        if let Some(updated) = self.update_existing_metadata(&v).await? {
             return Ok(updated);
         }
 
         let insert_sql = format!(
-            "INSERT INTO devices (device_id, device_key, hostname, os, device_group)
-             VALUES ($1, $2, $3, $4, $5)
+            "INSERT INTO devices (device_id, device_key, hostname, os, app_version, arch, device_group)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT DO NOTHING
              RETURNING {DEVICE_COLUMNS}"
         );
@@ -978,10 +1007,12 @@ impl DeviceStore for PgDeviceStore {
             let candidate_id = generate_device_id();
             let inserted: Option<DeviceRow> = sqlx::query_as(&insert_sql)
                 .bind(&candidate_id)
-                .bind(&device_key)
-                .bind(&hostname)
-                .bind(&os)
-                .bind(&device_group)
+                .bind(&v.device_key)
+                .bind(&v.hostname)
+                .bind(&v.os)
+                .bind(&v.app_version)
+                .bind(&v.arch)
+                .bind(&v.device_group)
                 .fetch_optional(&self.pool)
                 .await?;
 
@@ -990,10 +1021,7 @@ impl DeviceStore for PgDeviceStore {
             }
 
             // Conflict could be a concurrent register with the same device_key or a 9-digit ID collision.
-            if let Some(updated) = self
-                .update_existing_metadata(&device_key, &hostname, &os, &device_group)
-                .await?
-            {
+            if let Some(updated) = self.update_existing_metadata(&v).await? {
                 return Ok(updated);
             }
         }
@@ -2388,23 +2416,29 @@ impl MemoryDeviceStore {
 #[async_trait]
 impl DeviceStore for MemoryDeviceStore {
     async fn register_or_get(&self, input: RegisterInput) -> Result<DeviceRecord, StoreError> {
-        let (device_key, hostname, os, device_group) = validate_register_input(&input)?;
+        let v = validate_register_input(&input)?;
         let now = Utc::now();
 
         let mut guard = self.state.write().expect("MemoryDeviceStore lock poisoned");
-        if let Some(existing_id) = guard.by_key.get(&device_key).cloned() {
+        if let Some(existing_id) = guard.by_key.get(&v.device_key).cloned() {
             if let Some(existing) = guard.by_id.get_mut(&existing_id) {
                 if existing.disabled {
                     return Err(StoreError::DeviceDisabled(existing.device_id.clone()));
                 }
-                if !hostname.is_empty() {
-                    existing.hostname = hostname;
+                if !v.hostname.is_empty() {
+                    existing.hostname = v.hostname;
                 }
-                if !os.is_empty() {
-                    existing.os = os;
+                if !v.os.is_empty() {
+                    existing.os = v.os;
                 }
-                if !device_group.is_empty() {
-                    existing.device_group = device_group;
+                if !v.app_version.is_empty() {
+                    existing.app_version = v.app_version;
+                }
+                if !v.arch.is_empty() {
+                    existing.arch = v.arch;
+                }
+                if !v.device_group.is_empty() {
+                    existing.device_group = v.device_group;
                 }
                 existing.last_seen_at = now;
                 return Ok(existing.clone());
@@ -2416,10 +2450,12 @@ impl DeviceStore for MemoryDeviceStore {
             if !guard.by_id.contains_key(&candidate_id) {
                 let record = DeviceRecord {
                     device_id: candidate_id.clone(),
-                    device_key: device_key.clone(),
-                    hostname,
-                    os,
-                    device_group,
+                    device_key: v.device_key.clone(),
+                    hostname: v.hostname,
+                    os: v.os,
+                    app_version: v.app_version,
+                    arch: v.arch,
+                    device_group: v.device_group,
                     disabled: false,
                     created_at: now,
                     last_seen_at: now,
@@ -2429,7 +2465,7 @@ impl DeviceStore for MemoryDeviceStore {
                     allow_remote_assist: false,
                     bound_at: None,
                 };
-                guard.by_key.insert(device_key, candidate_id.clone());
+                guard.by_key.insert(v.device_key, candidate_id.clone());
                 guard.by_id.insert(candidate_id, record.clone());
                 return Ok(record);
             }
@@ -3622,6 +3658,8 @@ mod tests {
                 device_key: "ed25519:key-alpha".into(),
                 hostname: "mac-a".into(),
                 os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "dev".into(),
             })
             .await
@@ -3635,6 +3673,8 @@ mod tests {
                 device_key: "ed25519:key-alpha".into(),
                 hostname: "mac-a-renamed".into(),
                 os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "prod".into(),
             })
             .await
@@ -3650,6 +3690,8 @@ mod tests {
                 device_key: "ed25519:key-beta".into(),
                 hostname: "linux-box".into(),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
             })
             .await
@@ -3674,6 +3716,8 @@ mod tests {
                 device_key: "ed25519:key-alpha".into(),
                 hostname: "mac-a".into(),
                 os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "prod".into(),
             })
             .await
@@ -3716,6 +3760,8 @@ mod tests {
                 device_key: "   ".into(),
                 hostname: "x".into(),
                 os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
             })
             .await
@@ -3731,6 +3777,8 @@ mod tests {
                 device_key: "ed25519:super-secret-token-xyz".into(),
                 hostname: "alpha-node".into(),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "fleet".into(),
             })
             .await
@@ -3740,6 +3788,8 @@ mod tests {
                 device_key: "ed25519:another-secret-999".into(),
                 hostname: "beta_100%_node".into(),
                 os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "lab".into(),
             })
             .await
@@ -3791,6 +3841,8 @@ mod tests {
                 device_key: "k".repeat(MAX_DEVICE_KEY_LEN),
                 hostname: "h".repeat(MAX_HOSTNAME_LEN),
                 os: "o".repeat(MAX_OS_LEN),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "g".repeat(MAX_DEVICE_GROUP_LEN),
             })
             .await;
@@ -3802,18 +3854,24 @@ mod tests {
                 device_key: "key-1".into(),
                 hostname: "h".repeat(MAX_HOSTNAME_LEN + 1),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
             },
             RegisterInput {
                 device_key: "key-2".into(),
                 hostname: "host".into(),
                 os: "o".repeat(MAX_OS_LEN + 1),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
             },
             RegisterInput {
                 device_key: "key-3".into(),
                 hostname: "host".into(),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "g".repeat(MAX_DEVICE_GROUP_LEN + 1),
             },
             // NUL byte & control chars rejected across all fields.
@@ -3821,24 +3879,32 @@ mod tests {
                 device_key: "key\0nul".into(),
                 hostname: "host".into(),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
             },
             RegisterInput {
                 device_key: "key-4".into(),
                 hostname: "bad\0host".into(),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
             },
             RegisterInput {
                 device_key: "key-5".into(),
                 hostname: "host".into(),
                 os: "linux\x07bell".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
             },
             RegisterInput {
                 device_key: "key-6".into(),
                 hostname: "host".into(),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "group\nline".into(),
             },
         ] {
@@ -3882,6 +3948,8 @@ mod tests {
                     device_key: format!("key-page-{i}"),
                     hostname: format!("node-{i}"),
                     os: "linux".into(),
+                    app_version: String::new(),
+                    arch: String::new(),
                     device_group: "cluster".into(),
                 })
                 .await
@@ -4011,6 +4079,8 @@ mod tests {
                 device_key: "key-alice-1".into(),
                 hostname: "alice-mac".into(),
                 os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
             })
             .await
@@ -4251,6 +4321,8 @@ mod tests {
                 device_key: "key-carol".into(),
                 hostname: "carol-pc".into(),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
             })
             .await
@@ -4347,5 +4419,71 @@ mod tests {
         let logs = store.list_audit_logs(10, 0).await.unwrap();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].action, "device.unbind");
+    }
+
+    #[tokio::test]
+    async fn register_or_get_tracks_app_version_and_arch_preserving_non_empty() {
+        let store = MemoryDeviceStore::new();
+        let d1 = store
+            .register_or_get(RegisterInput {
+                device_key: "ed25519:ver-test".into(),
+                hostname: "mbp".into(),
+                os: "macos".into(),
+                app_version: "0.1.9".into(),
+                arch: "arm64".into(),
+                device_group: "default".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(d1.app_version, "0.1.9");
+        assert_eq!(d1.arch, "arm64");
+
+        // Re-registering with empty app_version/arch (e.g. older client) preserves stored metadata.
+        let d2 = store
+            .register_or_get(RegisterInput {
+                device_key: "ed25519:ver-test".into(),
+                hostname: "mbp".into(),
+                os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
+                device_group: String::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(d2.device_id, d1.device_id);
+        assert_eq!(d2.app_version, "0.1.9");
+        assert_eq!(d2.arch, "arm64");
+
+        // Re-registering after upgrade updates app_version immediately.
+        let d3 = store
+            .register_or_get(RegisterInput {
+                device_key: "ed25519:ver-test".into(),
+                hostname: "mbp".into(),
+                os: "macos".into(),
+                app_version: "0.1.10".into(),
+                arch: "arm64".into(),
+                device_group: String::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(d3.app_version, "0.1.10");
+
+        // Oversized app_version or arch rejected.
+        assert!(store
+            .register_or_get(RegisterInput {
+                device_key: "ed25519:ver-test".into(),
+                app_version: "v".repeat(MAX_APP_VERSION_LEN + 1),
+                ..Default::default()
+            })
+            .await
+            .is_err());
+        assert!(store
+            .register_or_get(RegisterInput {
+                device_key: "ed25519:ver-test".into(),
+                arch: "x".repeat(MAX_ARCH_LEN + 1),
+                ..Default::default()
+            })
+            .await
+            .is_err());
     }
 }

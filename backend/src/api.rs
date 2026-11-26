@@ -43,9 +43,10 @@ use crate::store::{
     format_device_id, is_valid_device_id, normalize_device_id, normalize_email, validate_email,
     validate_role, validate_status, validate_text_field, AuthStore, CreateSessionInput,
     CreateUserInput, DeviceCertRecord, DeviceRecord, DeviceStore, RegisterInput, StoreError,
-    UpdateUserInput, UserRecord, DEFAULT_LIST_LIMIT, MAX_CLIENT_INFO_LEN, MAX_DEVICE_ALIAS_LEN,
-    MAX_DEVICE_GROUP_LEN, MAX_DEVICE_KEY_LEN, MAX_DEVICE_PUBKEY_LEN, MAX_HOSTNAME_LEN,
-    MAX_LIST_LIMIT, MAX_OS_LEN, ROLE_ADMIN, ROLE_USER, STATUS_ACTIVE,
+    UpdateUserInput, UserRecord, DEFAULT_LIST_LIMIT, MAX_APP_VERSION_LEN, MAX_ARCH_LEN,
+    MAX_CLIENT_INFO_LEN, MAX_DEVICE_ALIAS_LEN, MAX_DEVICE_GROUP_LEN, MAX_DEVICE_KEY_LEN,
+    MAX_DEVICE_PUBKEY_LEN, MAX_HOSTNAME_LEN, MAX_LIST_LIMIT, MAX_OS_LEN, ROLE_ADMIN, ROLE_USER,
+    STATUS_ACTIVE,
 };
 
 pub const MAX_REGISTER_BODY_BYTES: usize = 8 * 1024;
@@ -573,45 +574,61 @@ struct BindDeviceParams<'a> {
     device_key: &'a str,
     hostname: Option<&'a str>,
     os: Option<&'a str>,
+    app_version: Option<&'a str>,
+    arch: Option<&'a str>,
     device_group: Option<&'a str>,
     alias: Option<&'a str>,
     device_pubkey: Option<&'a str>,
 }
 
+struct OptionalAuthDeviceFields<'a> {
+    device_key: Option<&'a str>,
+    hostname: Option<&'a str>,
+    os: Option<&'a str>,
+    app_version: Option<&'a str>,
+    arch: Option<&'a str>,
+    device_group: Option<&'a str>,
+    alias: Option<&'a str>,
+    device_pubkey: Option<&'a str>,
+    client_info: Option<&'a str>,
+}
+
 fn validate_optional_auth_device_fields(
-    device_key: Option<&str>,
-    hostname: Option<&str>,
-    os: Option<&str>,
-    device_group: Option<&str>,
-    alias: Option<&str>,
-    device_pubkey: Option<&str>,
-    client_info: Option<&str>,
+    fields: OptionalAuthDeviceFields<'_>,
 ) -> Result<(), Box<Response>> {
-    if let Some(dk) = device_key.map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(dk) = fields.device_key.map(str::trim).filter(|s| !s.is_empty()) {
         validate_text_field(dk, MAX_DEVICE_KEY_LEN, "device_key")
             .map_err(|e| Box::new(map_store_error(e, "validate_device_key")))?;
     }
-    if let Some(h) = hostname {
+    if let Some(h) = fields.hostname {
         validate_text_field(h, MAX_HOSTNAME_LEN, "hostname")
             .map_err(|e| Box::new(map_store_error(e, "validate_hostname")))?;
     }
-    if let Some(o) = os {
+    if let Some(o) = fields.os {
         validate_text_field(o, MAX_OS_LEN, "os")
             .map_err(|e| Box::new(map_store_error(e, "validate_os")))?;
     }
-    if let Some(g) = device_group {
+    if let Some(v) = fields.app_version {
+        validate_text_field(v, MAX_APP_VERSION_LEN, "app_version")
+            .map_err(|e| Box::new(map_store_error(e, "validate_app_version")))?;
+    }
+    if let Some(ar) = fields.arch {
+        validate_text_field(ar, MAX_ARCH_LEN, "arch")
+            .map_err(|e| Box::new(map_store_error(e, "validate_arch")))?;
+    }
+    if let Some(g) = fields.device_group {
         validate_text_field(g, MAX_DEVICE_GROUP_LEN, "device_group")
             .map_err(|e| Box::new(map_store_error(e, "validate_device_group")))?;
     }
-    if let Some(a) = alias {
+    if let Some(a) = fields.alias {
         validate_text_field(a, MAX_DEVICE_ALIAS_LEN, "alias")
             .map_err(|e| Box::new(map_store_error(e, "validate_alias")))?;
     }
-    if let Some(pk) = device_pubkey {
+    if let Some(pk) = fields.device_pubkey {
         validate_text_field(pk, MAX_DEVICE_PUBKEY_LEN, "device_pubkey")
             .map_err(|e| Box::new(map_store_error(e, "validate_device_pubkey")))?;
     }
-    if let Some(ci) = client_info {
+    if let Some(ci) = fields.client_info {
         validate_text_field(ci, MAX_CLIENT_INFO_LEN, "client_info")
             .map_err(|e| Box::new(map_store_error(e, "validate_client_info")))?;
     }
@@ -623,15 +640,17 @@ async fn register_and_bind_device_for_user(
     user_id: Uuid,
     params: BindDeviceParams<'_>,
 ) -> Result<DeviceRecord, Box<Response>> {
-    validate_optional_auth_device_fields(
-        Some(params.device_key),
-        params.hostname,
-        params.os,
-        params.device_group,
-        params.alias,
-        params.device_pubkey,
-        None,
-    )?;
+    validate_optional_auth_device_fields(OptionalAuthDeviceFields {
+        device_key: Some(params.device_key),
+        hostname: params.hostname,
+        os: params.os,
+        app_version: params.app_version,
+        arch: params.arch,
+        device_group: params.device_group,
+        alias: params.alias,
+        device_pubkey: params.device_pubkey,
+        client_info: None,
+    })?;
 
     let reg = state
         .device_store
@@ -639,6 +658,8 @@ async fn register_and_bind_device_for_user(
             device_key: params.device_key.to_string(),
             hostname: params.hostname.unwrap_or_default().to_string(),
             os: params.os.unwrap_or_default().to_string(),
+            app_version: params.app_version.unwrap_or_default().to_string(),
+            arch: params.arch.unwrap_or_default().to_string(),
             device_group: params.device_group.unwrap_or_default().to_string(),
         })
         .await
@@ -750,6 +771,10 @@ pub struct AuthRegisterRequest {
     pub hostname: Option<String>,
     #[serde(default)]
     pub os: Option<String>,
+    #[serde(default)]
+    pub app_version: Option<String>,
+    #[serde(default)]
+    pub arch: Option<String>,
     #[serde(default, alias = "group")]
     pub device_group: Option<String>,
     #[serde(default)]
@@ -770,6 +795,10 @@ pub struct AuthLoginRequest {
     pub hostname: Option<String>,
     #[serde(default)]
     pub os: Option<String>,
+    #[serde(default)]
+    pub app_version: Option<String>,
+    #[serde(default)]
+    pub arch: Option<String>,
     #[serde(default, alias = "group")]
     pub device_group: Option<String>,
     #[serde(default)]
@@ -857,6 +886,10 @@ pub struct BindDeviceRequest {
     pub hostname: Option<String>,
     #[serde(default)]
     pub os: Option<String>,
+    #[serde(default)]
+    pub app_version: Option<String>,
+    #[serde(default)]
+    pub arch: Option<String>,
     #[serde(default, alias = "group")]
     pub device_group: Option<String>,
     #[serde(default)]
@@ -879,6 +912,10 @@ pub struct MyDeviceView {
     pub formatted_id: String,
     pub hostname: String,
     pub os: String,
+    #[serde(default)]
+    pub app_version: String,
+    #[serde(default)]
+    pub arch: String,
     pub device_group: String,
     pub alias: String,
     pub allow_remote_assist: bool,
@@ -1015,6 +1052,10 @@ pub struct RegisterResponse {
     pub device_key: String,
     pub hostname: String,
     pub os: String,
+    #[serde(default)]
+    pub app_version: String,
+    #[serde(default)]
+    pub arch: String,
     pub device_group: String,
     pub created_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
@@ -1057,6 +1098,10 @@ pub struct DeviceView {
     pub formatted_id: String,
     pub hostname: String,
     pub os: String,
+    #[serde(default)]
+    pub app_version: String,
+    #[serde(default)]
+    pub arch: String,
     pub device_group: String,
     #[serde(default)]
     pub alias: String,
@@ -1462,15 +1507,17 @@ async fn post_auth_register(
         return api_error(StatusCode::BAD_REQUEST, "invalid_input", msg);
     }
 
-    if let Err(resp) = validate_optional_auth_device_fields(
-        req.device_key.as_deref(),
-        req.hostname.as_deref(),
-        req.os.as_deref(),
-        req.device_group.as_deref(),
-        req.alias.as_deref(),
-        req.device_pubkey.as_deref(),
-        req.client_info.as_deref(),
-    ) {
+    if let Err(resp) = validate_optional_auth_device_fields(OptionalAuthDeviceFields {
+        device_key: req.device_key.as_deref(),
+        hostname: req.hostname.as_deref(),
+        os: req.os.as_deref(),
+        app_version: req.app_version.as_deref(),
+        arch: req.arch.as_deref(),
+        device_group: req.device_group.as_deref(),
+        alias: req.alias.as_deref(),
+        device_pubkey: req.device_pubkey.as_deref(),
+        client_info: req.client_info.as_deref(),
+    }) {
         return *resp;
     }
     if let Some(dk) = req
@@ -1532,6 +1579,8 @@ async fn post_auth_register(
                     device_key: dk,
                     hostname: req.hostname.as_deref(),
                     os: req.os.as_deref(),
+                    app_version: req.app_version.as_deref(),
+                    arch: req.arch.as_deref(),
                     device_group: req.device_group.as_deref(),
                     alias: req.alias.as_deref(),
                     device_pubkey: req.device_pubkey.as_deref(),
@@ -1667,15 +1716,17 @@ async fn post_auth_login(
         );
     }
 
-    if let Err(resp) = validate_optional_auth_device_fields(
-        req.device_key.as_deref(),
-        req.hostname.as_deref(),
-        req.os.as_deref(),
-        req.device_group.as_deref(),
-        req.alias.as_deref(),
-        req.device_pubkey.as_deref(),
-        req.client_info.as_deref(),
-    ) {
+    if let Err(resp) = validate_optional_auth_device_fields(OptionalAuthDeviceFields {
+        device_key: req.device_key.as_deref(),
+        hostname: req.hostname.as_deref(),
+        os: req.os.as_deref(),
+        app_version: req.app_version.as_deref(),
+        arch: req.arch.as_deref(),
+        device_group: req.device_group.as_deref(),
+        alias: req.alias.as_deref(),
+        device_pubkey: req.device_pubkey.as_deref(),
+        client_info: req.client_info.as_deref(),
+    }) {
         return *resp;
     }
 
@@ -1694,6 +1745,8 @@ async fn post_auth_login(
                 device_key: dk,
                 hostname: req.hostname.as_deref(),
                 os: req.os.as_deref(),
+                app_version: req.app_version.as_deref(),
+                arch: req.arch.as_deref(),
                 device_group: req.device_group.as_deref(),
                 alias: req.alias.as_deref(),
                 device_pubkey: req.device_pubkey.as_deref(),
@@ -2328,6 +2381,8 @@ async fn get_my_devices(
             device_id: rec.device_id,
             hostname: rec.hostname,
             os: rec.os,
+            app_version: rec.app_version,
+            arch: rec.arch,
             device_group: rec.device_group,
             alias: rec.alias,
             allow_remote_assist: rec.allow_remote_assist,
@@ -2398,6 +2453,8 @@ async fn post_bind_my_device(
             device_key: dk,
             hostname: req.hostname.as_deref(),
             os: req.os.as_deref(),
+            app_version: req.app_version.as_deref(),
+            arch: req.arch.as_deref(),
             device_group: req.device_group.as_deref(),
             alias: req.alias.as_deref(),
             device_pubkey: req.device_pubkey.as_deref(),
@@ -3127,6 +3184,8 @@ async fn post_register_device(
                 device_key: rec.device_key,
                 hostname: rec.hostname,
                 os: rec.os,
+                app_version: rec.app_version,
+                arch: rec.arch,
                 device_group: rec.device_group,
                 created_at: rec.created_at,
                 last_seen_at: rec.last_seen_at,
@@ -3406,6 +3465,8 @@ async fn build_device_view_with_state(
         device_id: rec.device_id,
         hostname: rec.hostname,
         os: rec.os,
+        app_version: rec.app_version,
+        arch: rec.arch,
         device_group: rec.device_group,
         alias: rec.alias,
         owner_user_id: rec.owner_user_id,

@@ -65,6 +65,8 @@ Every message in both directions is length-prefixed:
   "device_key": "ed25519:7a9f2c...",
   "hostname": "macbook-pro",
   "os": "macos",
+  "app_version": "0.1.10",
+  "arch": "arm64",
   "device_group": "default",
   "lan_addrs": ["192.168.1.10:50000"]
 }
@@ -72,7 +74,8 @@ Every message in both directions is length-prefixed:
 
 - `device_key` (required): stable unique identifier (1–256 chars).
 - `device_id` (optional): if provided, verified against the resolved permanent 9-digit ID.
-- `hostname`, `os`, `device_group` (alias `"group"`), `lan_addrs`: optional metadata.
+- `hostname`, `os`, `app_version` (≤32 UTF-8 bytes), `arch` (≤32 UTF-8 bytes), `device_group` (alias `"group"`), `lan_addrs`: optional metadata (backward-compatible with older clients; empty strings preserve previously stored values).
+- `device_status_changed` broadcasts and `/api/v1/me/devices`, `/api/v1/devices` views also expose `app_version` and `arch`.
 
 #### `registered` (Server -> Client)
 
@@ -311,7 +314,7 @@ All responses — including malformed JSON, body-limit (`413`), and auth (`401`)
 ### `POST /api/v1/devices/register`
 
 - Request body limit: **8 KiB** (`8192` bytes).
-- Validation limits (no NUL `\0` or control characters allowed): `device_key` 1–256 B, `hostname` ≤ 128 B, `os` ≤ 128 B, `device_group` ≤ 64 B.
+- Validation limits (no NUL `\0` or control characters allowed): `device_key` 1–256 B, `hostname` ≤ 128 B, `os` ≤ 128 B, `app_version` ≤ 32 B, `arch` ≤ 32 B, `device_group` ≤ 64 B.
 
 Request:
 
@@ -320,6 +323,8 @@ Request:
   "device_key": "ed25519:7a9f2c...",
   "hostname": "macbook-pro",
   "os": "macos",
+  "app_version": "0.1.10",
+  "arch": "arm64",
   "device_group": "default"
 }
 ```
@@ -333,6 +338,8 @@ Response (`200 OK`):
   "device_key": "ed25519:7a9f2c...",
   "hostname": "macbook-pro",
   "os": "macos",
+  "app_version": "0.1.10",
+  "arch": "arm64",
   "device_group": "default",
   "created_at": "2026-11-22T10:00:00Z",
   "last_seen_at": "2026-11-22T10:05:00Z",
@@ -362,6 +369,8 @@ Response (`200 OK`):
       "formatted_id": "123 456 789",
       "hostname": "macbook-pro",
       "os": "macos",
+      "app_version": "0.1.10",
+      "arch": "arm64",
       "device_group": "default",
       "disabled": false,
       "online": true,
@@ -387,9 +396,9 @@ Note: `total` equals `devices.len()` (page length), while `total_count` is the t
 
 ## 6. Storage Architecture
 
-### 6.1 PostgreSQL (`DeviceStore` / `migrations/0001_init.sql` – `0004_session_replay_history.sql`)
+### 6.1 PostgreSQL (`DeviceStore` / `migrations/0001_init.sql` – `0005_device_app_version.sql`)
 
-- `devices`: `device_id CHAR(9) PRIMARY KEY`, `device_key TEXT UNIQUE NOT NULL`, `hostname TEXT NOT NULL`, `os TEXT NOT NULL`, `device_group TEXT NOT NULL DEFAULT ''`, `disabled BOOLEAN NOT NULL DEFAULT FALSE`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, `last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, plus `owner_user_id UUID REFERENCES users(id)`, `alias TEXT`, `device_pubkey TEXT`, `allow_remote_assist BOOLEAN`.
+- `devices`: `device_id CHAR(9) PRIMARY KEY`, `device_key TEXT UNIQUE NOT NULL`, `hostname TEXT NOT NULL`, `os TEXT NOT NULL`, `app_version TEXT NOT NULL DEFAULT ''`, `arch TEXT NOT NULL DEFAULT ''`, `device_group TEXT NOT NULL DEFAULT ''`, `disabled BOOLEAN NOT NULL DEFAULT FALSE`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, `last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, plus `owner_user_id UUID REFERENCES users(id)`, `alias TEXT`, `device_pubkey TEXT`, `allow_remote_assist BOOLEAN` (`0005_device_app_version.sql` adds `app_version` and `arch`).
 - `relay_sessions_log`: `id BIGSERIAL PRIMARY KEY`, `session_id TEXT NOT NULL`, `host_id CHAR(9) NOT NULL`, `client_id CHAR(9) NOT NULL`, `bytes_up BIGINT NOT NULL DEFAULT 0`, `bytes_down BIGINT NOT NULL DEFAULT 0`, `started_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, `ended_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, indexed on `(started_at DESC)`, `(session_id)`, `(host_id, started_at DESC)`, and `(client_id, started_at DESC)`.
 - `users`, `user_sessions` (refresh family tracking with single-use 15s grace + `retired_token_hashes` multi-generation replay detection), `system_settings` (`allow_registration`), `server_keys`, `pki_ca`, `device_certificates`, and `audit_logs` (`0003_users_auth_pki.sql`, `0004_session_replay_history.sql`).
 

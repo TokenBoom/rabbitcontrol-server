@@ -185,6 +185,8 @@ export function DevicesPage() {
                       <div style={{ fontWeight: 600 }}>{d.hostname || '未命名主机'}</div>
                       <div style={{ fontSize: 12, color: 'var(--rc-text-muted)' }}>
                         {d.os || '未知系统'}
+                        {d.arch ? ` (${d.arch})` : ''}
+                        {d.app_version ? ` · v${d.app_version.replace(/^v/i, '')}` : ''}
                         {d.device_group ? ` · ${d.device_group}` : ''}
                       </div>
                     </td>

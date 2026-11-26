@@ -94,6 +94,8 @@ export interface DeviceView {
   formatted_id: string;
   hostname: string;
   os: string;
+  app_version?: string;
+  arch?: string;
   device_group: string;
   disabled: boolean;
   online: boolean;

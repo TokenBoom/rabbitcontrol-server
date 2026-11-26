@@ -41,6 +41,8 @@ pub const MAX_LAN_ADDRS: usize = 16;
 pub const MAX_LAN_ADDR_LEN: usize = 64;
 pub const MAX_HOSTNAME_LEN: usize = crate::store::MAX_HOSTNAME_LEN;
 pub const MAX_OS_LEN: usize = crate::store::MAX_OS_LEN;
+pub const MAX_APP_VERSION_LEN: usize = crate::store::MAX_APP_VERSION_LEN;
+pub const MAX_ARCH_LEN: usize = crate::store::MAX_ARCH_LEN;
 pub const MAX_DEVICE_GROUP_LEN: usize = crate::store::MAX_DEVICE_GROUP_LEN;
 
 pub const DEFAULT_MAX_SIGNAL_CONNECTIONS: usize = 8_192;
@@ -250,6 +252,10 @@ pub enum SignalMsg {
         hostname: String,
         #[serde(default)]
         os: String,
+        #[serde(default)]
+        app_version: String,
+        #[serde(default)]
+        arch: String,
         #[serde(default, alias = "group")]
         device_group: String,
         #[serde(default)]
@@ -287,6 +293,10 @@ pub enum SignalMsg {
         hostname: String,
         alias: String,
         os: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        app_version: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        arch: String,
         allow_remote_assist: bool,
     },
     ConnectRequest {
@@ -544,11 +554,15 @@ fn validate_metadata_field(val: &str, max_len: usize, field: &'static str) -> Re
 fn validate_register_fields(
     hostname: &str,
     os: &str,
+    app_version: &str,
+    arch: &str,
     device_group: &str,
     lan_addrs: &[String],
 ) -> Result<(), String> {
     validate_metadata_field(hostname, MAX_HOSTNAME_LEN, "hostname")?;
     validate_metadata_field(os, MAX_OS_LEN, "os")?;
+    validate_metadata_field(app_version, MAX_APP_VERSION_LEN, "app_version")?;
+    validate_metadata_field(arch, MAX_ARCH_LEN, "arch")?;
     validate_metadata_field(device_group, MAX_DEVICE_GROUP_LEN, "device_group")?;
     validate_lan_addrs(lan_addrs)?;
     Ok(())
@@ -755,6 +769,8 @@ struct DeviceStatusBroadcast<'a> {
     hostname: &'a str,
     alias: &'a str,
     os: &'a str,
+    app_version: &'a str,
+    arch: &'a str,
     allow_remote_assist: bool,
 }
 
@@ -772,6 +788,8 @@ struct ActivePeer {
     hostname: String,
     alias: String,
     os: String,
+    app_version: String,
+    arch: String,
 }
 
 pub struct SignalHub {
@@ -944,6 +962,8 @@ impl SignalHub {
             hostname: status.hostname.to_string(),
             alias: status.alias.to_string(),
             os: status.os.to_string(),
+            app_version: status.app_version.to_string(),
+            arch: status.arch.to_string(),
             allow_remote_assist: status.allow_remote_assist,
         };
         for (peer_id, peer_tx) in targets {
@@ -974,6 +994,8 @@ impl SignalHub {
                 hostname: &peer.hostname,
                 alias: &peer.alias,
                 os: &peer.os,
+                app_version: &peer.app_version,
+                arch: &peer.arch,
                 allow_remote_assist: peer.allow_remote_assist,
             });
             true
@@ -1502,15 +1524,22 @@ impl SignalHub {
                 device_key,
                 hostname,
                 os,
+                app_version,
+                arch,
                 device_group,
                 lan_addrs,
                 access_token,
                 device_pubkey,
                 allow_remote_assist,
             } => {
-                if let Err(reason) =
-                    validate_register_fields(&hostname, &os, &device_group, &lan_addrs)
-                {
+                if let Err(reason) = validate_register_fields(
+                    &hostname,
+                    &os,
+                    &app_version,
+                    &arch,
+                    &device_group,
+                    &lan_addrs,
+                ) {
                     write_frame_with_timeout(
                         &mut writer,
                         &SignalMsg::Error {
@@ -1544,6 +1573,8 @@ impl SignalHub {
                         device_key,
                         hostname,
                         os,
+                        app_version,
+                        arch,
                         device_group,
                     },
                     lan_addrs,
@@ -1770,7 +1801,7 @@ impl SignalHub {
         // Step 3 (M4): Serialize disabled re-check + peers.insert + ephemeral.set_online
         // under the per-device stripe lock so concurrent admin disable/kick or reconnect
         // transitions can never interleave inconsistently.
-        let (peer_owner, peer_hostname, peer_alias, peer_os, peer_assist) = {
+        let (peer_owner, peer_hostname, peer_alias, peer_os, peer_ver, peer_arch, peer_assist) = {
             let _guard = self.lock_device(&device_id).await;
             if self.shutdown.is_cancelled() {
                 return;
@@ -1859,6 +1890,8 @@ impl SignalHub {
                     hostname: latest.hostname.clone(),
                     alias: latest.alias.clone(),
                     os: latest.os.clone(),
+                    app_version: latest.app_version.clone(),
+                    arch: latest.arch.clone(),
                 },
             ) {
                 old_peer.cancel.kick("replaced_by_new_connection");
@@ -1886,6 +1919,8 @@ impl SignalHub {
                 latest.hostname,
                 latest.alias,
                 latest.os,
+                latest.app_version,
+                latest.arch,
                 effective_assist,
             )
         };
@@ -1906,6 +1941,8 @@ impl SignalHub {
             hostname: &peer_hostname,
             alias: &peer_alias,
             os: &peer_os,
+            app_version: &peer_ver,
+            arch: &peer_arch,
             allow_remote_assist: peer_assist,
         });
 
@@ -2091,6 +2128,8 @@ impl SignalHub {
                 hostname: &peer.hostname,
                 alias: &peer.alias,
                 os: &peer.os,
+                app_version: &peer.app_version,
+                arch: &peer.arch,
                 allow_remote_assist: peer.allow_remote_assist,
             });
         }
@@ -2381,6 +2420,8 @@ impl SignalHub {
                                 peer.hostname.clone(),
                                 peer.alias.clone(),
                                 peer.os.clone(),
+                                peer.app_version.clone(),
+                                peer.arch.clone(),
                             ))
                         } else {
                             None
@@ -2388,7 +2429,7 @@ impl SignalHub {
                     })
                 };
 
-                if let Some((owner, hostname, alias, os)) = updated_peer {
+                if let Some((owner, hostname, alias, os, app_version, arch)) = updated_peer {
                     self.broadcast_user_device_status(DeviceStatusBroadcast {
                         owner_user_id: owner,
                         device_id,
@@ -2396,6 +2437,8 @@ impl SignalHub {
                         hostname: &hostname,
                         alias: &alias,
                         os: &os,
+                        app_version: &app_version,
+                        arch: &arch,
                         allow_remote_assist,
                     });
                 }
@@ -3046,6 +3089,8 @@ mod tests {
                 device_key: "ed25519:udp-probe-key".into(),
                 hostname: "udp-box".into(),
                 os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -3142,6 +3187,8 @@ mod tests {
                 device_key: "ed25519:host-key".into(),
                 hostname: "host-mac".into(),
                 os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "lab".into(),
                 lan_addrs: vec!["192.168.1.10:50000".into()],
                 access_token: None,
@@ -3164,6 +3211,8 @@ mod tests {
                 device_key: "ed25519:client-key".into(),
                 hostname: "client-mac".into(),
                 os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "lab".into(),
                 lan_addrs: vec!["192.168.1.20:50001".into()],
                 access_token: None,
@@ -3348,6 +3397,8 @@ mod tests {
                 device_key: "ed25519:host-key".into(),
                 hostname: "host-mac".into(),
                 os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "lab".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -3387,6 +3438,8 @@ mod tests {
                 device_key: "ed25519:dup-key".into(),
                 hostname: "mac-1".into(),
                 os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -3415,6 +3468,8 @@ mod tests {
                 device_key: "ed25519:dup-key".into(),
                 hostname: "mac-1".into(),
                 os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -3438,6 +3493,8 @@ mod tests {
                 device_key: "ed25519:dup-key".into(),
                 hostname: "mac-1".into(),
                 os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -3516,6 +3573,8 @@ mod tests {
                 device_key: "ed25519:target-peer".into(),
                 hostname: "target".into(),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -3544,6 +3603,8 @@ mod tests {
                 device_key: "ed25519:stalled-kick-key".into(),
                 hostname: "stalled-box".into(),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec!["10.0.0.1:5000".into()],
                 access_token: None,
@@ -3599,6 +3660,8 @@ mod tests {
                 device_key: "ed25519:replace-stalled-key".into(),
                 hostname: "dup-box".into(),
                 os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec!["10.1.0.1:1111".into()],
                 access_token: None,
@@ -3625,6 +3688,8 @@ mod tests {
                 device_key: "ed25519:replace-stalled-key".into(),
                 hostname: "dup-box".into(),
                 os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec!["10.2.0.2:2222".into()],
                 access_token: None,
@@ -3693,6 +3758,8 @@ mod tests {
                 device_key: "ed25519:idle-stalled-key".into(),
                 hostname: "idle-box".into(),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -3733,6 +3800,8 @@ mod tests {
                 device_key: "ed25519:key-a".into(),
                 hostname: "host-a".into(),
                 os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "grp-a".into(),
             })
             .await
@@ -3742,6 +3811,8 @@ mod tests {
                 device_key: "ed25519:key-b".into(),
                 hostname: "host-b".into(),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "grp-b".into(),
             })
             .await
@@ -3764,6 +3835,8 @@ mod tests {
                     device_key: "ed25519:unknown-attacker-key".into(),
                     hostname: "evil-host".into(),
                     os: "evil-os".into(),
+                    app_version: String::new(),
+                    arch: String::new(),
                     device_group: "evil-grp".into(),
                     lan_addrs: vec![],
                     access_token: None,
@@ -3789,6 +3862,8 @@ mod tests {
                     device_key: "ed25519:another-unknown-key".into(),
                     hostname: "ghost".into(),
                     os: "linux".into(),
+                    app_version: String::new(),
+                    arch: String::new(),
                     device_group: "ghost".into(),
                     lan_addrs: vec![],
                     access_token: None,
@@ -3814,6 +3889,8 @@ mod tests {
                     device_key: "ed25519:key-a".into(),
                     hostname: "mutated-a".into(),
                     os: "mutated-os".into(),
+                    app_version: String::new(),
+                    arch: String::new(),
                     device_group: "mutated-grp".into(),
                     lan_addrs: vec![],
                     access_token: None,
@@ -3956,6 +4033,8 @@ mod tests {
                 device_key: "ed25519:race-key".into(),
                 hostname: "race-box".into(),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
             })
             .await
@@ -3972,6 +4051,8 @@ mod tests {
                 device_key: "ed25519:race-key".into(),
                 hostname: "race-box".into(),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -4021,6 +4102,8 @@ mod tests {
                 device_key: "ed25519:race-key".into(),
                 hostname: "race-box".into(),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -4086,6 +4169,8 @@ mod tests {
                 device_key: device_key.into(),
                 hostname: "test-host".into(),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "test".into(),
                 lan_addrs,
                 access_token: None,
@@ -4134,6 +4219,8 @@ mod tests {
                 device_key: "ed25519:h4-victim".into(),
                 hostname: "victim".into(),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -4407,6 +4494,8 @@ mod tests {
                 device_key: "ed25519:bad-host".into(),
                 hostname: "h".repeat(MAX_HOSTNAME_LEN + 1),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -4418,6 +4507,8 @@ mod tests {
                 device_key: "ed25519:bad-os".into(),
                 hostname: "ok".into(),
                 os: "lin\0ux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -4429,6 +4520,8 @@ mod tests {
                 device_key: "ed25519:bad-lan".into(),
                 hostname: "ok".into(),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec!["10.0.0.1:5000".into(); MAX_LAN_ADDRS + 1],
                 access_token: None,
@@ -4717,6 +4810,8 @@ mod tests {
                     hostname: String::new(),
                     alias: String::new(),
                     os: String::new(),
+                    app_version: String::new(),
+                    arch: String::new(),
                 },
             );
 
@@ -4827,6 +4922,8 @@ mod tests {
                 device_key: "ed25519:h7-3".into(),
                 hostname: "h7-3".into(),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -4875,6 +4972,8 @@ mod tests {
                 device_key: "ed25519:m4-storm".into(),
                 hostname: "storm".into(),
                 os: "linux".into(),
+                app_version: String::new(),
+                arch: String::new(),
                 device_group: "".into(),
             })
             .await
@@ -4897,6 +4996,8 @@ mod tests {
                         device_key: "ed25519:m4-storm".into(),
                         hostname: "storm".into(),
                         os: "linux".into(),
+                        app_version: String::new(),
+                        arch: String::new(),
                         device_group: "".into(),
                         lan_addrs: vec![],
                         access_token: None,
@@ -4948,6 +5049,8 @@ mod tests {
                         device_key: "ed25519:m4-storm".into(),
                         hostname: "storm".into(),
                         os: "linux".into(),
+                        app_version: String::new(),
+                        arch: String::new(),
                         device_group: "".into(),
                         lan_addrs: vec![],
                         access_token: None,
@@ -5089,7 +5192,17 @@ mod tests {
     async fn memory_ephemeral_does_not_leak_issued_relay_tokens_and_os_len_matches_store() {
         assert_eq!(MAX_OS_LEN, crate::store::MAX_OS_LEN);
         assert_eq!(MAX_OS_LEN, 128);
-        validate_register_fields("host", &"o".repeat(128), "grp", &[]).unwrap();
+        assert_eq!(MAX_APP_VERSION_LEN, crate::store::MAX_APP_VERSION_LEN);
+        assert_eq!(MAX_ARCH_LEN, crate::store::MAX_ARCH_LEN);
+        validate_register_fields("host", &"o".repeat(128), "0.1.10", "arm64", "grp", &[]).unwrap();
+        assert!(
+            validate_register_fields("host", "macos", &"1".repeat(33), "arm64", "grp", &[])
+                .is_err()
+        );
+        assert!(
+            validate_register_fields("host", "macos", "0.1.10", &"a".repeat(33), "grp", &[])
+                .is_err()
+        );
 
         let store = Arc::new(MemoryDeviceStore::new());
         let ephemeral = Arc::new(MemoryEphemeralStore::new());
