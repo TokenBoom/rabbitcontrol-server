@@ -103,6 +103,16 @@ struct Args {
     /// TCP listen backlog for HTTP, optional Web Admin, signaling, and relay sockets [default: 4096]
     #[arg(long, env = "RC_LISTEN_BACKLOG", value_name = "BACKLOG")]
     listen_backlog: Option<String>,
+
+    /// Allow rc-server to directly broadcast Wake-on-LAN UDP magic packets when no same-LAN peer is online [default: false]
+    #[arg(
+        long = "allow-server-wol",
+        env = "ALLOW_SERVER_WOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_name = "BOOL"
+    )]
+    allow_server_wol: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +131,7 @@ struct ResolvedConfig {
     admin_token: Option<String>,
     cors_origin: Vec<String>,
     listen_backlog: u32,
+    allow_server_wol: bool,
 }
 
 fn trim_non_empty(raw: Option<String>) -> Option<String> {
@@ -249,6 +260,11 @@ fn resolve_config(
     let admin_token = trim_non_empty(args.admin_token);
     let cors_origin = clean_list(args.cors_origin);
     let listen_backlog = parse_listen_backlog(args.listen_backlog)?;
+    let allow_server_wol = parse_optional_bool(
+        trim_non_empty(args.allow_server_wol)
+            .or_else(|| trim_non_empty(env_lookup("RC_ALLOW_SERVER_WOL"))),
+        "--allow-server-wol / ALLOW_SERVER_WOL",
+    )?;
 
     Ok(ResolvedConfig {
         http,
@@ -265,6 +281,7 @@ fn resolve_config(
         admin_token,
         cors_origin,
         listen_backlog,
+        allow_server_wol,
     })
 }
 
@@ -478,6 +495,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SignalConfig {
             public_udp_probe_addr: advertised_udp.clone(),
             public_relay_addr: advertised_relay.clone(),
+            allow_server_wol: cfg.allow_server_wol,
             ..SignalConfig::default()
         },
     ));
@@ -538,6 +556,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ca_fingerprint_sha256 = %pki_authority.ca_fingerprint_sha256(),
         auth_pubkey_hex = %auth_authority.public_key_hex(),
         allow_registration,
+        allow_server_wol = cfg.allow_server_wol,
         prewarmed_revoked_certs = active_revoked.len(),
         web_dir = ?web_dir,
         static_admin_token_configured = cfg.admin_token.is_some(),
@@ -753,6 +772,7 @@ mod tests {
             admin_token: None,
             cors_origin: Vec::new(),
             listen_backlog: None,
+            allow_server_wol: None,
         }
     }
 
@@ -929,5 +949,32 @@ mod tests {
 
         let both = HashMap::from([("RUST_LOG", "warn"), ("RC_LOG", "debug")]);
         assert_eq!(resolve_log_filter(lookup_from(&both)), "warn");
+    }
+
+    #[test]
+    fn resolve_config_parses_allow_server_wol_default_false() {
+        let env = HashMap::new();
+        let parsed =
+            Args::try_parse_from(["rc-server", "--database-url", "postgres://cli:p@db/rc"])
+                .unwrap();
+        let cfg = resolve_config(parsed, lookup_from(&env)).unwrap();
+        assert!(!cfg.allow_server_wol);
+
+        let parsed_true = Args::try_parse_from([
+            "rc-server",
+            "--database-url",
+            "postgres://cli:p@db/rc",
+            "--allow-server-wol=true",
+        ])
+        .unwrap();
+        let cfg_true = resolve_config(parsed_true, lookup_from(&env)).unwrap();
+        assert!(cfg_true.allow_server_wol);
+
+        let env_fallback = HashMap::from([("RC_ALLOW_SERVER_WOL", "true")]);
+        let parsed_env =
+            Args::try_parse_from(["rc-server", "--database-url", "postgres://cli:p@db/rc"])
+                .unwrap();
+        let cfg_env = resolve_config(parsed_env, lookup_from(&env_fallback)).unwrap();
+        assert!(cfg_env.allow_server_wol);
     }
 }

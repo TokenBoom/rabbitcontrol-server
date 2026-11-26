@@ -74,7 +74,9 @@ Every message in both directions is length-prefixed:
   "access_token": "<optional-jwt>",
   "device_pubkey": "<optional-ed25519-hex>",
   "allow_remote_assist": false,
-  "allow_remote_control": true
+  "allow_remote_control": true,
+  "mac_addr": "aa:bb:cc:dd:ee:ff",
+  "wol_enabled": true
 }
 ```
 
@@ -83,23 +85,29 @@ Every message in both directions is length-prefixed:
 - `hostname`, `os`, `app_version` (≤32 UTF-8 bytes), `arch` (≤32 UTF-8 bytes), `device_group` (alias `"group"`), `lan_addrs`: optional metadata (backward-compatible with older clients; empty strings preserve previously stored values).
 - `allow_remote_control` (optional bool): gates **all** incoming remote control connections (including same-account owner self-control). When explicitly provided (`Some(v)`), persisted immediately. When omitted (`None`, older clients), newly registered devices default via `default_allow_remote_control_for_os(os)` (`false` when `os` contains `android` or `ios` case-insensitively, `true` otherwise), while existing devices preserve their stored DB value (converging to `false` if their previously empty `os` is populated with an Android/iOS OS).
 - `allow_remote_assist` (optional bool): gates non-owner third-party assistance (effective only when `allow_remote_control == true`).
-- `device_status_changed` broadcasts and `/api/v1/me/devices`, `/api/v1/devices` views also expose `app_version`, `arch`, `allow_remote_assist`, and `allow_remote_control`.
+- `mac_addr` (optional string): primary Ethernet/Wi-Fi unicast MAC address for Wake-on-LAN (`:` or `-` separated 6 hex bytes, normalized to lowercase `"aa:bb:cc:dd:ee:ff"`). All-zero (`00:00:00:00:00:00`), broadcast (`ff:ff:ff:ff:ff:ff`), and multicast (`(b0 & 0x01) != 0`) MACs are strictly rejected with `error` (`code = "invalid_input"`). When omitted or empty, previously stored `mac_addr` is preserved.
+- `wol_enabled` (optional bool): whether this device allows Wake-on-LAN remote wake by its account owner (defaults to `false`; omitted preserves the stored DB value).
+- `device_status_changed` broadcasts and `/api/v1/me/devices`, `/api/v1/devices` views also expose `app_version`, `arch`, `allow_remote_assist`, `allow_remote_control`, and `wol_capable` (`wol_enabled && valid(mac_addr)`). Raw `mac_addr` is **never** exposed in device list or status broadcasts.
 
 #### `update_assist_state` (Client -> Server)
 
-Updates the device's remote-assist and (optionally) remote-control policy in real time, persisting to `DeviceStore`, updating active peer state, and broadcasting `device_status_changed` to same-account online peers.
+Updates the device's remote-assist, remote-control, and/or Wake-on-LAN configuration in real time, persisting to `DeviceStore`, updating active peer state, and broadcasting `device_status_changed` to same-account online peers.
 
 ```json
 {
   "type": "update_assist_state",
   "allow_remote_assist": false,
-  "allow_remote_control": true
+  "allow_remote_control": true,
+  "mac_addr": "aa:bb:cc:dd:ee:ff",
+  "wol_enabled": true
 }
 ```
 
 - `allow_remote_assist` (optional bool): whether non-owner third-party assistance is allowed; when omitted (`None`), preserves the existing stored value without modification.
 - `allow_remote_control` (optional bool): when provided (`Some(v)`), persists and updates `allow_remote_control`; when omitted (`None`, older clients), preserves the existing stored value without modification.
-- At least one of `allow_remote_assist` or `allow_remote_control` must be present (otherwise the server responds with `error` `code = "invalid_payload"`). If persistence fails or affects 0 rows, the server returns an `error` frame without mutating in-memory peer state or broadcasting `device_status_changed`.
+- `mac_addr` (optional string): optional unicast MAC address (`aa:bb:cc:dd:ee:ff`); validated with the same strict rules as `register`.
+- `wol_enabled` (optional bool): optional Wake-on-LAN opt-in flag; omitted preserves the existing stored value.
+- At least one of `allow_remote_assist`, `allow_remote_control`, `mac_addr`, or `wol_enabled` must be present (otherwise the server responds with `error` `code = "invalid_payload"`). If persistence fails or affects 0 rows, the server returns an `error` frame without mutating in-memory peer state or broadcasting `device_status_changed`.
 
 #### `device_status_changed` (Server -> Same-Account Online Peers)
 
@@ -114,11 +122,12 @@ Updates the device's remote-assist and (optionally) remote-control policy in rea
   "app_version": "0.1.10",
   "arch": "arm64",
   "allow_remote_assist": false,
-  "allow_remote_control": true
+  "allow_remote_control": true,
+  "wol_capable": true
 }
 ```
 
-Pushed to other online peers belonging to the same `owner_user_id` on register (online), disconnect/kick (offline), and `update_assist_state`. On REST `PATCH /api/v1/me/devices/{id}`, `device_status_changed` is pushed both to other same-account online peers **and** to the target device itself (if online) so the device can synchronize its local policy cache without stale overwrite on reconnect.
+Pushed to other online peers belonging to the same `owner_user_id` on register (online), disconnect/kick (offline), `update_assist_state`, and `heartbeat` (when `wol_capable` changes). `wol_capable` is `true` iff `wol_enabled == true` and a valid unicast `mac_addr` is stored; raw `mac_addr` is never included. On REST `PATCH /api/v1/me/devices/{id}`, `device_status_changed` is pushed both to other same-account online peers **and** to the target device itself (if online) so the device can synchronize its local policy cache without stale overwrite on reconnect.
 
 #### `registered` (Server -> Client)
 
@@ -135,14 +144,18 @@ Pushed to other online peers belonging to the same `owner_user_id` on register (
 
 #### `heartbeat` (Client -> Server)
 
-Refreshes online TTL in `EphemeralStore`, updates `last_seen_at` in `DeviceStore`, and refreshes LAN candidate addresses.
+Refreshes online TTL in `EphemeralStore`, updates `last_seen_at`, `last_lan_addrs`, and `last_public_ip` in `DeviceStore`, and optionally synchronizes `mac_addr` / `wol_enabled`.
 
 ```json
 {
   "type": "heartbeat",
-  "lan_addrs": ["192.168.1.10:50000"]
+  "lan_addrs": ["192.168.1.10:50000"],
+  "mac_addr": "aa:bb:cc:dd:ee:ff",
+  "wol_enabled": true
 }
 ```
+
+- `mac_addr` (optional string) and `wol_enabled` (optional bool): backward-compatible optional fields; omitted preserves stored values. Invalid non-empty `mac_addr` returns `error` (`code = "invalid_input"`).
 
 #### `heartbeat_ack` (Server -> Client)
 
@@ -226,6 +239,60 @@ Explicitly requests a fresh one-time TCP Relay token when P2P hole-punching fail
   "session_id": "f3a1c9..."
 }
 ```
+
+#### `wol_request` (Client -> Server)
+
+Requests the server to wake an offline device owned by the **same authenticated user account** via Wake-on-LAN.
+
+```json
+{
+  "type": "wol_request",
+  "request_id": "optional-req-id",
+  "target_device_id": "987654321"
+}
+```
+
+- **Authorization & safety gates**:
+  - Caller MUST be authenticated on signaling (`owner_user_id = Some(uid)`) and the target device MUST belong to the exact same `owner_user_id`. Unauthenticated callers receive `wol_ack` (`ok = false, method = "none", code = "unauthorized"`); unknown target devices receive `code = "device_not_found"`; cross-account targets receive `code = "forbidden"`; disabled targets receive `code = "device_disabled"`.
+  - **Two-layer bounded rate limiting**:
+    1. Per-caller bounded sliding window (evaluated immediately after authenticating caller and **before** target DB lookups, mitigating device ID enumeration and DB read amplification; default 10 requests / 10 seconds);
+    2. Per-`target_device_id` bounded sliding window (at most 1 request per `target_device_id` every **5 seconds**). Excess requests receive `wol_ack` (`ok = false, method = "none", code = "rate_limited"`).
+  - Target device MUST have `wol_enabled == true` and a valid stored unicast `mac_addr`, otherwise the server replies `wol_ack` (`ok = false, method = "none", code = "wol_disabled"`).
+- **3-way wake routing priority**:
+  1. **Target already online**: replies immediately with `wol_ack` (`ok = true, method = "already_online"`).
+  2. **Same-account LAN peer relay (`lan_peer`)**: searches other currently online peers belonging to the same `owner_user_id` (`peer_id != target_device_id && peer_id != caller_device_id`). When both `target.last_public_ip` and `peer.remote_addr.ip()` are distinct routable public IPs, RFC 1918 `/24` overlap is **strictly rejected** to prevent cross-site misrouting across common `192.168.1.0/24` networks. Eligible peers are prioritized as `(same_public_ip && same_private_slash24)` > `(same_public_ip)` > `(same_private_slash24 fallback when last_public_ip is empty or either side uses private/loopback addressing)`. Pushes `wol_relay` to the highest-priority deliverable peer and returns `wol_ack` (`ok = true, method = "lan_peer"`).
+  3. **Server direct broadcast (`server`)**: if no eligible same-LAN peer is online and `ALLOW_SERVER_WOL=true` (default `false`), the server constructs a standard 102-byte magic packet (`6×0xFF + 16×MAC`) and broadcasts it over UDP (`SO_BROADCAST`) to each target private IPv4 `/24` directed broadcast `:9` plus `255.255.255.255:9`. Replies `wol_ack` (`ok = true, method = "server"`) on success or `wol_ack` (`ok = false, method = "none", code = "wol_send_failed"`) on failure.
+  4. **No relay peer available**: replies `wol_ack` (`ok = false, method = "none", code = "wol_no_relay_peer"`).
+
+#### `wol_relay` (Server -> Same-Account Online LAN Peer)
+
+Sent by the server to an eligible online same-account LAN peer instructing it to broadcast a local Wake-on-LAN magic packet for `target_device_id`.
+
+```json
+{
+  "type": "wol_relay",
+  "request_id": "req-0123456789ab",
+  "target_device_id": "987654321",
+  "mac_addr": "aa:bb:cc:dd:ee:ff",
+  "target_lan_addrs": ["192.168.1.20:50000"]
+}
+```
+
+#### `wol_ack` (Server -> Requester Client)
+
+```json
+{
+  "type": "wol_ack",
+  "request_id": "optional-req-id",
+  "target_device_id": "987654321",
+  "ok": true,
+  "method": "lan_peer",
+  "message": "wake-on-lan magic packet relayed via same-LAN peer"
+}
+```
+
+- `method`: one of `"already_online"`, `"lan_peer"`, `"server"`, or `"none"`.
+- `code` (optional string, omitted on success): `snake_case` wire alias from `generated::error_codes::wire::*` (`wol_disabled`, `wol_no_relay_peer`, `wol_send_failed`, `rate_limited`, `unauthorized`, `forbidden`, `device_not_found`, `device_disabled`, `invalid_input`).
 
 #### `kicked` (Server -> Client)
 
@@ -426,6 +493,7 @@ Response (`200 OK`):
       "owner_email": "alice@example.com",
       "allow_remote_assist": false,
       "allow_remote_control": true,
+      "wol_capable": true,
       "created_at": "2026-11-22T10:00:00Z",
       "last_seen_at": "2026-11-22T10:05:00Z"
     }
@@ -437,15 +505,15 @@ Response (`200 OK`):
 }
 ```
 
-Note: `total` equals `devices.len()` (page length), while `total_count` is the total number of matched devices across all pages.
+Note: `total` equals `devices.len()` (page length), while `total_count` is the total number of matched devices across all pages. `wol_capable` indicates whether Wake-on-LAN is enabled with a valid unicast MAC; raw `mac_addr` is intentionally omitted from all device list responses (`/api/v1/devices` and `/api/v1/me/devices`).
 
 ---
 
 ## 6. Storage Architecture
 
-### 6.1 PostgreSQL (`DeviceStore` / `migrations/0001_init.sql` – `0006_device_allow_remote_control.sql`)
+### 6.1 PostgreSQL (`DeviceStore` / `migrations/0001_init.sql` – `0007_device_wol.sql`)
 
-- `devices`: `device_id CHAR(9) PRIMARY KEY`, `device_key TEXT UNIQUE NOT NULL`, `hostname TEXT NOT NULL`, `os TEXT NOT NULL`, `app_version TEXT NOT NULL DEFAULT ''`, `arch TEXT NOT NULL DEFAULT ''`, `device_group TEXT NOT NULL DEFAULT ''`, `disabled BOOLEAN NOT NULL DEFAULT FALSE`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, `last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, plus `owner_user_id UUID REFERENCES users(id)`, `alias TEXT`, `device_pubkey TEXT`, `allow_remote_assist BOOLEAN`, `allow_remote_control BOOLEAN NOT NULL DEFAULT TRUE` (`0005_device_app_version.sql` adds `app_version` and `arch`; `0006_device_allow_remote_control.sql` adds `allow_remote_control` and backfills `FALSE` for existing `android`/`ios` rows). On device unbind or owner transfer, `allow_remote_assist` resets to `FALSE` and `allow_remote_control` resets to its OS default (`FALSE` for Android/iOS, `TRUE` for desktop).
+- `devices`: `device_id CHAR(9) PRIMARY KEY`, `device_key TEXT UNIQUE NOT NULL`, `hostname TEXT NOT NULL`, `os TEXT NOT NULL`, `app_version TEXT NOT NULL DEFAULT ''`, `arch TEXT NOT NULL DEFAULT ''`, `device_group TEXT NOT NULL DEFAULT ''`, `disabled BOOLEAN NOT NULL DEFAULT FALSE`, `created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, `last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, plus `owner_user_id UUID REFERENCES users(id)`, `alias TEXT`, `device_pubkey TEXT`, `allow_remote_assist BOOLEAN`, `allow_remote_control BOOLEAN NOT NULL DEFAULT TRUE`, `mac_addr VARCHAR(17)`, `wol_enabled BOOLEAN NOT NULL DEFAULT FALSE`, `last_lan_addrs TEXT NOT NULL DEFAULT '[]'`, `last_public_ip TEXT NOT NULL DEFAULT ''` (`0005_device_app_version.sql` adds `app_version` and `arch`; `0006_device_allow_remote_control.sql` adds `allow_remote_control` and backfills `FALSE` for existing `android`/`ios` rows; `0007_device_wol.sql` adds the Wake-on-LAN and last-seen network columns). On device unbind, user deletion, or owner transfer, `allow_remote_assist` and `wol_enabled` reset to `FALSE`, `mac_addr` clears to `NULL`, `last_lan_addrs` resets to `'[]'`, `last_public_ip` resets to `''`, and `allow_remote_control` resets to its OS default (`FALSE` for Android/iOS, `TRUE` for desktop).
 - `relay_sessions_log`: `id BIGSERIAL PRIMARY KEY`, `session_id TEXT NOT NULL`, `host_id CHAR(9) NOT NULL`, `client_id CHAR(9) NOT NULL`, `bytes_up BIGINT NOT NULL DEFAULT 0`, `bytes_down BIGINT NOT NULL DEFAULT 0`, `started_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, `ended_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`, indexed on `(started_at DESC)`, `(session_id)`, `(host_id, started_at DESC)`, and `(client_id, started_at DESC)`.
 - `users`, `user_sessions` (refresh family tracking with single-use 15s grace + `retired_token_hashes` multi-generation replay detection), `system_settings` (`allow_registration`), `server_keys`, `pki_ca`, `device_certificates`, and `audit_logs` (`0003_users_auth_pki.sql`, `0004_session_replay_history.sql`).
 

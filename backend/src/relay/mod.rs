@@ -3868,6 +3868,7 @@ mod tests {
                     app_version: String::new(),
                     arch: String::new(),
                     device_group: "test".into(),
+                    ..Default::default()
                 })
                 .await
                 .unwrap();
@@ -3884,6 +3885,7 @@ mod tests {
                     app_version: String::new(),
                     arch: String::new(),
                     device_group: "test".into(),
+                    ..Default::default()
                 })
                 .await
                 .unwrap();

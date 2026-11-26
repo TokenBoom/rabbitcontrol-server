@@ -108,6 +108,7 @@ export interface DeviceView {
   alias?: string;
   allow_remote_assist?: boolean;
   allow_remote_control?: boolean;
+  wol_capable?: boolean;
   created_at: string;
   last_seen_at: string;
 }

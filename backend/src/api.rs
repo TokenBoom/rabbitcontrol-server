@@ -669,6 +669,7 @@ async fn register_and_bind_device_for_user(
             app_version: params.app_version.unwrap_or_default().to_string(),
             arch: params.arch.unwrap_or_default().to_string(),
             device_group: params.device_group.unwrap_or_default().to_string(),
+            ..Default::default()
         })
         .await
         .map_err(|e| Box::new(map_store_error(e, "register_device_for_user")))?;
@@ -935,6 +936,8 @@ pub struct MyDeviceView {
     pub allow_remote_assist: bool,
     #[serde(default = "default_true")]
     pub allow_remote_control: bool,
+    #[serde(default)]
+    pub wol_capable: bool,
     pub disabled: bool,
     pub online: bool,
     pub in_session: bool,
@@ -1129,6 +1132,8 @@ pub struct DeviceView {
     pub allow_remote_assist: bool,
     #[serde(default = "default_true")]
     pub allow_remote_control: bool,
+    #[serde(default)]
+    pub wol_capable: bool,
     pub disabled: bool,
     pub online: bool,
     pub in_session: bool,
@@ -2409,6 +2414,7 @@ async fn get_my_devices(
             Vec::new()
         };
 
+        let wol_capable = rec.wol_capable();
         devices.push(MyDeviceView {
             formatted_id: format_device_id(&rec.device_id),
             device_id: rec.device_id,
@@ -2420,6 +2426,7 @@ async fn get_my_devices(
             alias: rec.alias,
             allow_remote_assist: rec.allow_remote_assist,
             allow_remote_control: rec.allow_remote_control,
+            wol_capable,
             disabled: rec.disabled,
             online,
             in_session,
@@ -3552,6 +3559,7 @@ async fn build_device_view_with_state(
     };
 
     let owner_email = resolve_owner_email(state, rec.owner_user_id, email_cache).await;
+    let wol_capable = rec.wol_capable();
 
     DeviceView {
         formatted_id: format_device_id(&rec.device_id),
@@ -3566,6 +3574,7 @@ async fn build_device_view_with_state(
         owner_email,
         allow_remote_assist: rec.allow_remote_assist,
         allow_remote_control: rec.allow_remote_control,
+        wol_capable,
         disabled: rec.disabled,
         online,
         in_session,
@@ -3852,5 +3861,194 @@ mod tests {
             assert_eq!(parsed["error"], expected_code);
             assert!(parsed["message"].is_string());
         }
+    }
+
+    #[tokio::test]
+    async fn devices_endpoints_expose_wol_capable_without_leaking_mac_addr() {
+        use crate::ephemeral::MemoryEphemeralStore;
+        use crate::relay::RelayConfig;
+        use crate::signal::SignalConfig;
+        use crate::store::{MemoryDeviceStore, UserStore};
+
+        let store = Arc::new(MemoryDeviceStore::new());
+        let ephemeral = Arc::new(MemoryEphemeralStore::new());
+        let auth_authority = Arc::new(AuthAuthority::load_or_create(store.as_ref()).await.unwrap());
+        let pki_authority = Arc::new(PkiAuthority::load_or_create(store.as_ref()).await.unwrap());
+        let settings_cache = Arc::new(SettingsCache::new(store.clone(), ephemeral.clone()));
+        let signal_hub = Arc::new(SignalHub::with_auth(
+            store.clone(),
+            ephemeral.clone(),
+            auth_authority.clone(),
+            SignalConfig::default(),
+        ));
+        let relay_server = Arc::new(RelayServer::new(
+            store.clone(),
+            ephemeral.clone(),
+            RelayConfig::default(),
+        ));
+
+        let user = store
+            .create_user(CreateUserInput {
+                email: "wol-api@example.com".into(),
+                display_name: "WoL API User".into(),
+                password_hash: "hash".into(),
+                role: ROLE_ADMIN.into(),
+                status: STATUS_ACTIVE.into(),
+                must_change_password: false,
+            })
+            .await
+            .unwrap();
+        let sess = store
+            .create_user_session(CreateSessionInput {
+                user_id: user.id,
+                device_id: None,
+                family_id: None,
+                token_hash: format!("{:064x}", user.id.as_u128()),
+                expires_at: Utc::now() + chrono::Duration::hours(24),
+                client_info: "test".into(),
+            })
+            .await
+            .unwrap();
+        let jwt = auth_authority
+            .issue_access_token_for_user(&user, sess.id, None, ACCESS_TOKEN_TTL)
+            .unwrap();
+
+        let dev_enabled = store
+            .register_or_get(RegisterInput {
+                device_key: "dk-api-wol-on".into(),
+                hostname: "wol-on".into(),
+                os: "macos".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .bind_device_to_user(&dev_enabled.device_id, user.id, None, None)
+            .await
+            .unwrap();
+        store
+            .update_device_wol_state(
+                &dev_enabled.device_id,
+                Some(user.id),
+                Some("AA:BB:CC:DD:EE:FF"),
+                Some(true),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let dev_disabled = store
+            .register_or_get(RegisterInput {
+                device_key: "dk-api-wol-off".into(),
+                hostname: "wol-off".into(),
+                os: "macos".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .bind_device_to_user(&dev_disabled.device_id, user.id, None, None)
+            .await
+            .unwrap();
+        store
+            .update_device_wol_state(
+                &dev_disabled.device_id,
+                Some(user.id),
+                Some("02:11:22:33:44:55"),
+                Some(false),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let state = AppState {
+            device_store: store.clone(),
+            auth_store: store,
+            ephemeral,
+            auth_authority,
+            pki_authority,
+            settings_cache,
+            signal_hub,
+            relay_server,
+            endpoints: AdvertisedEndpoints {
+                signal_tcp_addr: "127.0.0.1:21116".into(),
+                udp_probe_addr: "127.0.0.1:21116".into(),
+                tcp_relay_addr: "127.0.0.1:21117".into(),
+            },
+            started_at: Instant::now(),
+            admin_token: None,
+            cors_origins: Vec::new(),
+            tls_enabled: false,
+            web_dir: None,
+            auth_rate_limiter: Arc::new(AuthRateLimiter::default()),
+            allow_unauthenticated_legacy_admin: false,
+        };
+        let app = router(state);
+
+        // 1. Admin GET /api/v1/devices
+        let req_admin = Request::builder()
+            .uri("/api/v1/devices")
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp_admin = app.clone().oneshot(req_admin).await.unwrap();
+        assert_eq!(resp_admin.status(), StatusCode::OK);
+        let body_admin = axum::body::to_bytes(resp_admin.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let raw_admin = std::str::from_utf8(&body_admin).unwrap();
+        assert!(
+            !raw_admin.contains("mac_addr"),
+            "raw admin JSON must not expose mac_addr"
+        );
+        assert!(!raw_admin.to_ascii_lowercase().contains("aa:bb:cc:dd:ee:ff"));
+        assert!(!raw_admin.to_ascii_lowercase().contains("02:11:22:33:44:55"));
+        let parsed_admin: DevicesResponse = serde_json::from_slice(&body_admin).unwrap();
+        let on_view = parsed_admin
+            .devices
+            .iter()
+            .find(|d| d.device_id == dev_enabled.device_id)
+            .unwrap();
+        let off_view = parsed_admin
+            .devices
+            .iter()
+            .find(|d| d.device_id == dev_disabled.device_id)
+            .unwrap();
+        assert!(on_view.wol_capable);
+        assert!(!off_view.wol_capable);
+
+        // 2. Owner GET /api/v1/me/devices
+        let req_me = Request::builder()
+            .uri("/api/v1/me/devices")
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp_me = app.oneshot(req_me).await.unwrap();
+        assert_eq!(resp_me.status(), StatusCode::OK);
+        let body_me = axum::body::to_bytes(resp_me.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let raw_me = std::str::from_utf8(&body_me).unwrap();
+        assert!(
+            !raw_me.contains("mac_addr"),
+            "raw /me/devices JSON must not expose mac_addr"
+        );
+        assert!(!raw_me.to_ascii_lowercase().contains("aa:bb:cc:dd:ee:ff"));
+        assert!(!raw_me.to_ascii_lowercase().contains("02:11:22:33:44:55"));
+        let parsed_me: MyDevicesResponse = serde_json::from_slice(&body_me).unwrap();
+        let on_me = parsed_me
+            .devices
+            .iter()
+            .find(|d| d.device_id == dev_enabled.device_id)
+            .unwrap();
+        let off_me = parsed_me
+            .devices
+            .iter()
+            .find(|d| d.device_id == dev_disabled.device_id)
+            .unwrap();
+        assert!(on_me.wol_capable);
+        assert!(!off_me.wol_capable);
     }
 }

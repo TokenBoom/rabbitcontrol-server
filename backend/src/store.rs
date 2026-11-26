@@ -20,6 +20,10 @@ pub const MAX_ARCH_LEN: usize = 32;
 pub const MAX_DEVICE_GROUP_LEN: usize = 64;
 pub const MAX_DEVICE_ALIAS_LEN: usize = 128;
 pub const MAX_DEVICE_PUBKEY_LEN: usize = 256;
+pub const MAX_MAC_ADDR_LEN: usize = 17;
+pub const MAX_LAST_LAN_ADDRS: usize = 16;
+pub const MAX_LAST_LAN_ADDR_LEN: usize = 64;
+pub const MAX_LAST_PUBLIC_IP_LEN: usize = 64;
 pub const MAX_EMAIL_LEN: usize = 254;
 pub const MAX_DISPLAY_NAME_LEN: usize = 128;
 pub const MAX_CLIENT_INFO_LEN: usize = 256;
@@ -99,6 +103,26 @@ pub struct DeviceRecord {
     pub allow_remote_control: bool,
     #[serde(default)]
     pub bound_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing)]
+    pub mac_addr: Option<String>,
+    #[serde(default)]
+    pub wol_enabled: bool,
+    #[serde(default, skip_serializing)]
+    pub last_lan_addrs: Vec<String>,
+    #[serde(default, skip_serializing)]
+    pub last_public_ip: String,
+}
+
+impl DeviceRecord {
+    /// Returns `true` when Wake-on-LAN is enabled and a valid unicast MAC address is stored.
+    pub fn wol_capable(&self) -> bool {
+        self.wol_enabled
+            && self
+                .mac_addr
+                .as_deref()
+                .and_then(normalize_mac_addr)
+                .is_some()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -114,6 +138,14 @@ pub struct RegisterInput {
     pub arch: String,
     #[serde(default, alias = "group")]
     pub device_group: String,
+    #[serde(default)]
+    pub mac_addr: Option<String>,
+    #[serde(default)]
+    pub wol_enabled: Option<bool>,
+    #[serde(default)]
+    pub last_lan_addrs: Option<Vec<String>>,
+    #[serde(default)]
+    pub last_public_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,6 +396,140 @@ pub fn validate_text_field(
     Ok(trimmed.to_string())
 }
 
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Strictly parse a 6-byte unicast Ethernet MAC address delimited by `:` or `-`.
+///
+/// Rejects mixed separators, malformed lengths, non-hex characters, all-zero
+/// (`00:00:00:00:00:00`), broadcast (`ff:ff:ff:ff:ff:ff`), and multicast
+/// (`(b0 & 0x01) != 0`) MAC addresses.
+pub fn parse_mac_addr_bytes(raw: &str) -> Option<[u8; 6]> {
+    if raw.contains('\0') || raw.chars().any(char::is_control) {
+        return None;
+    }
+    let trimmed = raw.trim();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() != MAX_MAC_ADDR_LEN {
+        return None;
+    }
+    let sep = bytes[2];
+    if sep != b':' && sep != b'-' {
+        return None;
+    }
+    if bytes[5] != sep || bytes[8] != sep || bytes[11] != sep || bytes[14] != sep {
+        return None;
+    }
+    let mut octets = [0u8; 6];
+    for (i, slot) in octets.iter_mut().enumerate() {
+        let base = i * 3;
+        let hi = hex_nibble(bytes[base])?;
+        let lo = hex_nibble(bytes[base + 1])?;
+        *slot = (hi << 4) | lo;
+    }
+    if octets == [0u8; 6] || octets == [0xFFu8; 6] || (octets[0] & 0x01) != 0 {
+        return None;
+    }
+    Some(octets)
+}
+
+/// Validate and normalize a unicast MAC address (`:` or `-` delimited) into lowercase
+/// `aa:bb:cc:dd:ee:ff` form.
+pub fn normalize_mac_addr(raw: &str) -> Option<String> {
+    let b = parse_mac_addr_bytes(raw)?;
+    Some(format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5]
+    ))
+}
+
+fn validate_optional_mac_addr(raw: Option<&str>) -> Result<Option<String>, StoreError> {
+    let Some(s) = raw else {
+        return Ok(None);
+    };
+    if s.contains('\0') || s.chars().any(char::is_control) {
+        return Err(StoreError::InvalidInput(
+            "mac_addr must not contain NUL or control characters".into(),
+        ));
+    }
+    if s.trim().is_empty() {
+        return Ok(None);
+    }
+    normalize_mac_addr(s)
+        .map(Some)
+        .ok_or_else(|| StoreError::InvalidInput("invalid unicast mac_addr".into()))
+}
+
+fn validate_optional_lan_addrs(
+    raw: Option<&[String]>,
+) -> Result<Option<(Vec<String>, String)>, StoreError> {
+    let Some(addrs) = raw else {
+        return Ok(None);
+    };
+    if addrs.is_empty() {
+        return Ok(None);
+    }
+    if addrs.len() > MAX_LAST_LAN_ADDRS {
+        return Err(StoreError::InvalidInput(format!(
+            "last_lan_addrs exceeds maximum of {MAX_LAST_LAN_ADDRS} entries"
+        )));
+    }
+    for addr in addrs {
+        if addr.is_empty() || addr.len() > MAX_LAST_LAN_ADDR_LEN {
+            return Err(StoreError::InvalidInput(format!(
+                "each last_lan_addrs entry must be 1..={MAX_LAST_LAN_ADDR_LEN} bytes"
+            )));
+        }
+        if !addr.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(StoreError::InvalidInput(
+                "last_lan_addrs entries must contain only printable ASCII non-whitespace characters"
+                    .into(),
+            ));
+        }
+    }
+    let json = serde_json::to_string(addrs).map_err(|err| {
+        StoreError::InvalidInput(format!("failed to encode last_lan_addrs: {err}"))
+    })?;
+    Ok(Some((addrs.to_vec(), json)))
+}
+
+fn validate_optional_public_ip(raw: Option<&str>) -> Result<Option<String>, StoreError> {
+    let Some(s) = raw else {
+        return Ok(None);
+    };
+    if s.contains('\0') || s.chars().any(char::is_control) {
+        return Err(StoreError::InvalidInput(
+            "last_public_ip must not contain NUL or control characters".into(),
+        ));
+    }
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > MAX_LAST_PUBLIC_IP_LEN {
+        return Err(StoreError::InvalidInput(format!(
+            "last_public_ip exceeds maximum length of {MAX_LAST_PUBLIC_IP_LEN} bytes"
+        )));
+    }
+    let parsed: std::net::IpAddr = trimmed
+        .parse()
+        .map_err(|_| StoreError::InvalidInput("invalid last_public_ip".into()))?;
+    let canonical = match parsed {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(v6)),
+        v4 => v4,
+    };
+    Ok(Some(canonical.to_string()))
+}
+
 struct ValidatedRegisterInput {
     device_key: String,
     hostname: String,
@@ -371,6 +537,11 @@ struct ValidatedRegisterInput {
     app_version: String,
     arch: String,
     device_group: String,
+    mac_addr: Option<String>,
+    wol_enabled: Option<bool>,
+    last_lan_addrs: Option<Vec<String>>,
+    last_lan_addrs_json: Option<String>,
+    last_public_ip: Option<String>,
 }
 
 fn validate_register_input(input: &RegisterInput) -> Result<ValidatedRegisterInput, StoreError> {
@@ -386,6 +557,13 @@ fn validate_register_input(input: &RegisterInput) -> Result<ValidatedRegisterInp
     let arch = validate_text_field(&input.arch, MAX_ARCH_LEN, "arch")?;
     let device_group =
         validate_text_field(&input.device_group, MAX_DEVICE_GROUP_LEN, "device_group")?;
+    let mac_addr = validate_optional_mac_addr(input.mac_addr.as_deref())?;
+    let (last_lan_addrs, last_lan_addrs_json) =
+        match validate_optional_lan_addrs(input.last_lan_addrs.as_deref())? {
+            Some((vec, json)) => (Some(vec), Some(json)),
+            None => (None, None),
+        };
+    let last_public_ip = validate_optional_public_ip(input.last_public_ip.as_deref())?;
     Ok(ValidatedRegisterInput {
         device_key,
         hostname,
@@ -393,6 +571,11 @@ fn validate_register_input(input: &RegisterInput) -> Result<ValidatedRegisterInp
         app_version,
         arch,
         device_group,
+        mac_addr,
+        wol_enabled: input.wol_enabled,
+        last_lan_addrs,
+        last_lan_addrs_json,
+        last_public_ip,
     })
 }
 
@@ -515,6 +698,16 @@ pub trait DeviceStore: Send + Sync {
         &self,
         device_id: &str,
         device_pubkey: &str,
+    ) -> Result<bool, StoreError>;
+
+    async fn update_device_wol_state(
+        &self,
+        device_id: &str,
+        owner_user_id: Option<Uuid>,
+        mac_addr: Option<&str>,
+        wol_enabled: Option<bool>,
+        last_lan_addrs: Option<&[String]>,
+        last_public_ip: Option<&str>,
     ) -> Result<bool, StoreError>;
 }
 
@@ -697,10 +890,16 @@ struct DeviceRow {
     allow_remote_assist: bool,
     allow_remote_control: bool,
     bound_at: Option<DateTime<Utc>>,
+    mac_addr: Option<String>,
+    wol_enabled: bool,
+    last_lan_addrs: String,
+    last_public_ip: String,
 }
 
 impl From<DeviceRow> for DeviceRecord {
     fn from(row: DeviceRow) -> Self {
+        let last_lan_addrs =
+            serde_json::from_str::<Vec<String>>(&row.last_lan_addrs).unwrap_or_default();
         Self {
             device_id: row.device_id.trim().to_string(),
             device_key: row.device_key,
@@ -718,6 +917,10 @@ impl From<DeviceRow> for DeviceRecord {
             allow_remote_assist: row.allow_remote_assist,
             allow_remote_control: row.allow_remote_control,
             bound_at: row.bound_at,
+            mac_addr: row.mac_addr.and_then(|m| normalize_mac_addr(&m)),
+            wol_enabled: row.wol_enabled,
+            last_lan_addrs,
+            last_public_ip: row.last_public_ip,
         }
     }
 }
@@ -922,7 +1125,7 @@ impl From<AuditLogRow> for AuditLogRecord {
 const DEVICE_COLUMNS: &str =
     "device_id, device_key, hostname, os, app_version, arch, device_group, disabled, \
     created_at, last_seen_at, owner_user_id, alias, device_pubkey, allow_remote_assist, \
-    allow_remote_control, bound_at";
+    allow_remote_control, bound_at, mac_addr, wol_enabled, last_lan_addrs, last_public_ip";
 
 const USER_COLUMNS: &str = "id, email, display_name, password_hash, role, status, \
     must_change_password, token_version, created_at, updated_at, last_login_at";
@@ -987,8 +1190,12 @@ impl PgDeviceStore {
                      WHEN os = '' AND $2 <> '' AND (LOWER($2) LIKE '%android%' OR LOWER($2) LIKE '%ios%') THEN FALSE
                      ELSE allow_remote_control
                  END,
+                 mac_addr = COALESCE($6, mac_addr),
+                 wol_enabled = COALESCE($7, wol_enabled),
+                 last_lan_addrs = COALESCE($8, last_lan_addrs),
+                 last_public_ip = COALESCE($9, last_public_ip),
                  last_seen_at = NOW()
-             WHERE device_key = $6 AND disabled = FALSE
+             WHERE device_key = $10 AND disabled = FALSE
              RETURNING {DEVICE_COLUMNS}"
         );
         let row: Option<DeviceRow> = sqlx::query_as(&sql)
@@ -997,6 +1204,10 @@ impl PgDeviceStore {
             .bind(&v.app_version)
             .bind(&v.arch)
             .bind(&v.device_group)
+            .bind(v.mac_addr.as_deref())
+            .bind(v.wol_enabled)
+            .bind(v.last_lan_addrs_json.as_deref())
+            .bind(v.last_public_ip.as_deref())
             .bind(&v.device_key)
             .fetch_optional(&self.pool)
             .await?;
@@ -1026,8 +1237,11 @@ impl DeviceStore for PgDeviceStore {
 
         let default_allow_rc = default_allow_remote_control_for_os(&v.os);
         let insert_sql = format!(
-            "INSERT INTO devices (device_id, device_key, hostname, os, app_version, arch, device_group, allow_remote_control)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            "INSERT INTO devices (
+                device_id, device_key, hostname, os, app_version, arch, device_group,
+                allow_remote_control, mac_addr, wol_enabled, last_lan_addrs, last_public_ip
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
              ON CONFLICT DO NOTHING
              RETURNING {DEVICE_COLUMNS}"
         );
@@ -1043,6 +1257,10 @@ impl DeviceStore for PgDeviceStore {
                 .bind(&v.arch)
                 .bind(&v.device_group)
                 .bind(default_allow_rc)
+                .bind(v.mac_addr.as_deref())
+                .bind(v.wol_enabled.unwrap_or(false))
+                .bind(v.last_lan_addrs_json.as_deref().unwrap_or("[]"))
+                .bind(v.last_public_ip.as_deref().unwrap_or(""))
                 .fetch_optional(&self.pool)
                 .await?;
 
@@ -1307,6 +1525,10 @@ impl DeviceStore for PgDeviceStore {
                          CASE WHEN LOWER(os) LIKE '%android%' OR LOWER(os) LIKE '%ios%' THEN FALSE ELSE TRUE END
                      ELSE allow_remote_control
                  END,
+                 mac_addr = CASE WHEN owner_user_id IS DISTINCT FROM $2 THEN NULL ELSE mac_addr END,
+                 wol_enabled = CASE WHEN owner_user_id IS DISTINCT FROM $2 THEN FALSE ELSE wol_enabled END,
+                 last_lan_addrs = CASE WHEN owner_user_id IS DISTINCT FROM $2 THEN '[]' ELSE last_lan_addrs END,
+                 last_public_ip = CASE WHEN owner_user_id IS DISTINCT FROM $2 THEN '' ELSE last_public_ip END,
                  device_pubkey = COALESCE($4, CASE WHEN owner_user_id IS DISTINCT FROM $2 THEN '' ELSE device_pubkey END),
                  owner_user_id = $2,
                  bound_at = NOW()
@@ -1382,7 +1604,11 @@ impl DeviceStore for PgDeviceStore {
                  bound_at = NULL,
                  alias = '',
                  allow_remote_assist = FALSE,
-                 allow_remote_control = CASE WHEN LOWER(os) LIKE '%android%' OR LOWER(os) LIKE '%ios%' THEN FALSE ELSE TRUE END
+                 allow_remote_control = CASE WHEN LOWER(os) LIKE '%android%' OR LOWER(os) LIKE '%ios%' THEN FALSE ELSE TRUE END,
+                 mac_addr = NULL,
+                 wol_enabled = FALSE,
+                 last_lan_addrs = '[]',
+                 last_public_ip = ''
              WHERE device_id = $1 AND owner_user_id = $2",
         )
         .bind(&norm)
@@ -1403,7 +1629,11 @@ impl DeviceStore for PgDeviceStore {
                  bound_at = NULL,
                  alias = '',
                  allow_remote_assist = FALSE,
-                 allow_remote_control = CASE WHEN LOWER(os) LIKE '%android%' OR LOWER(os) LIKE '%ios%' THEN FALSE ELSE TRUE END
+                 allow_remote_control = CASE WHEN LOWER(os) LIKE '%android%' OR LOWER(os) LIKE '%ios%' THEN FALSE ELSE TRUE END,
+                 mac_addr = NULL,
+                 wol_enabled = FALSE,
+                 last_lan_addrs = '[]',
+                 last_public_ip = ''
              WHERE device_id = $1 AND owner_user_id IS NOT NULL",
         )
         .bind(&norm)
@@ -1504,6 +1734,63 @@ impl DeviceStore for PgDeviceStore {
             .bind(&norm)
             .execute(&self.pool)
             .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn update_device_wol_state(
+        &self,
+        device_id: &str,
+        owner_user_id: Option<Uuid>,
+        mac_addr: Option<&str>,
+        wol_enabled: Option<bool>,
+        last_lan_addrs: Option<&[String]>,
+        last_public_ip: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let norm = normalize_device_id(device_id);
+        if !is_valid_device_id(&norm) {
+            return Ok(false);
+        }
+        let norm_mac = validate_optional_mac_addr(mac_addr)?;
+        let lan_json = validate_optional_lan_addrs(last_lan_addrs)?.map(|(_, json)| json);
+        let norm_public_ip = validate_optional_public_ip(last_public_ip)?;
+
+        let res = match owner_user_id {
+            Some(uid) => {
+                sqlx::query(
+                    "UPDATE devices
+                     SET mac_addr = COALESCE($1, mac_addr),
+                         wol_enabled = COALESCE($2, wol_enabled),
+                         last_lan_addrs = COALESCE($3, last_lan_addrs),
+                         last_public_ip = COALESCE($4, last_public_ip)
+                     WHERE device_id = $5 AND owner_user_id = $6",
+                )
+                .bind(norm_mac.as_deref())
+                .bind(wol_enabled)
+                .bind(lan_json.as_deref())
+                .bind(norm_public_ip.as_deref())
+                .bind(&norm)
+                .bind(uid)
+                .execute(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "UPDATE devices
+                     SET mac_addr = COALESCE($1, mac_addr),
+                         wol_enabled = COALESCE($2, wol_enabled),
+                         last_lan_addrs = COALESCE($3, last_lan_addrs),
+                         last_public_ip = COALESCE($4, last_public_ip)
+                     WHERE device_id = $5 AND owner_user_id IS NULL",
+                )
+                .bind(norm_mac.as_deref())
+                .bind(wol_enabled)
+                .bind(lan_json.as_deref())
+                .bind(norm_public_ip.as_deref())
+                .bind(&norm)
+                .execute(&self.pool)
+                .await?
+            }
+        };
         Ok(res.rows_affected() > 0)
     }
 }
@@ -1776,7 +2063,11 @@ impl UserStore for PgDeviceStore {
                  bound_at = NULL,
                  alias = '',
                  allow_remote_assist = FALSE,
-                 allow_remote_control = CASE WHEN LOWER(os) LIKE '%android%' OR LOWER(os) LIKE '%ios%' THEN FALSE ELSE TRUE END
+                 allow_remote_control = CASE WHEN LOWER(os) LIKE '%android%' OR LOWER(os) LIKE '%ios%' THEN FALSE ELSE TRUE END,
+                 mac_addr = NULL,
+                 wol_enabled = FALSE,
+                 last_lan_addrs = '[]',
+                 last_public_ip = ''
              WHERE owner_user_id = $1",
         )
         .bind(user_id)
@@ -2525,6 +2816,18 @@ impl DeviceStore for MemoryDeviceStore {
                 if !v.device_group.is_empty() {
                     existing.device_group = v.device_group;
                 }
+                if let Some(mac) = v.mac_addr {
+                    existing.mac_addr = Some(mac);
+                }
+                if let Some(wol) = v.wol_enabled {
+                    existing.wol_enabled = wol;
+                }
+                if let Some(addrs) = v.last_lan_addrs {
+                    existing.last_lan_addrs = addrs;
+                }
+                if let Some(pub_ip) = v.last_public_ip {
+                    existing.last_public_ip = pub_ip;
+                }
                 existing.last_seen_at = now;
                 return Ok(existing.clone());
             }
@@ -2551,6 +2854,10 @@ impl DeviceStore for MemoryDeviceStore {
                     allow_remote_assist: false,
                     allow_remote_control: default_allow_rc,
                     bound_at: None,
+                    mac_addr: v.mac_addr,
+                    wol_enabled: v.wol_enabled.unwrap_or(false),
+                    last_lan_addrs: v.last_lan_addrs.unwrap_or_default(),
+                    last_public_ip: v.last_public_ip.unwrap_or_default(),
                 };
                 guard.by_key.insert(v.device_key, candidate_id.clone());
                 guard.by_id.insert(candidate_id, record.clone());
@@ -2733,6 +3040,10 @@ impl DeviceStore for MemoryDeviceStore {
         if rec.owner_user_id != Some(user_id) {
             rec.allow_remote_assist = false;
             rec.allow_remote_control = default_allow_remote_control_for_os(&rec.os);
+            rec.mac_addr = None;
+            rec.wol_enabled = false;
+            rec.last_lan_addrs.clear();
+            rec.last_public_ip.clear();
             if alias.is_none() {
                 rec.alias.clear();
             }
@@ -2805,6 +3116,10 @@ impl DeviceStore for MemoryDeviceStore {
                 rec.alias.clear();
                 rec.allow_remote_assist = false;
                 rec.allow_remote_control = default_allow_remote_control_for_os(&rec.os);
+                rec.mac_addr = None;
+                rec.wol_enabled = false;
+                rec.last_lan_addrs.clear();
+                rec.last_public_ip.clear();
                 return Ok(true);
             }
         }
@@ -2824,6 +3139,10 @@ impl DeviceStore for MemoryDeviceStore {
                 rec.alias.clear();
                 rec.allow_remote_assist = false;
                 rec.allow_remote_control = default_allow_remote_control_for_os(&rec.os);
+                rec.mac_addr = None;
+                rec.wol_enabled = false;
+                rec.last_lan_addrs.clear();
+                rec.last_public_ip.clear();
                 return Ok(true);
             }
         }
@@ -2893,6 +3212,48 @@ impl DeviceStore for MemoryDeviceStore {
         if let Some(rec) = guard.by_id.get_mut(&norm) {
             rec.device_pubkey = clean;
             return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn update_device_wol_state(
+        &self,
+        device_id: &str,
+        owner_user_id: Option<Uuid>,
+        mac_addr: Option<&str>,
+        wol_enabled: Option<bool>,
+        last_lan_addrs: Option<&[String]>,
+        last_public_ip: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let norm = normalize_device_id(device_id);
+        if !is_valid_device_id(&norm) {
+            return Ok(false);
+        }
+        let norm_mac = validate_optional_mac_addr(mac_addr)?;
+        let lan_addrs = validate_optional_lan_addrs(last_lan_addrs)?.map(|(vec, _)| vec);
+        let norm_public_ip = validate_optional_public_ip(last_public_ip)?;
+
+        let mut guard = self.state.write().expect("MemoryDeviceStore lock poisoned");
+        if let Some(rec) = guard.by_id.get_mut(&norm) {
+            let owner_matches = match owner_user_id {
+                Some(uid) => rec.owner_user_id == Some(uid),
+                None => rec.owner_user_id.is_none(),
+            };
+            if owner_matches {
+                if let Some(mac) = norm_mac {
+                    rec.mac_addr = Some(mac);
+                }
+                if let Some(wol) = wol_enabled {
+                    rec.wol_enabled = wol;
+                }
+                if let Some(addrs) = lan_addrs {
+                    rec.last_lan_addrs = addrs;
+                }
+                if let Some(pub_ip) = norm_public_ip {
+                    rec.last_public_ip = pub_ip;
+                }
+                return Ok(true);
+            }
         }
         Ok(false)
     }
@@ -3155,6 +3516,10 @@ impl UserStore for MemoryDeviceStore {
                 dev.alias.clear();
                 dev.allow_remote_assist = false;
                 dev.allow_remote_control = default_allow_remote_control_for_os(&dev.os);
+                dev.mac_addr = None;
+                dev.wol_enabled = false;
+                dev.last_lan_addrs.clear();
+                dev.last_public_ip.clear();
             }
         }
         Ok(true)
@@ -3772,6 +4137,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "dev".into(),
+                ..Default::default()
             })
             .await
             .expect("first register");
@@ -3787,6 +4153,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "prod".into(),
+                ..Default::default()
             })
             .await
             .expect("second register");
@@ -3804,6 +4171,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "".into(),
+                ..Default::default()
             })
             .await
             .expect("other register");
@@ -3830,6 +4198,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "prod".into(),
+                ..Default::default()
             })
             .await
             .unwrap_err();
@@ -3874,6 +4243,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "".into(),
+                ..Default::default()
             })
             .await
             .unwrap_err();
@@ -3891,6 +4261,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "fleet".into(),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -3902,6 +4273,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "lab".into(),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -3955,6 +4327,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "g".repeat(MAX_DEVICE_GROUP_LEN),
+                ..Default::default()
             })
             .await;
         assert!(ok.is_ok(), "boundary lengths should succeed: {ok:?}");
@@ -3968,6 +4341,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "".into(),
+                ..Default::default()
             },
             RegisterInput {
                 device_key: "key-2".into(),
@@ -3976,6 +4350,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "".into(),
+                ..Default::default()
             },
             RegisterInput {
                 device_key: "key-3".into(),
@@ -3984,6 +4359,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "g".repeat(MAX_DEVICE_GROUP_LEN + 1),
+                ..Default::default()
             },
             // NUL byte & control chars rejected across all fields.
             RegisterInput {
@@ -3993,6 +4369,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "".into(),
+                ..Default::default()
             },
             RegisterInput {
                 device_key: "key-4".into(),
@@ -4001,6 +4378,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "".into(),
+                ..Default::default()
             },
             RegisterInput {
                 device_key: "key-5".into(),
@@ -4009,6 +4387,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "".into(),
+                ..Default::default()
             },
             RegisterInput {
                 device_key: "key-6".into(),
@@ -4017,6 +4396,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "group\nline".into(),
+                ..Default::default()
             },
         ] {
             let err = store.register_or_get(bad).await.unwrap_err();
@@ -4062,6 +4442,7 @@ mod tests {
                     app_version: String::new(),
                     arch: String::new(),
                     device_group: "cluster".into(),
+                    ..Default::default()
                 })
                 .await
                 .unwrap();
@@ -4193,6 +4574,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "".into(),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -4435,6 +4817,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "".into(),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -4543,6 +4926,7 @@ mod tests {
                 app_version: "0.1.9".into(),
                 arch: "arm64".into(),
                 device_group: "default".into(),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -4558,6 +4942,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: String::new(),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -4574,6 +4959,7 @@ mod tests {
                 app_version: "0.1.10".into(),
                 arch: "arm64".into(),
                 device_group: String::new(),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -4745,5 +5131,253 @@ mod tests {
             .await
             .unwrap();
         assert!(!updated_stub.allow_remote_control);
+    }
+
+    #[test]
+    fn normalize_mac_addr_validates_and_normalizes_strictly() {
+        // Valid unicast MACs with `:` or `-` separators
+        assert_eq!(
+            normalize_mac_addr("AA:BB:CC:DD:EE:FF").as_deref(),
+            Some("aa:bb:cc:dd:ee:ff")
+        );
+        assert_eq!(
+            normalize_mac_addr("AA-BB-CC-DD-EE-FF").as_deref(),
+            Some("aa:bb:cc:dd:ee:ff")
+        );
+        assert_eq!(
+            normalize_mac_addr("  02:11:22:33:44:55  ").as_deref(),
+            Some("02:11:22:33:44:55")
+        );
+        assert_eq!(
+            normalize_mac_addr("fe-dc-ba-98-76-54").as_deref(),
+            Some("fe:dc:ba:98:76:54")
+        );
+
+        // Strictly reject all-zero, broadcast, multicast (b0 & 0x01 != 0), and malformed inputs
+        for bad in [
+            "00:00:00:00:00:00",
+            "00-00-00-00-00-00",
+            "ff:ff:ff:ff:ff:ff",
+            "FF-FF-FF-FF-FF-FF",
+            "01:00:5e:00:00:01",
+            "33:33:00:00:00:01",
+            "03:aa:bb:cc:dd:ee",
+            "aa:bb-cc:dd:ee:ff",
+            "aabbccddeeff",
+            "aa:bb:cc:dd:ee",
+            "aa:bb:cc:dd:ee:ff:00",
+            "gg:bb:cc:dd:ee:ff",
+            "",
+            "   ",
+            "aa:bb:cc:dd:ee:ff\n",
+            "aa:bb:cc:dd:ee:ff\0",
+        ] {
+            assert_eq!(
+                normalize_mac_addr(bad),
+                None,
+                "expected MAC '{bad}' to be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wol_fields_preserve_existing_on_legacy_reregister_and_reset_on_unbind() {
+        let store = MemoryDeviceStore::new();
+
+        // Register with WoL metadata + network info.
+        let rec = store
+            .register_or_get(RegisterInput {
+                device_key: "dk-wol-1".into(),
+                hostname: "studio".into(),
+                os: "macos".into(),
+                mac_addr: Some("AA-BB-CC-DD-EE-FF".into()),
+                wol_enabled: Some(true),
+                last_lan_addrs: Some(vec!["192.168.1.20:50000".into()]),
+                last_public_ip: Some("::ffff:203.0.113.10".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rec.mac_addr.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+        assert!(rec.wol_enabled);
+        assert!(rec.wol_capable());
+        assert_eq!(rec.last_lan_addrs, vec!["192.168.1.20:50000".to_string()]);
+        assert_eq!(rec.last_public_ip, "203.0.113.10");
+
+        // Ensure DeviceRecord JSON serialization never leaks raw mac_addr.
+        let rec_json = serde_json::to_string(&rec).unwrap();
+        assert!(!rec_json.contains("mac_addr"));
+        assert!(!rec_json.contains("aa:bb:cc:dd:ee:ff"));
+
+        // Legacy client re-registering without MAC/wol/network fields preserves stored records.
+        let legacy_json = r#"{"device_key":"dk-wol-1","hostname":"studio-v2","os":"macos"}"#;
+        let legacy_input: RegisterInput = serde_json::from_str(legacy_json).unwrap();
+        let after_legacy = store.register_or_get(legacy_input).await.unwrap();
+        assert_eq!(after_legacy.device_id, rec.device_id);
+        assert_eq!(after_legacy.hostname, "studio-v2");
+        assert_eq!(after_legacy.mac_addr.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+        assert!(after_legacy.wol_enabled);
+        assert!(after_legacy.wol_capable());
+        assert_eq!(
+            after_legacy.last_lan_addrs,
+            vec!["192.168.1.20:50000".to_string()]
+        );
+        assert_eq!(after_legacy.last_public_ip, "203.0.113.10");
+
+        // Invalid MAC in RegisterInput is rejected.
+        let bad_res = store
+            .register_or_get(RegisterInput {
+                device_key: "dk-wol-bad".into(),
+                mac_addr: Some("01:00:5e:00:00:01".into()),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(bad_res, Err(StoreError::InvalidInput(_))));
+
+        // Bind to user1 -> pre-bind WoL metadata is wiped so new owner never inherits stale MAC/topology.
+        let u1 = store
+            .create_user(CreateUserInput {
+                email: "wol-owner@example.com".into(),
+                display_name: "Owner".into(),
+                password_hash: "hash".into(),
+                role: ROLE_USER.into(),
+                status: STATUS_ACTIVE.into(),
+                must_change_password: false,
+            })
+            .await
+            .unwrap();
+        let u2 = store
+            .create_user(CreateUserInput {
+                email: "wol-owner2@example.com".into(),
+                display_name: "Owner 2".into(),
+                password_hash: "hash".into(),
+                role: ROLE_USER.into(),
+                status: STATUS_ACTIVE.into(),
+                must_change_password: false,
+            })
+            .await
+            .unwrap();
+
+        let bound_u1 = store
+            .bind_device_to_user(&rec.device_id, u1.id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound_u1.mac_addr, None);
+        assert!(!bound_u1.wol_enabled);
+        assert!(bound_u1.last_lan_addrs.is_empty());
+        assert!(bound_u1.last_public_ip.is_empty());
+
+        // Anonymous update_device_wol_state (owner_user_id=None) MUST NOT mutate a bound device!
+        assert!(!store
+            .update_device_wol_state(
+                &rec.device_id,
+                None,
+                Some("02:11:22:33:44:55"),
+                Some(true),
+                Some(&["10.0.0.1:50000".into()]),
+                Some("198.51.100.1"),
+            )
+            .await
+            .unwrap());
+
+        // Owner sets MAC + WoL + topology.
+        assert!(store
+            .update_device_wol_state(
+                &rec.device_id,
+                Some(u1.id),
+                Some("AA:BB:CC:DD:EE:FF"),
+                Some(true),
+                Some(&["192.168.1.20:50000".into()]),
+                Some("203.0.113.10"),
+            )
+            .await
+            .unwrap());
+        let with_wol = store.get_by_id(&rec.device_id).await.unwrap().unwrap();
+        assert!(with_wol.wol_capable());
+        assert_eq!(with_wol.mac_addr.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+        assert_eq!(
+            with_wol.last_lan_addrs,
+            vec!["192.168.1.20:50000".to_string()]
+        );
+        assert_eq!(with_wol.last_public_ip, "203.0.113.10");
+
+        // Owner transfer (u1 -> u2) MUST wipe mac_addr, wol_enabled, last_lan_addrs, last_public_ip!
+        let transferred = store
+            .bind_device_to_user(&rec.device_id, u2.id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(transferred.mac_addr, None);
+        assert!(!transferred.wol_enabled);
+        assert!(!transferred.wol_capable());
+        assert!(transferred.last_lan_addrs.is_empty());
+        assert!(transferred.last_public_ip.is_empty());
+
+        // Owner u2 configures WoL, then unbind -> MUST wipe all 4 fields!
+        assert!(store
+            .update_device_wol_state(
+                &rec.device_id,
+                Some(u2.id),
+                Some("02:aa:bb:cc:dd:ee"),
+                Some(true),
+                Some(&["192.168.2.30:50000".into()]),
+                Some("203.0.113.20"),
+            )
+            .await
+            .unwrap());
+        assert!(store.unbind_device(&rec.device_id, u2.id).await.unwrap());
+        let unbound = store.get_by_id(&rec.device_id).await.unwrap().unwrap();
+        assert_eq!(unbound.mac_addr, None);
+        assert!(!unbound.wol_enabled);
+        assert!(!unbound.wol_capable());
+        assert!(unbound.last_lan_addrs.is_empty());
+        assert!(unbound.last_public_ip.is_empty());
+
+        // Rebind to u2, configure WoL, then admin_unbind -> MUST wipe all 4 fields!
+        store
+            .bind_device_to_user(&rec.device_id, u2.id, None, None)
+            .await
+            .unwrap();
+        assert!(store
+            .update_device_wol_state(
+                &rec.device_id,
+                Some(u2.id),
+                Some("02:aa:bb:cc:dd:ee"),
+                Some(true),
+                Some(&["192.168.2.30:50000".into()]),
+                Some("203.0.113.20"),
+            )
+            .await
+            .unwrap());
+        assert!(store.admin_unbind_device(&rec.device_id).await.unwrap());
+        let after_admin_unbind = store.get_by_id(&rec.device_id).await.unwrap().unwrap();
+        assert_eq!(after_admin_unbind.mac_addr, None);
+        assert!(!after_admin_unbind.wol_enabled);
+        assert!(after_admin_unbind.last_lan_addrs.is_empty());
+        assert!(after_admin_unbind.last_public_ip.is_empty());
+
+        // Rebind to u2, configure WoL, then delete_user(u2) -> MUST wipe all 4 fields!
+        store
+            .bind_device_to_user(&rec.device_id, u2.id, None, None)
+            .await
+            .unwrap();
+        assert!(store
+            .update_device_wol_state(
+                &rec.device_id,
+                Some(u2.id),
+                Some("02:aa:bb:cc:dd:ee"),
+                Some(true),
+                Some(&["192.168.2.30:50000".into()]),
+                Some("203.0.113.20"),
+            )
+            .await
+            .unwrap());
+        assert!(store.delete_user(u2.id).await.unwrap());
+        let after_del = store.get_by_id(&rec.device_id).await.unwrap().unwrap();
+        assert_eq!(after_del.mac_addr, None);
+        assert!(!after_del.wol_enabled);
+        assert!(after_del.last_lan_addrs.is_empty());
+        assert!(after_del.last_public_ip.is_empty());
     }
 }

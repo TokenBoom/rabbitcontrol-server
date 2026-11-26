@@ -25,8 +25,9 @@ use crate::ephemeral::{
 };
 use crate::generated::error_codes::wire as err_code;
 use crate::store::{
-    format_device_id, is_valid_device_id, normalize_device_id, AuthStore, DeviceStore,
-    RegisterInput, StoreError, MAX_DEVICE_PUBKEY_LEN, STATUS_ACTIVE,
+    format_device_id, is_valid_device_id, normalize_device_id, normalize_mac_addr,
+    parse_mac_addr_bytes, AuthStore, DeviceStore, RegisterInput, StoreError, MAX_DEVICE_PUBKEY_LEN,
+    STATUS_ACTIVE,
 };
 
 pub const UDP_PROBE_MAGIC: &[u8; 4] = b"RCSP";
@@ -51,6 +52,15 @@ pub const DEFAULT_CONNECT_RATE_LIMIT_MAX: usize = 20;
 pub const DEFAULT_CONNECT_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(10);
 pub const DEFAULT_UDP_RATE_LIMIT_MAX: usize = 30;
 pub const DEFAULT_UDP_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(10);
+pub const DEFAULT_WOL_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(5);
+pub const DEFAULT_WOL_CALLER_RATE_LIMIT_MAX: usize = 10;
+pub const DEFAULT_WOL_CALLER_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(10);
+pub const WOL_MAGIC_PACKET_LEN: usize = 102;
+pub const WOL_UDP_PORT: u16 = 9;
+pub const WOL_METHOD_ALREADY_ONLINE: &str = "already_online";
+pub const WOL_METHOD_LAN_PEER: &str = "lan_peer";
+pub const WOL_METHOD_SERVER: &str = "server";
+pub const WOL_METHOD_NONE: &str = "none";
 
 const DEVICE_LOCK_STRIPES: usize = 64;
 const INITIAL_FRAME_BUF_CAP: usize = 4_096;
@@ -273,6 +283,10 @@ pub enum SignalMsg {
         allow_remote_assist: Option<bool>,
         #[serde(default)]
         allow_remote_control: Option<bool>,
+        #[serde(default)]
+        mac_addr: Option<String>,
+        #[serde(default)]
+        wol_enabled: Option<bool>,
     },
     Registered {
         device_id: String,
@@ -284,6 +298,10 @@ pub enum SignalMsg {
     Heartbeat {
         #[serde(default)]
         lan_addrs: Vec<String>,
+        #[serde(default)]
+        mac_addr: Option<String>,
+        #[serde(default)]
+        wol_enabled: Option<bool>,
     },
     HeartbeatAck {
         server_time: DateTime<Utc>,
@@ -296,6 +314,10 @@ pub enum SignalMsg {
         allow_remote_assist: Option<bool>,
         #[serde(default)]
         allow_remote_control: Option<bool>,
+        #[serde(default)]
+        mac_addr: Option<String>,
+        #[serde(default)]
+        wol_enabled: Option<bool>,
     },
     DeviceStatusChanged {
         device_id: String,
@@ -310,6 +332,8 @@ pub enum SignalMsg {
         allow_remote_assist: bool,
         #[serde(default = "default_true")]
         allow_remote_control: bool,
+        #[serde(default)]
+        wol_capable: bool,
     },
     ConnectRequest {
         target_id: String,
@@ -355,6 +379,28 @@ pub enum SignalMsg {
     PeerOffline {
         target_id: String,
         session_id: String,
+    },
+    WolRequest {
+        #[serde(default)]
+        request_id: Option<String>,
+        target_device_id: String,
+    },
+    WolRelay {
+        request_id: String,
+        target_device_id: String,
+        mac_addr: String,
+        #[serde(default)]
+        target_lan_addrs: Vec<String>,
+    },
+    WolAck {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        target_device_id: String,
+        ok: bool,
+        method: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        message: String,
     },
     Kicked {
         reason: String,
@@ -473,6 +519,10 @@ pub struct SignalConfig {
     pub connect_rate_limit_window: Duration,
     pub udp_rate_limit_max: usize,
     pub udp_rate_limit_window: Duration,
+    pub wol_rate_limit_window: Duration,
+    pub wol_caller_rate_limit_max: usize,
+    pub wol_caller_rate_limit_window: Duration,
+    pub allow_server_wol: bool,
     pub public_udp_probe_addr: String,
     pub public_relay_addr: String,
     pub require_auth: bool,
@@ -494,11 +544,186 @@ impl Default for SignalConfig {
             connect_rate_limit_window: DEFAULT_CONNECT_RATE_LIMIT_WINDOW,
             udp_rate_limit_max: DEFAULT_UDP_RATE_LIMIT_MAX,
             udp_rate_limit_window: DEFAULT_UDP_RATE_LIMIT_WINDOW,
+            wol_rate_limit_window: DEFAULT_WOL_RATE_LIMIT_WINDOW,
+            wol_caller_rate_limit_max: DEFAULT_WOL_CALLER_RATE_LIMIT_MAX,
+            wol_caller_rate_limit_window: DEFAULT_WOL_CALLER_RATE_LIMIT_WINDOW,
+            allow_server_wol: false,
             public_udp_probe_addr: "127.0.0.1:21116".to_string(),
             public_relay_addr: "127.0.0.1:21117".to_string(),
             require_auth: true,
         }
     }
+}
+
+/// Build a standard 102-byte Wake-on-LAN magic packet (`6×0xFF + 16×MAC`).
+/// Returns `None` if `mac_addr` is not a valid unicast MAC address.
+pub fn build_wol_magic_packet(mac_addr: &str) -> Option<[u8; WOL_MAGIC_PACKET_LEN]> {
+    let mac_bytes = parse_mac_addr_bytes(mac_addr)?;
+    let mut pkt = [0u8; WOL_MAGIC_PACKET_LEN];
+    pkt[0..6].fill(0xFF);
+    for i in 0..16 {
+        let start = 6 + i * 6;
+        pkt[start..start + 6].copy_from_slice(&mac_bytes);
+    }
+    Some(pkt)
+}
+
+fn extract_private_ipv4(addr: &str) -> Option<Ipv4Addr> {
+    let trimmed = addr.trim();
+    let ip = trimmed
+        .parse::<SocketAddr>()
+        .map(|sa| canonical_ip(sa.ip()))
+        .or_else(|_| trimmed.parse::<IpAddr>().map(canonical_ip))
+        .ok()?;
+    match ip {
+        IpAddr::V4(v4) if v4.is_private() => Some(v4),
+        _ => None,
+    }
+}
+
+fn share_private_ipv4_slash24(a: &[String], b: &[String]) -> bool {
+    let a_nets: Vec<[u8; 3]> = a
+        .iter()
+        .filter_map(|s| extract_private_ipv4(s))
+        .map(|v4| {
+            let o = v4.octets();
+            [o[0], o[1], o[2]]
+        })
+        .collect();
+    if a_nets.is_empty() {
+        return false;
+    }
+    b.iter().filter_map(|s| extract_private_ipv4(s)).any(|v4| {
+        let o = v4.octets();
+        a_nets.contains(&[o[0], o[1], o[2]])
+    })
+}
+
+fn is_routable_public_ip(ip: IpAddr) -> bool {
+    match canonical_ip(ip) {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            let is_cgnat = o[0] == 100 && (o[1] & 0b1100_0000) == 64;
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || is_cgnat)
+        }
+        IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local())
+        }
+    }
+}
+
+/// Score a same-account online candidate peer for Wake-on-LAN LAN relay.
+///
+/// Priority:
+/// - `3`: same public IP AND shared RFC 1918 IPv4 `/24` private subnet
+/// - `2`: same public IP (same NAT site)
+/// - `1`: shared RFC 1918 IPv4 `/24` private subnet fallback (ONLY when `target_public_ip` is
+///   empty or at least one side is private/loopback/non-public; strictly `0` when both sides
+///   have distinct routable public IPs to avoid cross-site misrouting on `192.168.1.0/24`)
+/// - `0`: ineligible
+fn score_wol_relay_candidate(
+    target_public_ip_raw: &str,
+    target_lan_addrs: &[String],
+    peer_remote_ip: IpAddr,
+    peer_lan_addrs: &[String],
+) -> u8 {
+    let target_ip = target_public_ip_raw
+        .trim()
+        .parse::<IpAddr>()
+        .ok()
+        .map(canonical_ip);
+    let peer_ip = canonical_ip(peer_remote_ip);
+    let same_public_ip = target_ip.is_some_and(|tip| tip == peer_ip);
+    let both_distinct_public_ips = target_ip.is_some_and(|tip| {
+        tip != peer_ip && is_routable_public_ip(tip) && is_routable_public_ip(peer_ip)
+    });
+
+    if both_distinct_public_ips {
+        return 0;
+    }
+
+    let same_lan_subnet = share_private_ipv4_slash24(peer_lan_addrs, target_lan_addrs);
+    match (same_public_ip, same_lan_subnet) {
+        (true, true) => 3,
+        (true, false) => 2,
+        (false, true) => 1,
+        (false, false) => 0,
+    }
+}
+
+/// Compute directed `/24` subnet broadcast destinations (port 9) for all private IPv4 LAN
+/// addresses, followed by the limited broadcast address `255.255.255.255:9`.
+pub fn wol_broadcast_targets(target_lan_addrs: &[String]) -> Vec<SocketAddr> {
+    let mut targets = Vec::new();
+    for raw in target_lan_addrs {
+        if let Some(v4) = extract_private_ipv4(raw) {
+            let o = v4.octets();
+            let bcast = SocketAddr::from((Ipv4Addr::new(o[0], o[1], o[2], 255), WOL_UDP_PORT));
+            if !targets.contains(&bcast) {
+                targets.push(bcast);
+            }
+        }
+    }
+    let global = SocketAddr::from((Ipv4Addr::BROADCAST, WOL_UDP_PORT));
+    if !targets.contains(&global) {
+        targets.push(global);
+    }
+    targets
+}
+
+async fn send_server_wol_magic_packet(
+    mac_addr: &str,
+    target_lan_addrs: &[String],
+) -> io::Result<()> {
+    let packet = build_wol_magic_packet(mac_addr)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid unicast mac_addr"))?;
+    let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await?;
+    socket.set_broadcast(true)?;
+    let destinations = wol_broadcast_targets(target_lan_addrs);
+    let mut sent_ok = 0usize;
+    let mut last_err: Option<io::Error> = None;
+    for dest in destinations {
+        match socket.send_to(&packet, dest).await {
+            Ok(_) => sent_ok += 1,
+            Err(err) => {
+                debug!(%dest, error = %err, "server WoL broadcast send_to failed");
+                last_err = Some(err);
+            }
+        }
+    }
+    if sent_ok > 0 {
+        Ok(())
+    } else {
+        Err(last_err
+            .unwrap_or_else(|| io::Error::other("no Wake-on-LAN broadcast destination succeeded")))
+    }
+}
+
+fn validate_optional_signal_mac_addr(
+    mac_addr: Option<&str>,
+) -> Result<Option<String>, &'static str> {
+    let Some(raw) = mac_addr else {
+        return Ok(None);
+    };
+    if raw.contains('\0') || raw.chars().any(char::is_control) {
+        return Err("mac_addr must not contain NUL or control characters");
+    }
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    normalize_mac_addr(raw)
+        .map(Some)
+        .ok_or("invalid unicast mac_addr")
 }
 
 fn validate_ascii_token(val: &str, max_len: usize, field: &'static str) -> Result<(), String> {
@@ -785,6 +1010,7 @@ struct DeviceStatusBroadcast<'a> {
     arch: &'a str,
     allow_remote_assist: bool,
     allow_remote_control: bool,
+    wol_capable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -799,6 +1025,7 @@ struct ActivePeer {
     device_pubkey: String,
     allow_remote_assist: bool,
     allow_remote_control: bool,
+    wol_capable: bool,
     hostname: String,
     alias: String,
     os: String,
@@ -815,6 +1042,8 @@ pub struct SignalHub {
     device_locks: [Mutex<()>; DEVICE_LOCK_STRIPES],
     connect_rate_limits: DashMap<String, VecDeque<Instant>>,
     udp_rate_limits: DashMap<IpAddr, VecDeque<Instant>>,
+    wol_rate_limits: DashMap<String, VecDeque<Instant>>,
+    wol_caller_rate_limits: DashMap<String, VecDeque<Instant>>,
     issued_relay_tokens: DashMap<String, Instant>,
     conn_semaphore: Arc<Semaphore>,
     shutdown: SignalShutdown,
@@ -843,6 +1072,8 @@ impl SignalHub {
             device_locks: std::array::from_fn(|_| Mutex::new(())),
             connect_rate_limits: DashMap::new(),
             udp_rate_limits: DashMap::new(),
+            wol_rate_limits: DashMap::new(),
+            wol_caller_rate_limits: DashMap::new(),
             issued_relay_tokens: DashMap::new(),
             conn_semaphore: Arc::new(Semaphore::new(max_connections)),
             shutdown: SignalShutdown::new(),
@@ -872,6 +1103,8 @@ impl SignalHub {
             device_locks: std::array::from_fn(|_| Mutex::new(())),
             connect_rate_limits: DashMap::new(),
             udp_rate_limits: DashMap::new(),
+            wol_rate_limits: DashMap::new(),
+            wol_caller_rate_limits: DashMap::new(),
             issued_relay_tokens: DashMap::new(),
             conn_semaphore: Arc::new(Semaphore::new(max_connections)),
             shutdown: SignalShutdown::new(),
@@ -980,6 +1213,7 @@ impl SignalHub {
             arch: status.arch.to_string(),
             allow_remote_assist: status.allow_remote_assist,
             allow_remote_control: status.allow_remote_control,
+            wol_capable: status.wol_capable,
         };
         for (peer_id, peer_tx) in targets {
             Self::send_nonblocking(&peer_tx, &peer_id, msg.clone());
@@ -987,17 +1221,19 @@ impl SignalHub {
     }
 
     /// Synchronize updated device metadata/policy (`alias`, `allow_remote_assist`,
-    /// `allow_remote_control`) from REST `PATCH /api/v1/me/devices/{id}` into in-memory
+    /// `allow_remote_control`, `wol_capable`) from REST `PATCH /api/v1/me/devices/{id}` into in-memory
     /// active peer state, notify the target online device itself (preventing stale cache
     /// overwrite on reconnect), and broadcast `DeviceStatusChanged` to same-account online peers.
     pub async fn sync_device_policy_and_broadcast(&self, updated: &crate::store::DeviceRecord) {
         let norm = normalize_device_id(&updated.device_id);
+        let wol_capable = updated.wol_capable();
         let self_tx = {
             let _guard = self.lock_device(&norm).await;
             if let Some(mut peer) = self.peers.get_mut(&norm) {
                 peer.alias = updated.alias.clone();
                 peer.allow_remote_assist = updated.allow_remote_assist;
                 peer.allow_remote_control = updated.allow_remote_control;
+                peer.wol_capable = wol_capable;
                 Some(peer.tx.clone())
             } else {
                 None
@@ -1015,6 +1251,7 @@ impl SignalHub {
                 arch: updated.arch.clone(),
                 allow_remote_assist: updated.allow_remote_assist,
                 allow_remote_control: updated.allow_remote_control,
+                wol_capable,
             };
             Self::send_nonblocking(&peer_tx, &norm, msg);
         }
@@ -1029,6 +1266,7 @@ impl SignalHub {
             arch: &updated.arch,
             allow_remote_assist: updated.allow_remote_assist,
             allow_remote_control: updated.allow_remote_control,
+            wol_capable,
         });
     }
 
@@ -1059,6 +1297,7 @@ impl SignalHub {
                 arch: &peer.arch,
                 allow_remote_assist: peer.allow_remote_assist,
                 allow_remote_control: peer.allow_remote_control,
+                wol_capable: peer.wol_capable,
             });
             true
         } else {
@@ -1590,6 +1829,8 @@ impl SignalHub {
             device_pubkey,
             allow_remote_assist_opt,
             allow_remote_control_opt,
+            mac_addr_opt,
+            wol_enabled_opt,
         ) = match first_frame {
             SignalMsg::Register {
                 device_id,
@@ -1604,6 +1845,8 @@ impl SignalHub {
                 device_pubkey,
                 allow_remote_assist,
                 allow_remote_control,
+                mac_addr,
+                wol_enabled,
             } => {
                 if let Err(reason) = validate_register_fields(
                     &hostname,
@@ -1640,6 +1883,21 @@ impl SignalHub {
                         return;
                     }
                 }
+                let normalized_mac = match validate_optional_signal_mac_addr(mac_addr.as_deref()) {
+                    Ok(mac) => mac,
+                    Err(reason) => {
+                        write_frame_with_timeout(
+                            &mut writer,
+                            &SignalMsg::Error {
+                                code: err_code::INVALID_INPUT.into(),
+                                message: reason.into(),
+                            },
+                            self.config.write_timeout,
+                        )
+                        .await;
+                        return;
+                    }
+                };
                 (
                     device_id,
                     RegisterInput {
@@ -1649,12 +1907,15 @@ impl SignalHub {
                         app_version,
                         arch,
                         device_group,
+                        ..Default::default()
                     },
                     lan_addrs,
                     access_token,
                     device_pubkey,
                     allow_remote_assist,
                     allow_remote_control,
+                    normalized_mac,
+                    wol_enabled,
                 )
             }
             _ => {
@@ -1873,6 +2134,7 @@ impl SignalHub {
             peer_arch,
             peer_assist,
             peer_remote_control,
+            peer_wol_capable,
         ) = {
             let _guard = self.lock_device(&device_id).await;
             if self.shutdown.is_cancelled() {
@@ -1991,10 +2253,53 @@ impl SignalHub {
                         }
                     }
                 }
-            } else if allow_remote_assist_opt.is_some() || allow_remote_control_opt.is_some() {
+                let public_ip_str = canonical_ip(remote_addr.ip()).to_string();
+                let reg_lan_slice =
+                    (!initial_lan_addrs.is_empty()).then_some(initial_lan_addrs.as_slice());
+                if mac_addr_opt.is_some()
+                    || wol_enabled_opt.is_some()
+                    || reg_lan_slice.is_some()
+                    || !public_ip_str.is_empty()
+                {
+                    if mac_addr_opt.is_some() || wol_enabled_opt.is_some() {
+                        policy_write_attempted = true;
+                    }
+                    match self
+                        .device_store
+                        .update_device_wol_state(
+                            &device_id,
+                            authed_user_id,
+                            mac_addr_opt.as_deref(),
+                            wol_enabled_opt,
+                            reg_lan_slice,
+                            Some(&public_ip_str),
+                        )
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            warn!(
+                                %device_id,
+                                "register WoL/network metadata update affected 0 rows"
+                            );
+                        }
+                        Err(err) => {
+                            warn!(
+                                %device_id,
+                                error = %err,
+                                "failed to persist register WoL/network metadata"
+                            );
+                        }
+                    }
+                }
+            } else if allow_remote_assist_opt.is_some()
+                || allow_remote_control_opt.is_some()
+                || mac_addr_opt.is_some()
+                || wol_enabled_opt.is_some()
+            {
                 warn!(
                     %device_id,
-                    "ignoring policy flags from unauthenticated register on bound device"
+                    "ignoring policy/WoL flags from unauthenticated register on bound device"
                 );
             }
 
@@ -2038,6 +2343,7 @@ impl SignalHub {
             };
             let effective_assist = latest.allow_remote_assist;
             let effective_remote_control = latest.allow_remote_control;
+            let effective_wol_capable = latest.wol_capable();
 
             if let Some(old_peer) = self.peers.insert(
                 device_id.clone(),
@@ -2052,6 +2358,7 @@ impl SignalHub {
                     device_pubkey: effective_pubkey,
                     allow_remote_assist: effective_assist,
                     allow_remote_control: effective_remote_control,
+                    wol_capable: effective_wol_capable,
                     hostname: latest.hostname.clone(),
                     alias: latest.alias.clone(),
                     os: latest.os.clone(),
@@ -2088,6 +2395,7 @@ impl SignalHub {
                 latest.arch,
                 effective_assist,
                 effective_remote_control,
+                effective_wol_capable,
             )
         };
 
@@ -2111,6 +2419,7 @@ impl SignalHub {
             arch: &peer_arch,
             allow_remote_assist: peer_assist,
             allow_remote_control: peer_remote_control,
+            wol_capable: peer_wol_capable,
         });
 
         // Writer task drains bounded channel with per-frame write timeout and immediate kick wakeup.
@@ -2299,6 +2608,7 @@ impl SignalHub {
                 arch: &peer.arch,
                 allow_remote_assist: peer.allow_remote_assist,
                 allow_remote_control: peer.allow_remote_control,
+                wol_capable: peer.wol_capable,
             });
         }
 
@@ -2542,7 +2852,11 @@ impl SignalHub {
         }
 
         match msg {
-            SignalMsg::Heartbeat { lan_addrs } => {
+            SignalMsg::Heartbeat {
+                lan_addrs,
+                mac_addr,
+                wol_enabled,
+            } => {
                 if let Err(reason) = validate_lan_addrs(&lan_addrs) {
                     Self::send_nonblocking(
                         self_tx,
@@ -2554,17 +2868,148 @@ impl SignalHub {
                     );
                     return;
                 }
-                let updated_addrs = if lan_addrs.is_empty() {
-                    None
-                } else {
-                    Some(lan_addrs)
+                let normalized_mac = match validate_optional_signal_mac_addr(mac_addr.as_deref()) {
+                    Ok(mac) => mac,
+                    Err(reason) => {
+                        Self::send_nonblocking(
+                            self_tx,
+                            device_id,
+                            SignalMsg::Error {
+                                code: err_code::INVALID_INPUT.into(),
+                                message: reason.into(),
+                            },
+                        );
+                        return;
+                    }
                 };
-                if !self
-                    .refresh_online_under_lock(device_id, conn_id, cancel, updated_addrs)
-                    .await
+                let has_wol_update = normalized_mac.is_some() || wol_enabled.is_some();
+
+                // Serialize online TTL refresh, peer LAN/WoL cache updates, and conditional DB
+                // persistence under the per-device stripe lock to eliminate TOCTOU races with
+                // concurrent bind/unbind/UpdateAssistState/PATCH.
+                let changed_peer = {
+                    let _guard = self.lock_device(device_id).await;
+                    if !self.is_active_conn(device_id, conn_id, cancel) {
+                        return;
+                    }
+
+                    let (owner_uid, public_ip_str, lan_addrs_changed) =
+                        match self.peers.get_mut(device_id) {
+                            Some(mut peer) if peer.conn_id == conn_id => {
+                                let changed = !lan_addrs.is_empty() && peer.lan_addrs != lan_addrs;
+                                if changed {
+                                    peer.lan_addrs = lan_addrs.clone();
+                                }
+                                (
+                                    peer.owner_user_id,
+                                    canonical_ip(peer.remote_addr.ip()).to_string(),
+                                    changed,
+                                )
+                            }
+                            _ => return,
+                        };
+
+                    if let Err(err) = self
+                        .ephemeral
+                        .set_online(device_id, self.config.online_ttl)
+                        .await
+                    {
+                        warn!(%device_id, error = %err, "failed to refresh ephemeral online TTL");
+                    }
+
+                    if has_wol_update || lan_addrs_changed {
+                        let hb_lan_slice = lan_addrs_changed.then_some(lan_addrs.as_slice());
+                        match self
+                            .device_store
+                            .update_device_wol_state(
+                                device_id,
+                                owner_uid,
+                                normalized_mac.as_deref(),
+                                wol_enabled,
+                                hb_lan_slice,
+                                Some(&public_ip_str),
+                            )
+                            .await
+                        {
+                            Ok(true) => {
+                                if has_wol_update {
+                                    if let Ok(Some(rec)) =
+                                        self.device_store.get_by_id(device_id).await
+                                    {
+                                        let new_wol_capable = rec.wol_capable();
+                                        self.peers.get_mut(device_id).and_then(|mut peer| {
+                                            if peer.conn_id == conn_id
+                                                && peer.wol_capable != new_wol_capable
+                                            {
+                                                peer.wol_capable = new_wol_capable;
+                                                Some((
+                                                    peer.owner_user_id,
+                                                    peer.hostname.clone(),
+                                                    peer.alias.clone(),
+                                                    peer.os.clone(),
+                                                    peer.app_version.clone(),
+                                                    peer.arch.clone(),
+                                                    peer.allow_remote_assist,
+                                                    peer.allow_remote_control,
+                                                    peer.wol_capable,
+                                                ))
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
+                            Ok(false) => {
+                                if owner_uid.is_none() {
+                                    debug!(
+                                        %device_id,
+                                        "ignoring unauthenticated heartbeat WoL/topology update on bound or missing device"
+                                    );
+                                }
+                                None
+                            }
+                            Err(err) => {
+                                warn!(%device_id, error = %err, "heartbeat failed to persist WoL/network state");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some((
+                    owner,
+                    hostname,
+                    alias,
+                    os,
+                    app_version,
+                    arch,
+                    allow_assist,
+                    allow_rc,
+                    wol_cap,
+                )) = changed_peer
                 {
-                    return;
+                    self.broadcast_user_device_status(DeviceStatusBroadcast {
+                        owner_user_id: owner,
+                        device_id,
+                        online: true,
+                        hostname: &hostname,
+                        alias: &alias,
+                        os: &os,
+                        app_version: &app_version,
+                        arch: &arch,
+                        allow_remote_assist: allow_assist,
+                        allow_remote_control: allow_rc,
+                        wol_capable: wol_cap,
+                    });
                 }
+
                 if let Err(err) = self.device_store.touch_last_seen(device_id).await {
                     warn!(%device_id, error = %err, "heartbeat failed to touch last_seen_at");
                 }
@@ -2593,16 +3038,35 @@ impl SignalHub {
             SignalMsg::UpdateAssistState {
                 allow_remote_assist,
                 allow_remote_control,
+                mac_addr,
+                wol_enabled,
             } => {
-                if allow_remote_assist.is_none() && allow_remote_control.is_none() {
+                let normalized_mac = match validate_optional_signal_mac_addr(mac_addr.as_deref()) {
+                    Ok(mac) => mac,
+                    Err(reason) => {
+                        Self::send_nonblocking(
+                            self_tx,
+                            device_id,
+                            SignalMsg::Error {
+                                code: err_code::INVALID_INPUT.into(),
+                                message: reason.into(),
+                            },
+                        );
+                        return;
+                    }
+                };
+                if allow_remote_assist.is_none()
+                    && allow_remote_control.is_none()
+                    && normalized_mac.is_none()
+                    && wol_enabled.is_none()
+                {
                     Self::send_nonblocking(
                         self_tx,
                         device_id,
                         SignalMsg::Error {
                             code: err_code::INVALID_PAYLOAD.into(),
-                            message:
-                                "at least one of allow_remote_assist or allow_remote_control is required"
-                                    .into(),
+                            message: "at least one of allow_remote_assist, allow_remote_control, mac_addr, or wol_enabled is required"
+                                .into(),
                         },
                     );
                     return;
@@ -2722,6 +3186,53 @@ impl SignalHub {
                         }
                     }
 
+                    let mut refreshed_wol_capable: Option<bool> = None;
+                    if normalized_mac.is_some() || wol_enabled.is_some() {
+                        match self
+                            .device_store
+                            .update_device_wol_state(
+                                device_id,
+                                owner,
+                                normalized_mac.as_deref(),
+                                wol_enabled,
+                                None,
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(true) => {
+                                if let Ok(Some(rec)) = self.device_store.get_by_id(device_id).await
+                                {
+                                    refreshed_wol_capable = Some(rec.wol_capable());
+                                }
+                            }
+                            Ok(false) => {
+                                warn!(%device_id, "UpdateAssistState WoL update affected 0 rows");
+                                Self::send_nonblocking(
+                                    self_tx,
+                                    device_id,
+                                    SignalMsg::Error {
+                                        code: err_code::UPDATE_FAILED.into(),
+                                        message: "failed to update Wake-on-LAN state".into(),
+                                    },
+                                );
+                                return;
+                            }
+                            Err(err) => {
+                                warn!(%device_id, error = %err, "failed to persist Wake-on-LAN state");
+                                Self::send_nonblocking(
+                                    self_tx,
+                                    device_id,
+                                    SignalMsg::Error {
+                                        code: err_code::INTERNAL_ERROR.into(),
+                                        message: "failed to persist Wake-on-LAN state".into(),
+                                    },
+                                );
+                                return;
+                            }
+                        }
+                    }
+
                     self.peers.get_mut(device_id).and_then(|mut peer| {
                         if peer.conn_id == conn_id {
                             if let Some(allow_assist) = allow_remote_assist {
@@ -2729,6 +3240,9 @@ impl SignalHub {
                             }
                             if let Some(allow_rc) = allow_remote_control {
                                 peer.allow_remote_control = allow_rc;
+                            }
+                            if let Some(wol_cap) = refreshed_wol_capable {
+                                peer.wol_capable = wol_cap;
                             }
                             Some((
                                 peer.owner_user_id,
@@ -2739,6 +3253,7 @@ impl SignalHub {
                                 peer.arch.clone(),
                                 peer.allow_remote_assist,
                                 peer.allow_remote_control,
+                                peer.wol_capable,
                             ))
                         } else {
                             None
@@ -2755,6 +3270,7 @@ impl SignalHub {
                     arch,
                     effective_assist,
                     effective_remote_control,
+                    effective_wol_capable,
                 )) = updated_peer
                 {
                     self.broadcast_user_device_status(DeviceStatusBroadcast {
@@ -2768,6 +3284,7 @@ impl SignalHub {
                         arch: &arch,
                         allow_remote_assist: effective_assist,
                         allow_remote_control: effective_remote_control,
+                        wol_capable: effective_wol_capable,
                     });
                 }
             }
@@ -3257,6 +3774,21 @@ impl SignalHub {
                 }
             }
 
+            SignalMsg::WolRequest {
+                request_id,
+                target_device_id,
+            } => {
+                self.handle_wol_request(
+                    device_id,
+                    conn_id,
+                    cancel,
+                    self_tx,
+                    request_id,
+                    target_device_id,
+                )
+                .await;
+            }
+
             SignalMsg::Register { .. } => {
                 Self::send_nonblocking(
                     self_tx,
@@ -3279,6 +3811,318 @@ impl SignalHub {
                 );
             }
         }
+    }
+
+    async fn handle_wol_request(
+        &self,
+        device_id: &str,
+        conn_id: u64,
+        cancel: &PeerCancel,
+        self_tx: &mpsc::Sender<SignalMsg>,
+        request_id: Option<String>,
+        target_device_id: String,
+    ) {
+        let target_norm = normalize_device_id(&target_device_id);
+        let caller_request_id = match request_id {
+            Some(rid) if !rid.is_empty() => {
+                if let Err(reason) = validate_ascii_token(&rid, MAX_SESSION_ID_LEN, "request_id") {
+                    Self::send_nonblocking(
+                        self_tx,
+                        device_id,
+                        SignalMsg::WolAck {
+                            request_id: None,
+                            target_device_id: target_norm,
+                            ok: false,
+                            method: WOL_METHOD_NONE.into(),
+                            code: Some(err_code::INVALID_INPUT.into()),
+                            message: reason,
+                        },
+                    );
+                    return;
+                }
+                Some(rid)
+            }
+            _ => None,
+        };
+
+        let send_err = |code: &'static str, message: String| {
+            Self::send_nonblocking(
+                self_tx,
+                device_id,
+                SignalMsg::WolAck {
+                    request_id: caller_request_id.clone(),
+                    target_device_id: target_norm.clone(),
+                    ok: false,
+                    method: WOL_METHOD_NONE.into(),
+                    code: Some(code.into()),
+                    message,
+                },
+            );
+        };
+
+        if !is_valid_device_id(&target_norm) {
+            send_err(err_code::INVALID_INPUT, "invalid target_device_id".into());
+            return;
+        }
+
+        // Security gate 1: Caller must be authenticated with an active owner session.
+        let caller_uid = match self
+            .peers
+            .get(device_id)
+            .filter(|p| p.conn_id == conn_id)
+            .and_then(|p| p.owner_user_id)
+        {
+            Some(uid) => uid,
+            None => {
+                send_err(
+                    err_code::UNAUTHORIZED,
+                    "authentication required for wake-on-lan".into(),
+                );
+                return;
+            }
+        };
+
+        // Security gate 1b: Bounded per-caller rate limit BEFORE any DB/ephemeral lookups
+        // to prevent device ID enumeration and DB read amplification.
+        if !check_sliding_window_rate_limit(
+            &self.wol_caller_rate_limits,
+            device_id.to_string(),
+            self.config.wol_caller_rate_limit_max,
+            self.config.wol_caller_rate_limit_window,
+        ) {
+            send_err(
+                err_code::RATE_LIMITED,
+                "too many wake-on-lan requests from this caller".into(),
+            );
+            return;
+        }
+
+        match self.device_store.get_by_id(device_id).await {
+            Ok(Some(rec)) => {
+                if rec.disabled {
+                    send_err(
+                        err_code::DEVICE_DISABLED,
+                        "caller device is disabled".into(),
+                    );
+                    return;
+                }
+                if rec.owner_user_id != Some(caller_uid) {
+                    send_err(
+                        err_code::UNAUTHORIZED,
+                        "caller device ownership changed".into(),
+                    );
+                    return;
+                }
+            }
+            Ok(None) => {
+                send_err(
+                    err_code::UNAUTHORIZED,
+                    "caller device is not registered".into(),
+                );
+                return;
+            }
+            Err(err) => {
+                warn!(caller = %device_id, error = %err, "failed to verify caller device for WoL");
+                send_err(
+                    err_code::INTERNAL_ERROR,
+                    "failed to verify caller device".into(),
+                );
+                return;
+            }
+        }
+
+        if !self
+            .refresh_online_under_lock(device_id, conn_id, cancel, None)
+            .await
+        {
+            return;
+        }
+
+        // Security gate 2: Target must exist, belong to the exact same owner account, and not be disabled.
+        let target_rec = match self.device_store.get_by_id(&target_norm).await {
+            Ok(Some(rec)) => rec,
+            Ok(None) => {
+                send_err(err_code::DEVICE_NOT_FOUND, "target device not found".into());
+                return;
+            }
+            Err(err) => {
+                warn!(target = %target_norm, error = %err, "failed to load target device for WoL");
+                send_err(
+                    err_code::INTERNAL_ERROR,
+                    "failed to load target device".into(),
+                );
+                return;
+            }
+        };
+
+        if target_rec.owner_user_id != Some(caller_uid) {
+            send_err(
+                err_code::FORBIDDEN,
+                "target device is not owned by the authenticated user".into(),
+            );
+            return;
+        }
+        if target_rec.disabled {
+            send_err(
+                err_code::DEVICE_DISABLED,
+                "target device is disabled".into(),
+            );
+            return;
+        }
+
+        // Security gate 3: Bounded per-target rate limit (1 request per 5 seconds).
+        if !check_sliding_window_rate_limit(
+            &self.wol_rate_limits,
+            target_norm.clone(),
+            1,
+            self.config.wol_rate_limit_window,
+        ) {
+            send_err(
+                err_code::RATE_LIMITED,
+                "too many wake-on-lan requests for this target device".into(),
+            );
+            return;
+        }
+
+        // Security gate 4: Target must have WoL enabled with a valid unicast MAC address.
+        let valid_mac = if target_rec.wol_enabled {
+            target_rec.mac_addr.as_deref().and_then(normalize_mac_addr)
+        } else {
+            None
+        };
+        let Some(mac_addr) = valid_mac else {
+            send_err(
+                err_code::WOL_DISABLED,
+                "wake-on-lan is disabled or no valid MAC address is configured for target device"
+                    .into(),
+            );
+            return;
+        };
+
+        if !self.is_active_conn(device_id, conn_id, cancel) {
+            return;
+        }
+
+        // Route 1: Target device is already online.
+        if self.peers.contains_key(&target_norm) {
+            Self::send_nonblocking(
+                self_tx,
+                device_id,
+                SignalMsg::WolAck {
+                    request_id: caller_request_id,
+                    target_device_id: target_norm,
+                    ok: true,
+                    method: WOL_METHOD_ALREADY_ONLINE.into(),
+                    code: None,
+                    message: "target device is already online".into(),
+                },
+            );
+            return;
+        }
+
+        // Route 2: Relay via another currently online peer under the same account on the same LAN.
+        let mut candidates: Vec<(u8, String, mpsc::Sender<SignalMsg>)> = self
+            .peers
+            .iter()
+            .filter(|entry| {
+                let peer_id = entry.key().as_str();
+                peer_id != target_norm
+                    && peer_id != device_id
+                    && entry.value().owner_user_id == Some(caller_uid)
+            })
+            .filter_map(|entry| {
+                let peer = entry.value();
+                let score = score_wol_relay_candidate(
+                    &target_rec.last_public_ip,
+                    &target_rec.last_lan_addrs,
+                    peer.remote_addr.ip(),
+                    &peer.lan_addrs,
+                );
+                if score > 0 {
+                    Some((score, entry.key().clone(), peer.tx.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+        let relay_request_id = caller_request_id.clone().unwrap_or_else(|| random_hex(12));
+        let relay_msg = SignalMsg::WolRelay {
+            request_id: relay_request_id,
+            target_device_id: target_norm.clone(),
+            mac_addr: mac_addr.clone(),
+            target_lan_addrs: target_rec.last_lan_addrs.clone(),
+        };
+
+        for (_, peer_id, peer_tx) in candidates {
+            if Self::try_enqueue_checked(&peer_tx, &peer_id, relay_msg.clone()).is_ok() {
+                info!(
+                    caller = %device_id,
+                    target = %target_norm,
+                    relay_peer = %peer_id,
+                    "relayed Wake-on-LAN request via same-account LAN peer"
+                );
+                Self::send_nonblocking(
+                    self_tx,
+                    device_id,
+                    SignalMsg::WolAck {
+                        request_id: caller_request_id,
+                        target_device_id: target_norm,
+                        ok: true,
+                        method: WOL_METHOD_LAN_PEER.into(),
+                        code: None,
+                        message: "wake-on-lan magic packet relayed via same-LAN peer".into(),
+                    },
+                );
+                return;
+            }
+        }
+
+        // Route 3: Direct UDP broadcast from server when explicitly enabled via ALLOW_SERVER_WOL=true.
+        if self.config.allow_server_wol {
+            match send_server_wol_magic_packet(&mac_addr, &target_rec.last_lan_addrs).await {
+                Ok(()) => {
+                    info!(
+                        caller = %device_id,
+                        target = %target_norm,
+                        "broadcast Wake-on-LAN magic packet directly from server"
+                    );
+                    Self::send_nonblocking(
+                        self_tx,
+                        device_id,
+                        SignalMsg::WolAck {
+                            request_id: caller_request_id,
+                            target_device_id: target_norm,
+                            ok: true,
+                            method: WOL_METHOD_SERVER.into(),
+                            code: None,
+                            message: "wake-on-lan magic packet broadcast by server".into(),
+                        },
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        caller = %device_id,
+                        target = %target_norm,
+                        error = %err,
+                        "server Wake-on-LAN UDP broadcast failed"
+                    );
+                    send_err(
+                        err_code::WOL_SEND_FAILED,
+                        format!("failed to send wake-on-lan magic packet: {err}"),
+                    );
+                }
+            }
+            return;
+        }
+
+        // Route 4: No relay peer available and server-side WoL disabled.
+        send_err(
+            err_code::WOL_NO_RELAY_PEER,
+            "no online same-LAN peer available to relay wake-on-lan packet".into(),
+        );
     }
 
     fn try_enqueue_checked(
@@ -3377,6 +4221,8 @@ mod tests {
     fn tcp_framing_encode_decode_and_bounds() {
         let msg = SignalMsg::Heartbeat {
             lan_addrs: vec!["192.168.1.10:50000".into()],
+            mac_addr: None,
+            wol_enabled: None,
         };
         let frame = encode_signal_frame(&msg).expect("encode frame");
         let len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
@@ -3425,6 +4271,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -3497,9 +4345,16 @@ mod tests {
         // 1. Non-register first frame is rejected.
         {
             let mut bad = TcpStream::connect(tcp_addr).await.unwrap();
-            write_signal_frame(&mut bad, &SignalMsg::Heartbeat { lan_addrs: vec![] })
-                .await
-                .unwrap();
+            write_signal_frame(
+                &mut bad,
+                &SignalMsg::Heartbeat {
+                    lan_addrs: vec![],
+                    mac_addr: None,
+                    wol_enabled: None,
+                },
+            )
+            .await
+            .unwrap();
             let reply = read_signal_frame(&mut bad).await.unwrap().unwrap();
             assert!(matches!(
                 reply,
@@ -3524,6 +4379,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -3549,6 +4406,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -3575,6 +4434,8 @@ mod tests {
             &mut client,
             &SignalMsg::Heartbeat {
                 lan_addrs: vec!["192.168.1.20:50001".into()],
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -3736,6 +4597,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -3778,6 +4641,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -3809,6 +4674,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -3835,6 +4702,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -3873,7 +4742,11 @@ mod tests {
         // `HeartbeatAck` replies so both kernel TCP buffers and the bounded server channel fill.
         let _ = socket2::SockRef::from(&*stream).set_recv_buffer_size(4096);
         for _ in 0..2048 {
-            let msg = SignalMsg::Heartbeat { lan_addrs: vec![] };
+            let msg = SignalMsg::Heartbeat {
+                lan_addrs: vec![],
+                mac_addr: None,
+                wol_enabled: None,
+            };
             if write_signal_frame(stream, &msg).await.is_err() {
                 break;
             }
@@ -3916,6 +4789,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -3947,6 +4822,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -3971,6 +4848,8 @@ mod tests {
             &mut stalled,
             &SignalMsg::Heartbeat {
                 lan_addrs: vec!["10.99.99.99:9999".into()],
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await;
@@ -4005,6 +4884,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -4034,6 +4915,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -4048,6 +4931,8 @@ mod tests {
             &mut old_conn,
             &SignalMsg::Heartbeat {
                 lan_addrs: vec!["10.99.99.99:9999".into()],
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await;
@@ -4105,6 +4990,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -4143,6 +5030,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "grp-a".into(),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -4154,6 +5042,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "grp-b".into(),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -4183,6 +5072,8 @@ mod tests {
                     device_pubkey: None,
                     allow_remote_assist: None,
                     allow_remote_control: None,
+                    mac_addr: None,
+                    wol_enabled: None,
                 },
             )
             .await
@@ -4211,6 +5102,8 @@ mod tests {
                     device_pubkey: None,
                     allow_remote_assist: None,
                     allow_remote_control: None,
+                    mac_addr: None,
+                    wol_enabled: None,
                 },
             )
             .await
@@ -4239,6 +5132,8 @@ mod tests {
                     device_pubkey: None,
                     allow_remote_assist: None,
                     allow_remote_control: None,
+                    mac_addr: None,
+                    wol_enabled: None,
                 },
             )
             .await
@@ -4379,6 +5274,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "".into(),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -4402,6 +5298,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -4454,6 +5352,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -4468,6 +5368,8 @@ mod tests {
             &mut conn2,
             &SignalMsg::Heartbeat {
                 lan_addrs: vec!["10.0.0.5:5000".into()],
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -4522,6 +5424,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -4573,6 +5477,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -4849,6 +5755,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
             SignalMsg::Register {
                 device_id: None,
@@ -4863,6 +5771,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
             SignalMsg::Register {
                 device_id: None,
@@ -4877,6 +5787,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
         ] {
             let mut s = TcpStream::connect(tcp_addr).await.unwrap();
@@ -4950,9 +5862,16 @@ mod tests {
         }
 
         // Victim must remain connected and receive a normal HeartbeatAck!
-        write_signal_frame(&mut victim, &SignalMsg::Heartbeat { lan_addrs: vec![] })
-            .await
-            .unwrap();
+        write_signal_frame(
+            &mut victim,
+            &SignalMsg::Heartbeat {
+                lan_addrs: vec![],
+                mac_addr: None,
+                wol_enabled: None,
+            },
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(2), read_signal_frame(&mut victim))
                 .await
@@ -5142,7 +6061,11 @@ mod tests {
             // (receiver kept alive and never drained) to deterministically trigger TrySendError::Full.
             let (full_tx, _hold_rx) = mpsc::channel::<SignalMsg>(1);
             full_tx
-                .try_send(SignalMsg::Heartbeat { lan_addrs: vec![] })
+                .try_send(SignalMsg::Heartbeat {
+                    lan_addrs: vec![],
+                    mac_addr: None,
+                    wol_enabled: None,
+                })
                 .unwrap();
             let full_host_id = "888777666".to_string();
             hub.peers.insert(
@@ -5158,6 +6081,7 @@ mod tests {
                     device_pubkey: String::new(),
                     allow_remote_assist: false,
                     allow_remote_control: true,
+                    wol_capable: false,
                     hostname: String::new(),
                     alias: String::new(),
                     os: String::new(),
@@ -5281,6 +6205,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -5327,6 +6253,7 @@ mod tests {
                 app_version: String::new(),
                 arch: String::new(),
                 device_group: "".into(),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -5356,6 +6283,8 @@ mod tests {
                         device_pubkey: None,
                         allow_remote_assist: None,
                         allow_remote_control: None,
+                        mac_addr: None,
+                        wol_enabled: None,
                     },
                 )
                 .await;
@@ -5410,6 +6339,8 @@ mod tests {
                         device_pubkey: None,
                         allow_remote_assist: None,
                         allow_remote_control: None,
+                        mac_addr: None,
+                        wol_enabled: None,
                     },
                 )
                 .await;
@@ -5601,6 +6532,8 @@ mod tests {
             SignalMsg::UpdateAssistState {
                 allow_remote_assist: Some(true),
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             }
         );
 
@@ -5611,6 +6544,8 @@ mod tests {
             SignalMsg::UpdateAssistState {
                 allow_remote_assist: None,
                 allow_remote_control: Some(false),
+                mac_addr: None,
+                wol_enabled: None,
             }
         );
 
@@ -5622,6 +6557,8 @@ mod tests {
             SignalMsg::UpdateAssistState {
                 allow_remote_assist: Some(false),
                 allow_remote_control: Some(true),
+                mac_addr: None,
+                wol_enabled: None,
             }
         );
 
@@ -5673,6 +6610,8 @@ mod tests {
                 device_pubkey: None,
                 allow_remote_assist: Some(true),
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -5734,6 +6673,7 @@ mod tests {
                 device_pubkey: String::new(),
                 allow_remote_assist: true,
                 allow_remote_control: false,
+                wol_capable: false,
                 hostname: "synth".into(),
                 alias: String::new(),
                 os: "android".into(),
@@ -5765,6 +6705,8 @@ mod tests {
             &SignalMsg::UpdateAssistState {
                 allow_remote_assist: None,
                 allow_remote_control: Some(true),
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -5784,6 +6726,8 @@ mod tests {
             &SignalMsg::UpdateAssistState {
                 allow_remote_assist: None,
                 allow_remote_control: Some(false),
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -5802,6 +6746,8 @@ mod tests {
             &SignalMsg::UpdateAssistState {
                 allow_remote_assist: None,
                 allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
             },
         )
         .await
@@ -5829,12 +6775,15 @@ mod tests {
             (err_code::ASSIST_DISABLED, "assist_disabled"),
             (err_code::DEVICE_DISABLED, "device_disabled"),
             (err_code::DEVICE_ID_MISMATCH, "device_id_mismatch"),
+            (err_code::DEVICE_NOT_FOUND, "device_not_found"),
             (err_code::DEVICE_UNBOUND, "device_unbound"),
             (err_code::EXPECTED_REGISTER, "expected_register"),
+            (err_code::FORBIDDEN, "forbidden"),
             (err_code::FRAME_TOO_LARGE, "frame_too_large"),
             (err_code::HANDSHAKE_TIMEOUT, "handshake_timeout"),
             (err_code::INTERNAL_ERROR, "internal_error"),
             (err_code::INVALID_FRAME, "invalid_frame"),
+            (err_code::INVALID_INPUT, "invalid_input"),
             (err_code::INVALID_PAYLOAD, "invalid_payload"),
             (
                 err_code::PASSWORD_CHANGE_REQUIRED,
@@ -5861,6 +6810,9 @@ mod tests {
             (err_code::UNAUTHORIZED, "unauthorized"),
             (err_code::UNEXPECTED_MESSAGE, "unexpected_message"),
             (err_code::UPDATE_FAILED, "update_failed"),
+            (err_code::WOL_DISABLED, "wol_disabled"),
+            (err_code::WOL_NO_RELAY_PEER, "wol_no_relay_peer"),
+            (err_code::WOL_SEND_FAILED, "wol_send_failed"),
         ];
 
         for &(constant, expected_wire) in emitted {
@@ -5896,5 +6848,1019 @@ mod tests {
         .unwrap();
         assert_eq!(kicked_json["type"], "kicked");
         assert_eq!(kicked_json["reason"], "replaced_by_new_connection");
+    }
+
+    #[test]
+    fn wol_magic_packet_102b_format_and_broadcast_targets() {
+        let pkt = build_wol_magic_packet("AA-BB-CC-DD-EE-FF").expect("valid unicast MAC");
+        assert_eq!(pkt.len(), 102);
+        assert_eq!(&pkt[0..6], &[0xFF; 6]);
+        let expected_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        for i in 0..16 {
+            let start = 6 + i * 6;
+            assert_eq!(&pkt[start..start + 6], &expected_mac);
+        }
+
+        assert!(build_wol_magic_packet("00:00:00:00:00:00").is_none());
+        assert!(build_wol_magic_packet("ff:ff:ff:ff:ff:ff").is_none());
+        assert!(build_wol_magic_packet("01:00:5e:00:00:01").is_none());
+        assert!(build_wol_magic_packet("not-a-mac").is_none());
+
+        let targets = wol_broadcast_targets(&[
+            "192.168.1.20:50000".into(),
+            "192.168.1.44:50001".into(),
+            "10.20.30.40".into(),
+            "8.8.8.8:50000".into(),
+            "127.0.0.1:50000".into(),
+        ]);
+        assert_eq!(
+            targets,
+            vec![
+                "192.168.1.255:9".parse().unwrap(),
+                "10.20.30.255:9".parse().unwrap(),
+                "255.255.255.255:9".parse().unwrap(),
+            ]
+        );
+
+        assert!(share_private_ipv4_slash24(
+            &["192.168.50.10:50000".into()],
+            &["192.168.50.99:40000".into()]
+        ));
+        assert!(!share_private_ipv4_slash24(
+            &["192.168.50.10:50000".into()],
+            &["192.168.51.10:50000".into()]
+        ));
+        assert!(!share_private_ipv4_slash24(
+            &["8.8.8.1:50000".into()],
+            &["8.8.8.2:50000".into()]
+        ));
+
+        // Legacy client frames without WoL fields deserialize cleanly.
+        let legacy_reg: SignalMsg = serde_json::from_str(
+            r#"{"type":"register","device_key":"dk-legacy","hostname":"old-host","os":"macos"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy_reg,
+            SignalMsg::Register {
+                mac_addr: None,
+                wol_enabled: None,
+                ..
+            }
+        ));
+        let legacy_hb: SignalMsg =
+            serde_json::from_str(r#"{"type":"heartbeat","lan_addrs":["192.168.1.2:50000"]}"#)
+                .unwrap();
+        assert!(matches!(
+            legacy_hb,
+            SignalMsg::Heartbeat {
+                mac_addr: None,
+                wol_enabled: None,
+                ..
+            }
+        ));
+
+        // DeviceStatusChanged includes wol_capable and never exposes mac_addr.
+        let status_json = serde_json::to_string(&SignalMsg::DeviceStatusChanged {
+            device_id: "123456789".into(),
+            online: true,
+            hostname: "host".into(),
+            alias: String::new(),
+            os: "macos".into(),
+            app_version: String::new(),
+            arch: String::new(),
+            allow_remote_assist: false,
+            allow_remote_control: true,
+            wol_capable: true,
+        })
+        .unwrap();
+        assert!(status_json.contains("\"wol_capable\":true"));
+        assert!(!status_json.contains("mac_addr"));
+    }
+
+    async fn create_test_authed_user(
+        store: &Arc<MemoryDeviceStore>,
+        auth_authority: &Arc<AuthAuthority>,
+        email: &str,
+    ) -> (Uuid, String) {
+        use crate::auth::ACCESS_TOKEN_TTL;
+        use crate::store::{CreateSessionInput, CreateUserInput, UserStore, ROLE_USER};
+
+        let user = store
+            .create_user(CreateUserInput {
+                email: email.into(),
+                display_name: email.into(),
+                password_hash: "hash".into(),
+                role: ROLE_USER.into(),
+                status: STATUS_ACTIVE.into(),
+                must_change_password: false,
+            })
+            .await
+            .unwrap();
+        let sess = store
+            .create_user_session(CreateSessionInput {
+                user_id: user.id,
+                device_id: None,
+                family_id: None,
+                token_hash: format!("{:064x}", user.id.as_u128()),
+                expires_at: Utc::now() + chrono::Duration::hours(24),
+                client_info: "test".into(),
+            })
+            .await
+            .unwrap();
+        let token = auth_authority
+            .issue_access_token_for_user(&user, sess.id, None, ACCESS_TOKEN_TTL)
+            .unwrap();
+        (user.id, token)
+    }
+
+    #[tokio::test]
+    async fn wol_signaling_auth_cross_account_disabled_online_and_rate_limit() {
+        let store = Arc::new(MemoryDeviceStore::new());
+        let ephemeral = Arc::new(MemoryEphemeralStore::new());
+        let auth_authority = Arc::new(AuthAuthority::load_or_create(store.as_ref()).await.unwrap());
+
+        let (_alice_id, alice_token) =
+            create_test_authed_user(&store, &auth_authority, "alice-wol@example.com").await;
+        let (_bob_id, bob_token) =
+            create_test_authed_user(&store, &auth_authority, "bob-wol@example.com").await;
+
+        // First verify unauthenticated peer (require_auth=false) is strictly rejected with unauthorized.
+        let anon_cfg = SignalConfig {
+            require_auth: false,
+            ..SignalConfig::default()
+        };
+        let anon_hub = Arc::new(SignalHub::with_auth(
+            store.clone(),
+            ephemeral.clone(),
+            auth_authority.clone(),
+            anon_cfg,
+        ));
+        let anon_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let anon_addr = anon_listener.local_addr().unwrap();
+        let anon_task = tokio::spawn(
+            anon_hub
+                .clone()
+                .serve_tcp_signaling_on_listener(anon_listener),
+        );
+
+        let mut anon_stream = TcpStream::connect(anon_addr).await.unwrap();
+        write_signal_frame(
+            &mut anon_stream,
+            &SignalMsg::Register {
+                device_id: None,
+                device_key: "dk-anon-wol".into(),
+                hostname: "anon".into(),
+                os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
+                device_group: String::new(),
+                lan_addrs: vec![],
+                access_token: None,
+                device_pubkey: None,
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut anon_stream).await.unwrap().unwrap(),
+            SignalMsg::Registered { .. }
+        ));
+        write_signal_frame(
+            &mut anon_stream,
+            &SignalMsg::WolRequest {
+                request_id: Some("unauth-1".into()),
+                target_device_id: "123456789".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut anon_stream).await.unwrap().unwrap(),
+            SignalMsg::WolAck {
+                request_id: Some(ref rid),
+                ok: false,
+                ref method,
+                code: Some(ref c),
+                ..
+            } if rid == "unauth-1" && method == WOL_METHOD_NONE && c == err_code::UNAUTHORIZED
+        ));
+        drop(anon_stream);
+        anon_hub.shutdown_all().await;
+        let _ = anon_task.await;
+
+        // Authenticated hub for cross-account, wol_disabled, already_online, and 5s rate limit.
+        assert_eq!(
+            SignalConfig::default().wol_rate_limit_window,
+            Duration::from_secs(5)
+        );
+        let hub = Arc::new(SignalHub::with_auth(
+            store.clone(),
+            ephemeral.clone(),
+            auth_authority.clone(),
+            SignalConfig::default(),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(hub.clone().serve_tcp_signaling_on_listener(listener));
+
+        let mut alice_caller = TcpStream::connect(addr).await.unwrap();
+        write_signal_frame(
+            &mut alice_caller,
+            &SignalMsg::Register {
+                device_id: None,
+                device_key: "dk-alice-caller".into(),
+                hostname: "alice-laptop".into(),
+                os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
+                device_group: String::new(),
+                lan_addrs: vec!["192.168.1.10:50000".into()],
+                access_token: Some(alice_token.clone()),
+                device_pubkey: None,
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut alice_caller).await.unwrap().unwrap(),
+            SignalMsg::Registered { .. }
+        ));
+
+        let mut alice_target = TcpStream::connect(addr).await.unwrap();
+        write_signal_frame(
+            &mut alice_target,
+            &SignalMsg::Register {
+                device_id: None,
+                device_key: "dk-alice-target".into(),
+                hostname: "alice-studio".into(),
+                os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
+                device_group: String::new(),
+                lan_addrs: vec!["192.168.1.20:50000".into()],
+                access_token: Some(alice_token.clone()),
+                device_pubkey: None,
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: Some("AA-BB-CC-DD-EE-FF".into()),
+                wol_enabled: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+        let target_id = match read_signal_frame(&mut alice_target).await.unwrap().unwrap() {
+            SignalMsg::Registered { device_id, .. } => device_id,
+            other => panic!("expected Registered, got {other:?}"),
+        };
+        // Consume DeviceStatusChanged pushed to alice_caller (wol_capable=false)
+        assert!(matches!(
+            read_signal_frame(&mut alice_caller).await.unwrap().unwrap(),
+            SignalMsg::DeviceStatusChanged {
+                ref device_id,
+                wol_capable: false,
+                ..
+            } if device_id == &target_id
+        ));
+
+        let mut bob_caller = TcpStream::connect(addr).await.unwrap();
+        write_signal_frame(
+            &mut bob_caller,
+            &SignalMsg::Register {
+                device_id: None,
+                device_key: "dk-bob-caller".into(),
+                hostname: "bob-laptop".into(),
+                os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
+                device_group: String::new(),
+                lan_addrs: vec!["192.168.1.30:50000".into()],
+                access_token: Some(bob_token),
+                device_pubkey: None,
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut bob_caller).await.unwrap().unwrap(),
+            SignalMsg::Registered { .. }
+        ));
+
+        // 1. Cross-account attempt by Bob is rejected with forbidden (and does NOT consume Alice's rate limit).
+        write_signal_frame(
+            &mut bob_caller,
+            &SignalMsg::WolRequest {
+                request_id: Some("cross-1".into()),
+                target_device_id: target_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut bob_caller).await.unwrap().unwrap(),
+            SignalMsg::WolAck {
+                request_id: Some(ref rid),
+                ok: false,
+                ref method,
+                code: Some(ref c),
+                ..
+            } if rid == "cross-1" && method == WOL_METHOD_NONE && c == err_code::FORBIDDEN
+        ));
+
+        // 2. Non-existent target returns device_not_found; invalid ID returns invalid_input.
+        write_signal_frame(
+            &mut alice_caller,
+            &SignalMsg::WolRequest {
+                request_id: Some("missing-1".into()),
+                target_device_id: "999999999".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut alice_caller).await.unwrap().unwrap(),
+            SignalMsg::WolAck {
+                ok: false,
+                ref method,
+                code: Some(ref c),
+                ..
+            } if method == WOL_METHOD_NONE && c == err_code::DEVICE_NOT_FOUND
+        ));
+
+        write_signal_frame(
+            &mut alice_caller,
+            &SignalMsg::WolRequest {
+                request_id: Some("bad-id".into()),
+                target_device_id: "abc".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut alice_caller).await.unwrap().unwrap(),
+            SignalMsg::WolAck {
+                ok: false,
+                ref method,
+                code: Some(ref c),
+                ..
+            } if method == WOL_METHOD_NONE && c == err_code::INVALID_INPUT
+        ));
+
+        // 3. Target has wol_enabled = false -> returns wol_disabled.
+        write_signal_frame(
+            &mut alice_caller,
+            &SignalMsg::WolRequest {
+                request_id: Some("dis-1".into()),
+                target_device_id: target_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut alice_caller).await.unwrap().unwrap(),
+            SignalMsg::WolAck {
+                ok: false,
+                ref method,
+                code: Some(ref c),
+                ..
+            } if method == WOL_METHOD_NONE && c == err_code::WOL_DISABLED
+        ));
+
+        // 4. Enable WoL via UpdateAssistState -> broadcast wol_capable=true to alice_caller.
+        write_signal_frame(
+            &mut alice_target,
+            &SignalMsg::UpdateAssistState {
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut alice_caller).await.unwrap().unwrap(),
+            SignalMsg::DeviceStatusChanged {
+                ref device_id,
+                wol_capable: true,
+                ..
+            } if device_id == &target_id
+        ));
+
+        // 5. Immediate request within 5s window -> rate_limited!
+        write_signal_frame(
+            &mut alice_caller,
+            &SignalMsg::WolRequest {
+                request_id: Some("rl-1".into()),
+                target_device_id: target_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut alice_caller).await.unwrap().unwrap(),
+            SignalMsg::WolAck {
+                ok: false,
+                ref method,
+                code: Some(ref c),
+                ..
+            } if method == WOL_METHOD_NONE && c == err_code::RATE_LIMITED
+        ));
+
+        // Clear rate-limit bucket for target to deterministically verify already_online on same target.
+        hub.wol_rate_limits.remove(&target_id);
+
+        // 6. Target is online with wol_enabled = true -> returns already_online!
+        write_signal_frame(
+            &mut alice_caller,
+            &SignalMsg::WolRequest {
+                request_id: Some("online-1".into()),
+                target_device_id: target_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut alice_caller).await.unwrap().unwrap(),
+            SignalMsg::WolAck {
+                request_id: Some(ref rid),
+                ok: true,
+                ref method,
+                code: None,
+                ..
+            } if rid == "online-1" && method == WOL_METHOD_ALREADY_ONLINE
+        ));
+
+        drop(alice_caller);
+        drop(alice_target);
+        drop(bob_caller);
+        hub.shutdown_all().await;
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn wol_signaling_lan_peer_relay_and_no_relay_peer() {
+        let store = Arc::new(MemoryDeviceStore::new());
+        let ephemeral = Arc::new(MemoryEphemeralStore::new());
+        let auth_authority = Arc::new(AuthAuthority::load_or_create(store.as_ref()).await.unwrap());
+
+        let (alice_id, alice_token) =
+            create_test_authed_user(&store, &auth_authority, "alice-relay@example.com").await;
+        let (_bob_id, bob_token) =
+            create_test_authed_user(&store, &auth_authority, "bob-relay@example.com").await;
+
+        let hub = Arc::new(SignalHub::with_auth(
+            store.clone(),
+            ephemeral.clone(),
+            auth_authority.clone(),
+            SignalConfig::default(), // allow_server_wol = false
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(hub.clone().serve_tcp_signaling_on_listener(listener));
+
+        // Create two offline target devices owned by Alice with distinct WAN IPs & private /24 LANs.
+        let target_no_peer = store
+            .register_or_get(RegisterInput {
+                device_key: "dk-wol-offline-1".into(),
+                hostname: "home-box-1".into(),
+                os: "macos".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .bind_device_to_user(&target_no_peer.device_id, alice_id, None, None)
+            .await
+            .unwrap();
+        store
+            .update_device_wol_state(
+                &target_no_peer.device_id,
+                Some(alice_id),
+                Some("02:11:22:33:44:55"),
+                Some(true),
+                Some(&["192.168.50.20:50000".into()]),
+                Some("203.0.113.50"),
+            )
+            .await
+            .unwrap();
+
+        let target_with_peer = store
+            .register_or_get(RegisterInput {
+                device_key: "dk-wol-offline-2".into(),
+                hostname: "home-box-2".into(),
+                os: "macos".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .bind_device_to_user(&target_with_peer.device_id, alice_id, None, None)
+            .await
+            .unwrap();
+        store
+            .update_device_wol_state(
+                &target_with_peer.device_id,
+                Some(alice_id),
+                Some("AA-BB-CC-DD-EE-FF"),
+                Some(true),
+                Some(&["192.168.60.20:50000".into()]),
+                Some("203.0.113.60"),
+            )
+            .await
+            .unwrap();
+
+        // Connect Alice's caller (remote WAN/different subnet).
+        let mut alice_caller = TcpStream::connect(addr).await.unwrap();
+        write_signal_frame(
+            &mut alice_caller,
+            &SignalMsg::Register {
+                device_id: None,
+                device_key: "dk-alice-mobile".into(),
+                hostname: "alice-phone".into(),
+                os: "ios".into(),
+                app_version: String::new(),
+                arch: String::new(),
+                device_group: String::new(),
+                lan_addrs: vec!["10.99.0.5:50000".into()],
+                access_token: Some(alice_token.clone()),
+                device_pubkey: None,
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut alice_caller).await.unwrap().unwrap(),
+            SignalMsg::Registered { .. }
+        ));
+
+        // Connect Bob's peer on 192.168.50.0/24 (different account -> MUST NOT be chosen!).
+        let mut bob_peer = TcpStream::connect(addr).await.unwrap();
+        write_signal_frame(
+            &mut bob_peer,
+            &SignalMsg::Register {
+                device_id: None,
+                device_key: "dk-bob-lan".into(),
+                hostname: "bob-mini".into(),
+                os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
+                device_group: String::new(),
+                lan_addrs: vec!["192.168.50.99:50000".into()],
+                access_token: Some(bob_token),
+                device_pubkey: None,
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut bob_peer).await.unwrap().unwrap(),
+            SignalMsg::Registered { .. }
+        ));
+
+        // Connect Alice's helper peer on 192.168.60.0/24 (matches target_with_peer, NOT target_no_peer).
+        let mut alice_helper = TcpStream::connect(addr).await.unwrap();
+        write_signal_frame(
+            &mut alice_helper,
+            &SignalMsg::Register {
+                device_id: None,
+                device_key: "dk-alice-helper".into(),
+                hostname: "alice-mini".into(),
+                os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
+                device_group: String::new(),
+                lan_addrs: vec!["192.168.60.88:50000".into()],
+                access_token: Some(alice_token),
+                device_pubkey: None,
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut alice_helper).await.unwrap().unwrap(),
+            SignalMsg::Registered { .. }
+        ));
+        // Drain DeviceStatusChanged sent to alice_caller when alice_helper joined.
+        assert!(matches!(
+            read_signal_frame(&mut alice_caller).await.unwrap().unwrap(),
+            SignalMsg::DeviceStatusChanged { .. }
+        ));
+
+        // Case 1: target_no_peer has no eligible same-account LAN peer -> wol_no_relay_peer!
+        write_signal_frame(
+            &mut alice_caller,
+            &SignalMsg::WolRequest {
+                request_id: Some("nopeer-1".into()),
+                target_device_id: target_no_peer.device_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut alice_caller).await.unwrap().unwrap(),
+            SignalMsg::WolAck {
+                request_id: Some(ref rid),
+                ok: false,
+                ref method,
+                code: Some(ref c),
+                ..
+            } if rid == "nopeer-1" && method == WOL_METHOD_NONE && c == err_code::WOL_NO_RELAY_PEER
+        ));
+
+        // Case 2: target_with_peer matches alice_helper on 192.168.60.0/24 -> WolRelay + WolAck(lan_peer)!
+        write_signal_frame(
+            &mut alice_caller,
+            &SignalMsg::WolRequest {
+                request_id: Some("relay-42".into()),
+                target_device_id: target_with_peer.device_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut alice_caller).await.unwrap().unwrap(),
+            SignalMsg::WolAck {
+                request_id: Some(ref rid),
+                ref target_device_id,
+                ok: true,
+                ref method,
+                code: None,
+                ..
+            } if rid == "relay-42"
+                && target_device_id == &target_with_peer.device_id
+                && method == WOL_METHOD_LAN_PEER
+        ));
+        assert!(matches!(
+            read_signal_frame(&mut alice_helper).await.unwrap().unwrap(),
+            SignalMsg::WolRelay {
+                ref request_id,
+                ref target_device_id,
+                ref mac_addr,
+                ref target_lan_addrs,
+            } if request_id == "relay-42"
+                && target_device_id == &target_with_peer.device_id
+                && mac_addr == "aa:bb:cc:dd:ee:ff"
+                && target_lan_addrs == &vec!["192.168.60.20:50000".to_string()]
+        ));
+
+        drop(alice_caller);
+        drop(alice_helper);
+        drop(bob_peer);
+        hub.shutdown_all().await;
+        let _ = server_task.await;
+    }
+
+    #[test]
+    fn wol_relay_scoring_rejects_cross_site_public_ip_overlap_and_prioritizes_same_public_ip() {
+        let home_pub = "203.0.113.10";
+        let home_lan = vec!["192.168.1.20:50000".to_string()];
+
+        // 1. Different routable public IP (office) with identical 192.168.1.0/24 MUST be rejected (score = 0)!
+        assert_eq!(
+            score_wol_relay_candidate(
+                home_pub,
+                &home_lan,
+                "198.51.100.77".parse().unwrap(),
+                &["192.168.1.35:50000".into()],
+            ),
+            0,
+            "cross-site peer with different public IP must never match on RFC1918 /24 overlap"
+        );
+
+        // 2. Same public IP AND same /24 -> highest priority (3).
+        let score_both = score_wol_relay_candidate(
+            home_pub,
+            &home_lan,
+            "203.0.113.10".parse().unwrap(),
+            &["192.168.1.50:50000".into()],
+        );
+        // 3. Same public IP without /24 match -> priority 2 (strictly beats pure /24 fallback).
+        let score_pub_only = score_wol_relay_candidate(
+            home_pub,
+            &home_lan,
+            "203.0.113.10".parse().unwrap(),
+            &["10.0.0.5:50000".into()],
+        );
+        // 4. Pure /24 fallback when either side is private/loopback or last_public_ip is empty -> priority 1.
+        let score_lan_fallback_loopback = score_wol_relay_candidate(
+            home_pub,
+            &home_lan,
+            "127.0.0.1".parse().unwrap(),
+            &["192.168.1.99:50000".into()],
+        );
+        let score_lan_fallback_empty_pub = score_wol_relay_candidate(
+            "",
+            &home_lan,
+            "198.51.100.77".parse().unwrap(),
+            &["192.168.1.99:50000".into()],
+        );
+        let score_lan_fallback_private_server = score_wol_relay_candidate(
+            "192.168.1.20",
+            &home_lan,
+            "192.168.1.50".parse().unwrap(),
+            &["192.168.1.50:50000".into()],
+        );
+
+        assert_eq!(score_both, 3);
+        assert_eq!(score_pub_only, 2);
+        assert_eq!(score_lan_fallback_loopback, 1);
+        assert_eq!(score_lan_fallback_empty_pub, 1);
+        assert_eq!(score_lan_fallback_private_server, 1);
+        assert!(score_both > score_pub_only);
+        assert!(score_pub_only > score_lan_fallback_loopback);
+    }
+
+    #[tokio::test]
+    async fn wol_regressions_anon_heartbeat_protection_caller_rate_limit_and_empty_mac_update() {
+        let store = Arc::new(MemoryDeviceStore::new());
+        let ephemeral = Arc::new(MemoryEphemeralStore::new());
+        let auth_authority = Arc::new(AuthAuthority::load_or_create(store.as_ref()).await.unwrap());
+
+        let (alice_id, alice_token) =
+            create_test_authed_user(&store, &auth_authority, "alice-reg@example.com").await;
+
+        // 1. Bound device with WoL state must NEVER be polluted by unauthenticated Heartbeat (require_auth=false).
+        let bound_dev = store
+            .register_or_get(RegisterInput {
+                device_key: "dk-bound-victim".into(),
+                hostname: "victim".into(),
+                os: "macos".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .bind_device_to_user(&bound_dev.device_id, alice_id, None, None)
+            .await
+            .unwrap();
+        store
+            .update_device_wol_state(
+                &bound_dev.device_id,
+                Some(alice_id),
+                Some("aa:bb:cc:dd:ee:ff"),
+                Some(true),
+                Some(&["192.168.88.10:50000".into()]),
+                Some("203.0.113.88"),
+            )
+            .await
+            .unwrap();
+
+        let anon_hub = Arc::new(SignalHub::with_auth(
+            store.clone(),
+            ephemeral.clone(),
+            auth_authority.clone(),
+            SignalConfig {
+                require_auth: false,
+                ..SignalConfig::default()
+            },
+        ));
+        let anon_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let anon_addr = anon_listener.local_addr().unwrap();
+        let anon_task = tokio::spawn(
+            anon_hub
+                .clone()
+                .serve_tcp_signaling_on_listener(anon_listener),
+        );
+
+        let mut anon_conn = TcpStream::connect(anon_addr).await.unwrap();
+        write_signal_frame(
+            &mut anon_conn,
+            &SignalMsg::Register {
+                device_id: Some(bound_dev.device_id.clone()),
+                device_key: "dk-bound-victim".into(),
+                hostname: "victim".into(),
+                os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
+                device_group: String::new(),
+                lan_addrs: vec!["10.66.66.66:50000".into()],
+                access_token: None,
+                device_pubkey: None,
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: Some("02:66:66:66:66:66".into()),
+                wol_enabled: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut anon_conn).await.unwrap().unwrap(),
+            SignalMsg::Registered { .. }
+        ));
+        // Send anonymous Heartbeat attempting to poison LAN addrs, public IP, MAC, and wol_enabled.
+        write_signal_frame(
+            &mut anon_conn,
+            &SignalMsg::Heartbeat {
+                lan_addrs: vec!["10.77.77.77:50000".into()],
+                mac_addr: Some("02:77:77:77:77:77".into()),
+                wol_enabled: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut anon_conn).await.unwrap().unwrap(),
+            SignalMsg::HeartbeatAck { .. }
+        ));
+        // Verify stored WoL + network topology is 100% untouched!
+        let after_anon = store
+            .get_by_id(&bound_dev.device_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_anon.mac_addr.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+        assert!(after_anon.wol_enabled);
+        assert_eq!(
+            after_anon.last_lan_addrs,
+            vec!["192.168.88.10:50000".to_string()]
+        );
+        assert_eq!(after_anon.last_public_ip, "203.0.113.88");
+
+        drop(anon_conn);
+        anon_hub.shutdown_all().await;
+        let _ = anon_task.await;
+
+        // 2. Per-caller WoL rate limit blocks rapid device ID enumeration BEFORE DB lookup,
+        //    AND UpdateAssistState with only empty mac_addr returns invalid_payload.
+        let hub = Arc::new(SignalHub::with_auth(
+            store.clone(),
+            ephemeral.clone(),
+            auth_authority.clone(),
+            SignalConfig {
+                wol_caller_rate_limit_max: 2,
+                wol_caller_rate_limit_window: Duration::from_secs(10),
+                ..SignalConfig::default()
+            },
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(hub.clone().serve_tcp_signaling_on_listener(listener));
+
+        let mut caller = TcpStream::connect(addr).await.unwrap();
+        write_signal_frame(
+            &mut caller,
+            &SignalMsg::Register {
+                device_id: None,
+                device_key: "dk-enum-caller".into(),
+                hostname: "caller".into(),
+                os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
+                device_group: String::new(),
+                lan_addrs: vec!["192.168.1.10:50000".into()],
+                access_token: Some(alice_token),
+                device_pubkey: None,
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut caller).await.unwrap().unwrap(),
+            SignalMsg::Registered { .. }
+        ));
+
+        // UpdateAssistState with only empty mac_addr must return invalid_payload.
+        write_signal_frame(
+            &mut caller,
+            &SignalMsg::UpdateAssistState {
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: Some("   ".into()),
+                wol_enabled: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut caller).await.unwrap().unwrap(),
+            SignalMsg::Error { ref code, .. } if code == err_code::INVALID_PAYLOAD
+        ));
+
+        // 2 distinct missing targets consume the per-caller limit (max = 2), 3rd returns rate_limited!
+        for (idx, target) in ["111111111", "222222222"].iter().enumerate() {
+            write_signal_frame(
+                &mut caller,
+                &SignalMsg::WolRequest {
+                    request_id: Some(format!("enum-{idx}")),
+                    target_device_id: (*target).into(),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                read_signal_frame(&mut caller).await.unwrap().unwrap(),
+                SignalMsg::WolAck {
+                    ok: false,
+                    code: Some(ref c),
+                    ..
+                } if c == err_code::DEVICE_NOT_FOUND
+            ));
+        }
+
+        write_signal_frame(
+            &mut caller,
+            &SignalMsg::WolRequest {
+                request_id: Some("enum-3".into()),
+                target_device_id: "333333333".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut caller).await.unwrap().unwrap(),
+            SignalMsg::WolAck {
+                request_id: Some(ref rid),
+                ok: false,
+                ref method,
+                code: Some(ref c),
+                ..
+            } if rid == "enum-3" && method == WOL_METHOD_NONE && c == err_code::RATE_LIMITED
+        ));
+
+        // 3. Cross-site online peer with distinct public IP and overlapping 192.168.88.0/24
+        //    must NOT be picked for WoL relay (returns wol_no_relay_peer)!
+        hub.wol_caller_rate_limits.clear();
+        let (office_tx, mut office_rx) = mpsc::channel::<SignalMsg>(8);
+        hub.peers.insert(
+            "444555666".to_string(),
+            ActivePeer {
+                conn_id: 444_555,
+                tx: office_tx,
+                cancel: PeerCancel::new(),
+                lan_addrs: vec!["192.168.88.55:50000".into()],
+                remote_addr: "198.51.100.77:55555".parse().unwrap(),
+                connected_at: Utc::now(),
+                owner_user_id: Some(alice_id),
+                device_pubkey: String::new(),
+                allow_remote_assist: false,
+                allow_remote_control: true,
+                wol_capable: false,
+                hostname: "office-pc".into(),
+                alias: String::new(),
+                os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
+            },
+        );
+        write_signal_frame(
+            &mut caller,
+            &SignalMsg::WolRequest {
+                request_id: Some("cross-site-1".into()),
+                target_device_id: bound_dev.device_id.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut caller).await.unwrap().unwrap(),
+            SignalMsg::WolAck {
+                request_id: Some(ref rid),
+                ok: false,
+                ref method,
+                code: Some(ref c),
+                ..
+            } if rid == "cross-site-1"
+                && method == WOL_METHOD_NONE
+                && c == err_code::WOL_NO_RELAY_PEER
+        ));
+        assert!(
+            office_rx.try_recv().is_err(),
+            "cross-site office peer must never receive WolRelay"
+        );
+        hub.peers.remove("444555666");
+
+        drop(caller);
+        hub.shutdown_all().await;
+        let _ = server_task.await;
     }
 }

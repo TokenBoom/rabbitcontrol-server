@@ -485,6 +485,8 @@ async fn initial_admin_must_change_password_gate_and_settings_toggle() {
             device_pubkey: None,
             allow_remote_assist: None,
             allow_remote_control: None,
+            mac_addr: None,
+            wol_enabled: None,
         },
     )
     .await
@@ -847,6 +849,8 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             device_pubkey: Some("aa".repeat(32)),
             allow_remote_assist: Some(false),
             allow_remote_control: None,
+            mac_addr: None,
+            wol_enabled: None,
         },
     )
     .await
@@ -873,6 +877,8 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             device_pubkey: Some(caller_pk_hex.clone()),
             allow_remote_assist: Some(false),
             allow_remote_control: None,
+            mac_addr: None,
+            wol_enabled: None,
         },
     )
     .await
@@ -911,6 +917,8 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             device_pubkey: Some("cc".repeat(32)),
             allow_remote_assist: Some(false),
             allow_remote_control: None,
+            mac_addr: None,
+            wol_enabled: None,
         },
     )
     .await
@@ -1201,6 +1209,8 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
         &SignalMsg::UpdateAssistState {
             allow_remote_assist: Some(true),
             allow_remote_control: None,
+            mac_addr: None,
+            wol_enabled: None,
         },
     )
     .await
@@ -1383,6 +1393,8 @@ async fn admin_disable_and_delete_user_kicks_signal_relay_and_protects_last_admi
             device_pubkey: None,
             allow_remote_assist: None,
             allow_remote_control: None,
+            mac_addr: None,
+            wol_enabled: None,
         },
     )
     .await
@@ -2209,6 +2221,8 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             device_pubkey: Some("22".repeat(32)),
             allow_remote_assist: Some(false),
             allow_remote_control: None,
+            mac_addr: None,
+            wol_enabled: None,
         },
     )
     .await
@@ -2254,6 +2268,8 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             device_pubkey: Some("33".repeat(32)),
             allow_remote_assist: Some(false),
             allow_remote_control: None,
+            mac_addr: None,
+            wol_enabled: None,
         },
     )
     .await
@@ -2367,6 +2383,8 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
         &SignalMsg::UpdateAssistState {
             allow_remote_assist: Some(false),
             allow_remote_control: Some(true),
+            mac_addr: None,
+            wol_enabled: None,
         },
     )
     .await
@@ -2633,6 +2651,8 @@ async fn my_devices_orders_online_before_offline_even_when_offline_seen_later() 
             device_pubkey: None,
             allow_remote_assist: Some(false),
             allow_remote_control: Some(true),
+            mac_addr: None,
+            wol_enabled: None,
         },
     )
     .await
@@ -2663,6 +2683,8 @@ async fn my_devices_orders_online_before_offline_even_when_offline_seen_later() 
             device_pubkey: None,
             allow_remote_assist: Some(false),
             allow_remote_control: Some(true),
+            mac_addr: None,
+            wol_enabled: None,
         },
     )
     .await

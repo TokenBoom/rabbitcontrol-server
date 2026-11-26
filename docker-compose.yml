@@ -52,6 +52,7 @@ services:
       RC_PUBLIC_HOST: ${RC_PUBLIC_HOST:-}
       RC_TLS_SAN: ${RC_TLS_SAN:-}
       RC_PLAIN_HTTP: ${RC_PLAIN_HTTP:-false}
+      ALLOW_SERVER_WOL: ${ALLOW_SERVER_WOL:-false}
       RC_WEB_DIR: ${RC_WEB_DIR:-/app/web}
       RC_INIT_ADMIN_EMAIL: ${RC_INIT_ADMIN_EMAIL:-}
       RC_ADMIN_TOKEN: ${RC_ADMIN_TOKEN:-}
