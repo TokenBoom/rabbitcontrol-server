@@ -56,7 +56,7 @@ const COPY_BUF_SIZE: usize = 64 * 1024;
 const COPY_POOL_SHARDS: usize = 8;
 const COPY_POOL_SHARD_CAP: usize = 16;
 const _: () = assert!(COPY_POOL_SHARDS * COPY_POOL_SHARD_CAP * COPY_BUF_SIZE == 8 * 1024 * 1024);
-const USERSPACE_YIELD_BYTES: usize = 4 * 1024 * 1024;
+const USERSPACE_YIELD_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Error)]
 pub enum RelayError {
@@ -4053,5 +4053,200 @@ mod tests {
             relay.shutdown_all().await;
             let _ = server_task.await;
         }
+    }
+
+    #[tokio::test]
+    async fn userspace_yield_budget_and_bidirectional_fairness_under_burst() {
+        use std::collections::VecDeque;
+        use std::sync::Mutex;
+
+        const {
+            assert!(USERSPACE_YIELD_BYTES <= 256 * 1024);
+            assert!(USERSPACE_YIELD_BYTES == 128 * 1024);
+        }
+
+        #[derive(Default)]
+        struct MockEndpointState {
+            read_chunks: VecDeque<Vec<u8>>,
+            eof: bool,
+            written: Vec<u8>,
+            flushes: usize,
+            peer_written_at_first_write: Option<usize>,
+            peer_flushes_at_first_write: Option<usize>,
+        }
+
+        struct MockStream {
+            self_state: Arc<Mutex<MockEndpointState>>,
+            peer_state: Arc<Mutex<MockEndpointState>>,
+        }
+
+        impl AsyncRead for MockStream {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                let mut st = self.self_state.lock().unwrap();
+                if let Some(chunk) = st.read_chunks.front_mut() {
+                    let take = chunk.len().min(buf.remaining());
+                    buf.put_slice(&chunk[..take]);
+                    if take == chunk.len() {
+                        st.read_chunks.pop_front();
+                    } else {
+                        chunk.drain(..take);
+                    }
+                    Poll::Ready(Ok(()))
+                } else if st.eof {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+
+        impl AsyncWrite for MockStream {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                let peer_snapshot = {
+                    let peer = self.peer_state.lock().unwrap();
+                    (peer.written.len(), peer.flushes)
+                };
+                let mut st = self.self_state.lock().unwrap();
+                if st.peer_written_at_first_write.is_none() {
+                    st.peer_written_at_first_write = Some(peer_snapshot.0);
+                    st.peer_flushes_at_first_write = Some(peer_snapshot.1);
+                }
+                st.written.extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                let mut st = self.self_state.lock().unwrap();
+                st.flushes += 1;
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let host_state = Arc::new(Mutex::new(MockEndpointState::default()));
+        let client_state = Arc::new(Mutex::new(MockEndpointState::default()));
+
+        let burst_chunk_count = 16usize; // 16 * 64 KiB = 1 MiB Host -> Client video burst
+        let burst_total = burst_chunk_count * COPY_BUF_SIZE;
+        {
+            let mut h = host_state.lock().unwrap();
+            for i in 0..burst_chunk_count {
+                h.read_chunks
+                    .push_back(vec![0x40u8.wrapping_add(i as u8); COPY_BUF_SIZE]);
+            }
+            h.eof = true;
+        }
+        let ctrl_msg = b"idr-request-ctrl";
+        {
+            let mut c = client_state.lock().unwrap();
+            c.read_chunks.push_back(ctrl_msg.to_vec());
+            c.eof = true;
+        }
+
+        let mut host_stream = MockStream {
+            self_state: Arc::clone(&host_state),
+            peer_state: Arc::clone(&client_state),
+        };
+        let mut client_stream = MockStream {
+            self_state: Arc::clone(&client_state),
+            peer_state: Arc::clone(&host_state),
+        };
+
+        let bytes_up = Arc::new(AtomicU64::new(0));
+        let bytes_down = Arc::new(AtomicU64::new(0));
+        let cancel = CancellationFlag::new();
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            copy_bidirectional_pooled(
+                &mut host_stream,
+                &mut client_stream,
+                Arc::clone(&bytes_up),
+                Arc::clone(&bytes_down),
+                None,
+                None,
+                cancel,
+                DEFAULT_HALFCLOSE_GRACE,
+            ),
+        )
+        .await
+        .expect("bidirectional relay must complete promptly")
+        .expect("relay copy ok");
+
+        assert_eq!(bytes_up.load(Ordering::Relaxed), burst_total as u64);
+        assert_eq!(bytes_down.load(Ordering::Relaxed), ctrl_msg.len() as u64);
+
+        {
+            let h = host_state.lock().unwrap();
+            let c = client_state.lock().unwrap();
+            assert_eq!(h.written, ctrl_msg);
+            assert_eq!(c.written.len(), burst_total);
+            // Host -> Client must yield and flush at USERSPACE_YIELD_BYTES (128 KiB) before draining
+            // the full 1 MiB burst, allowing Client -> Host control traffic to run on the next poll.
+            assert_eq!(h.peer_written_at_first_write, Some(USERSPACE_YIELD_BYTES));
+            assert_eq!(h.peer_flushes_at_first_write, Some(1));
+            assert!(h.flushes >= 1);
+            assert!(c.flushes >= 1);
+        }
+
+        // Also verify real TCP loopback bidirectional copy under simultaneous bursty traffic.
+        let (a_cli, mut a_srv) = loopback_pair().await;
+        let (b_cli, mut b_srv) = loopback_pair().await;
+        let tcp_up = Arc::new(AtomicU64::new(0));
+        let tcp_down = Arc::new(AtomicU64::new(0));
+        let tcp_cancel = CancellationFlag::new();
+        let pump = tokio::spawn({
+            let tcp_up = Arc::clone(&tcp_up);
+            let tcp_down = Arc::clone(&tcp_down);
+            let tcp_cancel = tcp_cancel.clone();
+            async move {
+                copy_bidirectional_userspace(&mut a_srv, &mut b_srv, tcp_up, tcp_down, tcp_cancel)
+                    .await
+            }
+        });
+
+        let video_burst = make_pattern_bytes(512 * 1024, 0x5A);
+        let input_burst = make_pattern_bytes(256 * 1024, 0xC3);
+        let (mut a_r, mut a_w) = tokio::io::split(a_cli);
+        let (mut b_r, mut b_w) = tokio::io::split(b_cli);
+        let mut got_video = Vec::with_capacity(video_burst.len());
+        let mut got_input = Vec::with_capacity(input_burst.len());
+
+        let (aw, ar, bw, br) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                async {
+                    a_w.write_all(&video_burst).await?;
+                    a_w.shutdown().await
+                },
+                a_r.read_to_end(&mut got_input),
+                async {
+                    b_w.write_all(&input_burst).await?;
+                    b_w.shutdown().await
+                },
+                b_r.read_to_end(&mut got_video),
+            )
+        })
+        .await
+        .expect("TCP bidirectional burst must finish promptly");
+        aw.unwrap();
+        ar.unwrap();
+        bw.unwrap();
+        br.unwrap();
+
+        assert_eq!(got_video, video_burst);
+        assert_eq!(got_input, input_burst);
+        tcp_cancel.cancel();
+        pump.await.unwrap().unwrap();
     }
 }
