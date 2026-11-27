@@ -40,7 +40,7 @@ ENV RC_HTTP_ADDR=0.0.0.0:21118 \
     RC_WEB_DIR=/app/web \
     RUST_LOG=info,rc_server=info,tower_http=info
 
-EXPOSE 21116/tcp 21116/udp 21117/tcp 21118/tcp 21119/tcp
+EXPOSE 21116/tcp 21116/udp 21117/tcp 21118/tcp 21119/tcp 21119/udp
 
 USER rcserver
 
