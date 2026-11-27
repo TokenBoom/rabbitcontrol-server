@@ -81,7 +81,8 @@ Every message in both directions is length-prefixed:
   "wol_enabled": true,
   "nat_type": "cone",
   "nat_port_delta": 0,
-  "nat_port_range": [10000, 20000]
+  "nat_port_range": [10000, 20000],
+  "rcp2_v2": true
 }
 ```
 
@@ -95,6 +96,7 @@ Every message in both directions is length-prefixed:
 - `nat_type` (optional string): client-classified NAT behavior (`"unknown"`, `"public"`, `"cone"`, `"cone_verified"`, `"cone_unverified"`, `"symmetric_seq"`, `"symmetric_random"`, `"adm_seq"`, `"adm_random"`, `"apdm_seq"`, `"apdm_random"`, `"udp_blocked"`, normalized case-insensitively; unrecognized values are safely ignored as `None` for backward compatibility).
 - `nat_port_delta` (optional `i16`): observed sequential NAT port allocation step, clamped to `-1024..=1024`.
 - `nat_port_range` (optional `[u16; 2]`): observed NAT port allocation range hint `[min, max]` (`1 <= min <= max <= 65535`; invalid ranges or `0` ports are safely ignored as `None`).
+- `rcp2_v2` (optional bool, default `false`): declares support for `RCP2 v2` 48-byte HMAC-SHA256 authenticated punch packets; omitted by legacy (`< v0.2.5`) clients and treated as `false`.
 - `device_status_changed` broadcasts and `/api/v1/me/devices`, `/api/v1/devices` views also expose `app_version`, `arch`, `allow_remote_assist`, `allow_remote_control`, and `wol_capable` (`wol_enabled && valid(mac_addr)`). Raw `mac_addr` is **never** exposed in device list or status broadcasts.
 
 #### `update_assist_state` (Client -> Server)
@@ -208,7 +210,7 @@ Initiates P2P hole-punching coordination with `target_id`.
 
 - `nat_type` / `nat_port_delta` / `nat_port_range` (optional): updates the caller's in-memory NAT profile before issuing `punch_coord`.
 - If `target_id` is offline, the server responds only to the requester with `peer_offline`.
-- If `target_id` is online, the server reads both sides' observed public UDP endpoints (`get_public_udp` and dual-stack `get_public_udp_all`) from `EphemeralStore`, allocates a one-time fallback `relay_token` in `EphemeralStore`, generates a per-session 128-bit `OsRng` `punch_secret`, computes synchronized `start_after_ms` from both peers' smoothed RTT estimates (falling back to `0` when unsampled), and pushes `punch_coord` to **both** the client (`role = "client"`) and target host (`role = "host"`).
+- If `target_id` is online, the server reads both sides' observed public UDP endpoints (`get_public_udp` and dual-stack `get_public_udp_all`) from `EphemeralStore`, allocates a one-time fallback `relay_token` in `EphemeralStore`, generates a per-session 128-bit `OsRng` `punch_secret` **only when both peers declared `rcp2_v2 == true`** (otherwise `None`), computes synchronized `start_after_ms` from both peers' smoothed RTT estimates (falling back to `0` when unsampled), and pushes `punch_coord` to **both** the client (`role = "client"`) and target host (`role = "host"`).
 
 #### `punch_coord` (Server -> Both Peers)
 
@@ -240,7 +242,7 @@ Initiates P2P hole-punching coordination with `target_id`.
 - `self_public_udp_addr` (optional string): the recipient's own observed public UDP address (for hairpin / same-public-IP detection).
 - `peer_nat_type` / `peer_nat_port_delta` (optional): the peer's normalized NAT classification and port step hint.
 - `self_nat_port_range` / `peer_nat_port_range` (optional `[u16; 2]`): validated NAT port range hints (`[min, max]`, `1 <= min <= max <= 65535`) for the recipient and peer respectively.
-- `punch_secret` (optional string): 32-char lowercase hex encoding of a per-session 128-bit `OsRng` secret shared identically by both `client` and `host` for `RCP2 v2` HMAC-SHA256 punch authentication.
+- `punch_secret` (optional string, omitted when `None`): 32-char lowercase hex encoding of a per-session 128-bit `OsRng` secret shared identically by both `client` and `host` for `RCP2 v2` HMAC-SHA256 punch authentication. Issued **only** when both `client` and `host` declared `rcp2_v2 == true` during `register`; otherwise omitted (`None`) so mixed or legacy clients fall back to 29-byte `RCP2 v1` interoperability.
 - `start_after_ms` (optional `u16`): fast-side punch launch delay in milliseconds, computed as `clamp((rtt_slow - rtt_fast) / 2, 0, 500)` for the lower-RTT peer and `0` for the slower peer (unsampled peers fall back to `0` ms).
 - `relay_fallback_after_ms` (optional `u16`): synchronized delay threshold in milliseconds (default `400`) after which both peers concurrently initiate Relay-first dialing.
 

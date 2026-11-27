@@ -492,6 +492,7 @@ async fn initial_admin_must_change_password_gate_and_settings_toggle() {
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            rcp2_v2: false,
         },
     )
     .await
@@ -859,6 +860,7 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            rcp2_v2: false,
         },
     )
     .await
@@ -890,6 +892,7 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            rcp2_v2: false,
         },
     )
     .await
@@ -933,6 +936,7 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            rcp2_v2: false,
         },
     )
     .await
@@ -1421,6 +1425,7 @@ async fn admin_disable_and_delete_user_kicks_signal_relay_and_protects_last_admi
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            rcp2_v2: false,
         },
     )
     .await
@@ -2254,6 +2259,7 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            rcp2_v2: false,
         },
     )
     .await
@@ -2304,6 +2310,7 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            rcp2_v2: false,
         },
     )
     .await
@@ -2705,6 +2712,7 @@ async fn my_devices_orders_online_before_offline_even_when_offline_seen_later() 
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            rcp2_v2: false,
         },
     )
     .await
@@ -2740,6 +2748,7 @@ async fn my_devices_orders_online_before_offline_even_when_offline_seen_later() 
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            rcp2_v2: false,
         },
     )
     .await

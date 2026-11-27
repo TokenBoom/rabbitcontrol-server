@@ -337,6 +337,7 @@ async fn full_flow_register_udp_signal_relay_2mib_and_api_stats() {
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            rcp2_v2: false,
         },
     )
     .await
@@ -367,6 +368,7 @@ async fn full_flow_register_udp_signal_relay_2mib_and_api_stats() {
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            rcp2_v2: false,
         },
     )
     .await
@@ -880,6 +882,7 @@ async fn admin_disable_device_kicks_online_peer_and_blocks_reregister() {
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            rcp2_v2: false,
         },
     )
     .await
@@ -947,6 +950,7 @@ async fn admin_disable_device_kicks_online_peer_and_blocks_reregister() {
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            rcp2_v2: false,
         },
     )
     .await

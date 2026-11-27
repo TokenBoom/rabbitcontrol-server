@@ -497,6 +497,8 @@ pub enum SignalMsg {
         nat_port_delta: Option<i16>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         nat_port_range: Option<[u16; 2]>,
+        #[serde(default)]
+        rcp2_v2: bool,
     },
     Registered {
         device_id: String,
@@ -1290,6 +1292,7 @@ struct ActivePeer {
     nat_port_delta: Option<i16>,
     nat_port_range: Option<[u16; 2]>,
     smoothed_rtt_ms: Option<u32>,
+    rcp2_v2: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2183,6 +2186,7 @@ impl SignalHub {
             nat_type_opt,
             nat_port_delta_opt,
             nat_port_range_opt,
+            rcp2_v2,
         ) = match first_frame {
             SignalMsg::Register {
                 device_id,
@@ -2202,6 +2206,7 @@ impl SignalHub {
                 nat_type,
                 nat_port_delta,
                 nat_port_range,
+                rcp2_v2,
             } => {
                 if let Err(reason) = validate_register_fields(
                     &hostname,
@@ -2274,6 +2279,7 @@ impl SignalHub {
                     normalize_nat_type(nat_type.as_deref()),
                     normalize_nat_port_delta(nat_port_delta),
                     normalize_nat_port_range(nat_port_range),
+                    rcp2_v2,
                 )
             }
             _ => {
@@ -2730,6 +2736,7 @@ impl SignalHub {
                     nat_port_delta: nat_port_delta_opt,
                     nat_port_range: nat_port_range_opt,
                     smoothed_rtt_ms: None,
+                    rcp2_v2,
                 },
             ) {
                 old_peer.cancel.kick(err_code::REPLACED_BY_NEW_CONNECTION);
@@ -3826,6 +3833,7 @@ impl SignalHub {
                     client_nat_port_delta,
                     client_nat_port_range,
                     client_rtt_ms,
+                    client_rcp2_v2,
                 ) = {
                     let snapshot = self
                         .peers
@@ -3838,18 +3846,19 @@ impl SignalHub {
                                 p.nat_port_delta,
                                 p.nat_port_range,
                                 p.smoothed_rtt_ms.unwrap_or(0),
+                                p.rcp2_v2,
                             )
                         });
                     match snapshot {
-                        Some((peer_lan, nt, delta, range, rtt)) => {
+                        Some((peer_lan, nt, delta, range, rtt, rcp2_v2)) => {
                             let addrs = if !lan_addrs.is_empty() {
                                 lan_addrs
                             } else {
                                 peer_lan
                             };
-                            (addrs, nt, delta, range, rtt)
+                            (addrs, nt, delta, range, rtt, rcp2_v2)
                         }
-                        None => (lan_addrs, None, None, None, 0),
+                        None => (lan_addrs, None, None, None, 0, false),
                     }
                 };
 
@@ -3861,6 +3870,7 @@ impl SignalHub {
                         p.nat_port_delta,
                         p.nat_port_range,
                         p.smoothed_rtt_ms.unwrap_or(0),
+                        p.rcp2_v2,
                     )
                 });
 
@@ -3871,6 +3881,7 @@ impl SignalHub {
                     host_nat_port_delta,
                     host_nat_port_range,
                     host_rtt_ms,
+                    host_rcp2_v2,
                 )) = target_snapshot
                 else {
                     Self::send_nonblocking(
@@ -3944,7 +3955,8 @@ impl SignalHub {
                 }
 
                 let relay_token = random_hex(32);
-                let punch_secret = random_hex(PUNCH_SECRET_LEN);
+                let punch_secret =
+                    (client_rcp2_v2 && host_rcp2_v2).then(|| random_hex(PUNCH_SECRET_LEN));
                 let client_start_after_ms =
                     compute_punch_start_after_ms(client_rtt_ms, host_rtt_ms);
                 let host_start_after_ms = compute_punch_start_after_ms(host_rtt_ms, client_rtt_ms);
@@ -3962,7 +3974,7 @@ impl SignalHub {
                     peer_nat_port_range: host_nat_port_range,
                     peer_lan_addrs: host_lan_addrs,
                     nonce: nonce.clone(),
-                    punch_secret: Some(punch_secret.clone()),
+                    punch_secret: punch_secret.clone(),
                     start_after_ms: Some(client_start_after_ms),
                     relay_fallback_after_ms,
                     relay_token: relay_token.clone(),
@@ -3983,7 +3995,7 @@ impl SignalHub {
                     peer_nat_port_range: client_nat_port_range,
                     peer_lan_addrs: client_lan_addrs,
                     nonce,
-                    punch_secret: Some(punch_secret),
+                    punch_secret,
                     start_after_ms: Some(host_start_after_ms),
                     relay_fallback_after_ms,
                     relay_token: relay_token.clone(),
@@ -4788,6 +4800,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -4903,6 +4916,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -4933,6 +4947,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -5137,6 +5152,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -5184,6 +5200,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -5220,6 +5237,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -5251,6 +5269,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -5345,6 +5364,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -5381,6 +5401,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -5450,6 +5471,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -5484,6 +5506,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -5566,6 +5589,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -5651,6 +5675,7 @@ mod tests {
                     nat_type: None,
                     nat_port_delta: None,
                     nat_port_range: None,
+                    rcp2_v2: false,
                 },
             )
             .await
@@ -5684,6 +5709,7 @@ mod tests {
                     nat_type: None,
                     nat_port_delta: None,
                     nat_port_range: None,
+                    rcp2_v2: false,
                 },
             )
             .await
@@ -5717,6 +5743,7 @@ mod tests {
                     nat_type: None,
                     nat_port_delta: None,
                     nat_port_range: None,
+                    rcp2_v2: false,
                 },
             )
             .await
@@ -5893,6 +5920,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -5950,6 +5978,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -6029,6 +6058,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -6085,6 +6115,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -6372,6 +6403,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
             SignalMsg::Register {
                 device_id: None,
@@ -6391,6 +6423,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
             SignalMsg::Register {
                 device_id: None,
@@ -6410,6 +6443,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         ] {
             let mut s = TcpStream::connect(tcp_addr).await.unwrap();
@@ -6739,6 +6773,7 @@ mod tests {
                     nat_port_delta: None,
                     nat_port_range: None,
                     smoothed_rtt_ms: None,
+                    rcp2_v2: false,
                 },
             );
 
@@ -6865,6 +6900,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -6946,6 +6982,7 @@ mod tests {
                         nat_type: None,
                         nat_port_delta: None,
                         nat_port_range: None,
+                        rcp2_v2: false,
                     },
                 )
                 .await;
@@ -7005,6 +7042,7 @@ mod tests {
                         nat_type: None,
                         nat_port_delta: None,
                         nat_port_range: None,
+                        rcp2_v2: false,
                     },
                 )
                 .await;
@@ -7282,6 +7320,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -7357,6 +7396,7 @@ mod tests {
                 nat_port_delta: None,
                 nat_port_range: None,
                 smoothed_rtt_ms: None,
+                rcp2_v2: false,
             },
         );
         write_signal_frame(
@@ -7706,6 +7746,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -7773,6 +7814,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -7803,6 +7845,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -7842,6 +7885,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -8097,6 +8141,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -8128,6 +8173,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -8159,6 +8205,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -8370,6 +8417,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -8452,6 +8500,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -8547,6 +8596,7 @@ mod tests {
                 nat_port_delta: None,
                 nat_port_range: None,
                 smoothed_rtt_ms: None,
+                rcp2_v2: false,
             },
         );
         write_signal_frame(
@@ -8674,6 +8724,7 @@ mod tests {
                 nat_type: Some("Cone".into()),
                 nat_port_delta: Some(0),
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -8855,6 +8906,7 @@ mod tests {
                 nat_type: Some("Symmetric_Seq".into()),
                 nat_port_delta: Some(3),
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -8886,6 +8938,7 @@ mod tests {
                 nat_type: Some("bogus_nat".into()),
                 nat_port_delta: Some(9999),
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -9017,6 +9070,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
                 ..
             }
         ));
@@ -9157,6 +9211,7 @@ mod tests {
                 nat_type: Some("cone".into()),
                 nat_port_delta: Some(0),
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -9198,6 +9253,7 @@ mod tests {
                 nat_type: Some("cone".into()),
                 nat_port_delta: Some(0),
                 nat_port_range: None,
+                rcp2_v2: false,
             },
         )
         .await
@@ -9463,6 +9519,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                rcp2_v2: false,
                 ..
             }
         ));
@@ -9566,6 +9623,7 @@ mod tests {
                 nat_type: Some("adm_seq".into()),
                 nat_port_delta: Some(2),
                 nat_port_range: Some([30_000, 31_000]),
+                rcp2_v2: true,
             },
         )
         .await
@@ -9604,6 +9662,7 @@ mod tests {
                 nat_type: Some("apdm_random".into()),
                 nat_port_delta: None,
                 nat_port_range: Some([0, 1000]),
+                rcp2_v2: true,
             },
         )
         .await
@@ -9825,6 +9884,148 @@ mod tests {
 
         drop(client);
         drop(host);
+        hub.shutdown_all().await;
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn punch_secret_requires_both_peers_rcp2_v2() {
+        let store = Arc::new(MemoryDeviceStore::new());
+        let ephemeral = Arc::new(MemoryEphemeralStore::new());
+        let hub = Arc::new(SignalHub::new(store, ephemeral, SignalConfig::default()));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(hub.clone().serve_tcp_signaling_on_listener(listener));
+
+        for (idx, (client_v2, host_v2)) in
+            [(true, true), (true, false), (false, true), (false, false)]
+                .into_iter()
+                .enumerate()
+        {
+            let mut host = TcpStream::connect(tcp_addr).await.unwrap();
+            write_signal_frame(
+                &mut host,
+                &SignalMsg::Register {
+                    device_id: None,
+                    device_key: format!("ed25519:neg-host-{idx}"),
+                    hostname: format!("neg-host-{idx}"),
+                    os: "macos".into(),
+                    app_version: String::new(),
+                    arch: String::new(),
+                    device_group: String::new(),
+                    lan_addrs: vec![],
+                    access_token: None,
+                    device_pubkey: None,
+                    allow_remote_assist: None,
+                    allow_remote_control: None,
+                    mac_addr: None,
+                    wol_enabled: None,
+                    nat_type: None,
+                    nat_port_delta: None,
+                    nat_port_range: None,
+                    rcp2_v2: host_v2,
+                },
+            )
+            .await
+            .unwrap();
+            let host_id = match read_signal_frame(&mut host).await.unwrap().unwrap() {
+                SignalMsg::Registered { device_id, .. } => device_id,
+                other => panic!("expected Registered for host, got {other:?}"),
+            };
+
+            let mut client = TcpStream::connect(tcp_addr).await.unwrap();
+            write_signal_frame(
+                &mut client,
+                &SignalMsg::Register {
+                    device_id: None,
+                    device_key: format!("ed25519:neg-client-{idx}"),
+                    hostname: format!("neg-client-{idx}"),
+                    os: "macos".into(),
+                    app_version: String::new(),
+                    arch: String::new(),
+                    device_group: String::new(),
+                    lan_addrs: vec![],
+                    access_token: None,
+                    device_pubkey: None,
+                    allow_remote_assist: None,
+                    allow_remote_control: None,
+                    mac_addr: None,
+                    wol_enabled: None,
+                    nat_type: None,
+                    nat_port_delta: None,
+                    nat_port_range: None,
+                    rcp2_v2: client_v2,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                read_signal_frame(&mut client).await.unwrap().unwrap(),
+                SignalMsg::Registered { .. }
+            ));
+
+            write_signal_frame(
+                &mut client,
+                &SignalMsg::ConnectRequest {
+                    target_id: host_id,
+                    session_id: Some(format!("sess-neg-{idx}")),
+                    lan_addrs: vec![],
+                    nonce: Some(format!("nonce{idx}")),
+                    nat_type: None,
+                    nat_port_delta: None,
+                    nat_port_range: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            let c_msg = read_signal_frame(&mut client).await.unwrap().unwrap();
+            let h_msg = read_signal_frame(&mut host).await.unwrap().unwrap();
+
+            match (&c_msg, &h_msg) {
+                (
+                    SignalMsg::PunchCoord {
+                        punch_secret: cs, ..
+                    },
+                    SignalMsg::PunchCoord {
+                        punch_secret: hs, ..
+                    },
+                ) => {
+                    if client_v2 && host_v2 {
+                        let cs = cs
+                            .as_ref()
+                            .expect("both rcp2_v2=true must yield punch_secret");
+                        let hs = hs
+                            .as_ref()
+                            .expect("both rcp2_v2=true must yield punch_secret");
+                        assert_eq!(cs, hs);
+                        assert_eq!(cs.len(), 32);
+                        assert!(cs
+                            .chars()
+                            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+                    } else {
+                        assert_eq!(
+                            *cs, None,
+                            "mixed/legacy ({client_v2}, {host_v2}) must not issue punch_secret to client"
+                        );
+                        assert_eq!(
+                            *hs, None,
+                            "mixed/legacy ({client_v2}, {host_v2}) must not issue punch_secret to host"
+                        );
+                        let c_json = serde_json::to_string(&c_msg).unwrap();
+                        let h_json = serde_json::to_string(&h_msg).unwrap();
+                        assert!(!c_json.contains("punch_secret"));
+                        assert!(!h_json.contains("punch_secret"));
+                    }
+                }
+                other => panic!("expected PunchCoord pair, got {other:?}"),
+            }
+
+            drop(client);
+            drop(host);
+        }
+
         hub.shutdown_all().await;
         let _ = server_task.await;
     }
