@@ -61,10 +61,11 @@ const DEFAULT_AUTH_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const MAX_RATE_LIMIT_KEYS: usize = 16_384;
 const HTTPS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AdvertisedEndpoints {
     pub signal_tcp_addr: String,
     pub udp_probe_addr: String,
+    pub udp_probe_alt_addr: Option<String>,
     pub tcp_relay_addr: String,
 }
 
@@ -1080,6 +1081,8 @@ pub struct RegisterResponse {
     pub last_seen_at: DateTime<Utc>,
     pub signal_tcp_addr: String,
     pub udp_probe_addr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_probe_alt_addr: Option<String>,
     pub tcp_relay_addr: String,
     pub relay_addr: String,
 }
@@ -3291,6 +3294,7 @@ async fn post_register_device(
                 last_seen_at: rec.last_seen_at,
                 signal_tcp_addr: state.endpoints.signal_tcp_addr.clone(),
                 udp_probe_addr: state.endpoints.udp_probe_addr.clone(),
+                udp_probe_alt_addr: state.endpoints.udp_probe_alt_addr.clone(),
                 tcp_relay_addr: state.endpoints.tcp_relay_addr.clone(),
                 relay_addr: state.endpoints.tcp_relay_addr.clone(),
             };
@@ -3975,6 +3979,7 @@ mod tests {
             endpoints: AdvertisedEndpoints {
                 signal_tcp_addr: "127.0.0.1:21116".into(),
                 udp_probe_addr: "127.0.0.1:21116".into(),
+                udp_probe_alt_addr: None,
                 tcp_relay_addr: "127.0.0.1:21117".into(),
             },
             started_at: Instant::now(),

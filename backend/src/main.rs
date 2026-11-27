@@ -54,6 +54,14 @@ struct Args {
     #[arg(long, env = "RC_SIGNAL_ADDR", value_name = "ADDR")]
     signal: Option<String>,
 
+    /// Optional secondary UDP STUN-lite echo-only probe listen address [default: same IP as --signal, port+3 (e.g. 0.0.0.0:21119); set "disabled" or "none" to disable]
+    #[arg(
+        long = "udp-probe-alt",
+        env = "RC_UDP_PROBE_ALT_ADDR",
+        value_name = "ADDR"
+    )]
+    udp_probe_alt: Option<String>,
+
     /// Mandatory TLS 1.3 mTLS TCP relay listen address (RCR1 binary handshake) [default: 0.0.0.0:21117]
     #[arg(long, env = "RC_RELAY_ADDR", value_name = "ADDR")]
     relay: Option<String>,
@@ -120,6 +128,7 @@ struct ResolvedConfig {
     http: SocketAddr,
     web_addr: Option<SocketAddr>,
     signal: SocketAddr,
+    udp_probe_alt: Option<SocketAddr>,
     relay: SocketAddr,
     database_url: String,
     redis_url: Option<String>,
@@ -220,6 +229,27 @@ fn addrs_conflict(a: SocketAddr, b: SocketAddr) -> bool {
         && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
 }
 
+fn resolve_udp_probe_alt(
+    raw: Option<String>,
+    signal: SocketAddr,
+) -> Result<Option<SocketAddr>, String> {
+    let Some(val) = trim_non_empty(raw) else {
+        if signal.port() == 0 {
+            return Ok(Some(SocketAddr::new(signal.ip(), 0)));
+        }
+        return Ok(signal
+            .port()
+            .checked_add(3)
+            .map(|port| SocketAddr::new(signal.ip(), port)));
+    };
+    if val.eq_ignore_ascii_case("disabled") || val.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    val.parse::<SocketAddr>().map(Some).map_err(|err| {
+        format!("invalid socket address '{val}' for --udp-probe-alt / RC_UDP_PROBE_ALT_ADDR: {err}")
+    })
+}
+
 fn resolve_config(
     args: Args,
     env_lookup: impl Fn(&str) -> Option<String>,
@@ -231,6 +261,7 @@ fn resolve_config(
         DEFAULT_SIGNAL_ADDR,
         "--signal / RC_SIGNAL_ADDR",
     )?;
+    let udp_probe_alt = resolve_udp_probe_alt(args.udp_probe_alt, signal)?;
     let relay =
         parse_socket_addr_or_default(args.relay, DEFAULT_RELAY_ADDR, "--relay / RC_RELAY_ADDR")?;
 
@@ -239,6 +270,14 @@ fn resolve_config(
         {
             return Err(format!(
                 "--web-addr / RC_WEB_ADDR ({addr}) must not conflict with --http ({http}), --signal ({signal}), or --relay ({relay})"
+            ));
+        }
+    }
+
+    if let Some(alt_addr) = udp_probe_alt {
+        if addrs_conflict(alt_addr, signal) {
+            return Err(format!(
+                "--udp-probe-alt / RC_UDP_PROBE_ALT_ADDR ({alt_addr}) must not conflict with primary UDP probe on --signal ({signal})"
             ));
         }
     }
@@ -270,6 +309,7 @@ fn resolve_config(
         http,
         web_addr,
         signal,
+        udp_probe_alt,
         relay,
         database_url,
         redis_url,
@@ -467,6 +507,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signal_local = signal_listener.local_addr()?;
     let udp_socket = Arc::new(UdpSocket::bind(signal_local).await?);
     let udp_local = udp_socket.local_addr()?;
+    let udp_alt_socket = match cfg.udp_probe_alt {
+        Some(alt_bind) => Some(Arc::new(UdpSocket::bind(alt_bind).await?)),
+        None => None,
+    };
+    let udp_alt_local = udp_alt_socket
+        .as_ref()
+        .map(|s| s.local_addr())
+        .transpose()?;
     let relay_listener = bind_tcp_listener(cfg.relay, cfg.listen_backlog)?;
     let relay_local = relay_listener.local_addr()?;
     let http_listener = bind_tcp_listener(cfg.http, cfg.listen_backlog)?;
@@ -486,6 +534,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let advertised_signal = format_advertised_addr(cfg.public_host.as_deref(), signal_local);
     let advertised_udp = format_advertised_addr(cfg.public_host.as_deref(), udp_local);
+    let advertised_udp_alt =
+        udp_alt_local.map(|addr| format_advertised_addr(cfg.public_host.as_deref(), addr));
     let advertised_relay = format_advertised_addr(cfg.public_host.as_deref(), relay_local);
 
     let signal_hub = Arc::new(SignalHub::with_auth(
@@ -494,6 +544,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&auth_authority),
         SignalConfig {
             public_udp_probe_addr: advertised_udp.clone(),
+            public_udp_probe_alt_addr: advertised_udp_alt.clone(),
             public_relay_addr: advertised_relay.clone(),
             allow_server_wol: cfg.allow_server_wol,
             ..SignalConfig::default()
@@ -519,6 +570,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         endpoints: AdvertisedEndpoints {
             signal_tcp_addr: advertised_signal.clone(),
             udp_probe_addr: advertised_udp.clone(),
+            udp_probe_alt_addr: advertised_udp_alt.clone(),
             tcp_relay_addr: advertised_relay.clone(),
         },
         started_at: Instant::now(),
@@ -548,10 +600,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         split_web_admin = web_local.is_some(),
         signal_tls_addr = %signal_local,
         udp_probe_addr = %udp_local,
+        udp_probe_alt_addr = ?udp_alt_local,
         relay_mtls_addr = %relay_local,
         listen_backlog = cfg.listen_backlog,
         advertised_signal = %advertised_signal,
         advertised_udp = %advertised_udp,
+        advertised_udp_alt = ?advertised_udp_alt,
         advertised_relay = %advertised_relay,
         ca_fingerprint_sha256 = %pki_authority.ca_fingerprint_sha256(),
         auth_pubkey_hex = %auth_authority.public_key_hex(),
@@ -576,6 +630,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "udp_probe",
                 udp_hub
                     .serve_udp_probe_on_socket_with_shutdown(udp_socket, udp_shutdown)
+                    .await,
+            )
+        });
+    }
+
+    if let Some(udp_alt_socket) = udp_alt_socket {
+        let udp_alt_hub = Arc::clone(&signal_hub);
+        let udp_alt_shutdown = shutdown_rx.clone();
+        listeners.spawn(async move {
+            (
+                "udp_probe_alt",
+                udp_alt_hub
+                    .serve_udp_probe_alt_on_socket_with_shutdown(udp_alt_socket, udp_alt_shutdown)
                     .await,
             )
         });
@@ -761,6 +828,7 @@ mod tests {
             http: None,
             web_addr: None,
             signal: None,
+            udp_probe_alt: None,
             relay: None,
             database_url: None,
             redis_url: None,
@@ -810,6 +878,7 @@ mod tests {
         assert_eq!(cfg.http, DEFAULT_HTTP_ADDR.parse().unwrap());
         assert_eq!(cfg.web_addr, None);
         assert_eq!(cfg.signal, DEFAULT_SIGNAL_ADDR.parse().unwrap());
+        assert_eq!(cfg.udp_probe_alt, Some("0.0.0.0:21119".parse().unwrap()));
         assert_eq!(cfg.relay, DEFAULT_RELAY_ADDR.parse().unwrap());
         assert_eq!(
             cfg.database_url,
@@ -976,5 +1045,57 @@ mod tests {
                 .unwrap();
         let cfg_env = resolve_config(parsed_env, lookup_from(&env_fallback)).unwrap();
         assert!(cfg_env.allow_server_wol);
+    }
+
+    #[test]
+    fn resolve_config_handles_udp_probe_alt_defaults_disable_and_udp_conflicts() {
+        let env = HashMap::new();
+
+        // 1. Signal port 0 -> alt port 0 on same IP.
+        let mut args = empty_args();
+        args.database_url = Some("postgres://u:p@127.0.0.1/rc".into());
+        args.signal = Some("127.0.0.1:0".into());
+        let cfg = resolve_config(args, lookup_from(&env)).unwrap();
+        assert_eq!(cfg.udp_probe_alt, Some("127.0.0.1:0".parse().unwrap()));
+
+        // 2. Signal port near u16::MAX -> overflow safely disables alt port.
+        let mut args = empty_args();
+        args.database_url = Some("postgres://u:p@127.0.0.1/rc".into());
+        args.signal = Some("127.0.0.1:65534".into());
+        let cfg = resolve_config(args, lookup_from(&env)).unwrap();
+        assert_eq!(cfg.udp_probe_alt, None);
+
+        // 3. Explicit "disabled" / "none" (case-insensitive) disables alt port.
+        for val in ["disabled", "DISABLED", "none", "None"] {
+            let mut args = empty_args();
+            args.database_url = Some("postgres://u:p@127.0.0.1/rc".into());
+            args.udp_probe_alt = Some(val.into());
+            let cfg = resolve_config(args, lookup_from(&env)).unwrap();
+            assert_eq!(
+                cfg.udp_probe_alt, None,
+                "expected '{val}' to disable alt port"
+            );
+        }
+
+        // 4. TCP --web-addr on :21119 does NOT conflict with default UDP :21119!
+        let mut args = empty_args();
+        args.database_url = Some("postgres://u:p@127.0.0.1/rc".into());
+        args.web_addr = Some("0.0.0.0:21119".into());
+        let cfg = resolve_config(args, lookup_from(&env)).unwrap();
+        assert_eq!(cfg.web_addr, Some("0.0.0.0:21119".parse().unwrap()));
+        assert_eq!(cfg.udp_probe_alt, Some("0.0.0.0:21119".parse().unwrap()));
+
+        // 5. Explicit --udp-probe-alt conflicting with primary UDP --signal IS rejected.
+        let mut args = empty_args();
+        args.database_url = Some("postgres://u:p@127.0.0.1/rc".into());
+        args.udp_probe_alt = Some("127.0.0.1:21116".into());
+        let err = resolve_config(args, lookup_from(&env)).unwrap_err();
+        assert!(err.contains("--udp-probe-alt"), "{err}");
+
+        // 6. Invalid --udp-probe-alt address is rejected.
+        let mut args = empty_args();
+        args.database_url = Some("postgres://u:p@127.0.0.1/rc".into());
+        args.udp_probe_alt = Some("not-an-addr".into());
+        assert!(resolve_config(args, lookup_from(&env)).is_err());
     }
 }

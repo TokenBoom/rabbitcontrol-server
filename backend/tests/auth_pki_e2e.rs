@@ -127,6 +127,7 @@ impl SecureTestCluster {
             endpoints: AdvertisedEndpoints {
                 signal_tcp_addr: signal_addr.to_string(),
                 udp_probe_addr: signal_addr.to_string(),
+                udp_probe_alt_addr: None,
                 tcp_relay_addr: relay_addr.to_string(),
             },
             started_at: Instant::now(),
@@ -487,6 +488,8 @@ async fn initial_admin_must_change_password_gate_and_settings_toggle() {
             allow_remote_control: None,
             mac_addr: None,
             wol_enabled: None,
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await
@@ -851,6 +854,8 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             allow_remote_control: None,
             mac_addr: None,
             wol_enabled: None,
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await
@@ -879,6 +884,8 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             allow_remote_control: None,
             mac_addr: None,
             wol_enabled: None,
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await
@@ -919,6 +926,8 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             allow_remote_control: None,
             mac_addr: None,
             wol_enabled: None,
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await
@@ -936,6 +945,8 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             session_id: Some("sess-owner-1".into()),
             lan_addrs: vec![],
             nonce: Some("n1".into()),
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await
@@ -986,6 +997,8 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             session_id: Some("sess-stranger-blocked".into()),
             lan_addrs: vec![],
             nonce: None,
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await
@@ -1232,6 +1245,8 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             session_id: Some("sess-stranger-allowed".into()),
             lan_addrs: vec![],
             nonce: None,
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await
@@ -1395,6 +1410,8 @@ async fn admin_disable_and_delete_user_kicks_signal_relay_and_protects_last_admi
             allow_remote_control: None,
             mac_addr: None,
             wol_enabled: None,
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await
@@ -1814,6 +1831,7 @@ async fn split_web_admin_and_client_api_ports_isolate_routes_and_static_ui() {
         endpoints: AdvertisedEndpoints {
             signal_tcp_addr: signal_addr.to_string(),
             udp_probe_addr: signal_addr.to_string(),
+            udp_probe_alt_addr: None,
             tcp_relay_addr: relay_addr.to_string(),
         },
         started_at: Instant::now(),
@@ -2223,6 +2241,8 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             allow_remote_control: None,
             mac_addr: None,
             wol_enabled: None,
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await
@@ -2270,6 +2290,8 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             allow_remote_control: None,
             mac_addr: None,
             wol_enabled: None,
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await
@@ -2289,6 +2311,8 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             session_id: Some("sess-android-blocked-punch".into()),
             lan_addrs: vec![],
             nonce: Some("n1".into()),
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await
@@ -2368,6 +2392,8 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             session_id: Some("sess-stranger-blocked-layer1".into()),
             lan_addrs: vec![],
             nonce: None,
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await
@@ -2409,6 +2435,8 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             session_id: Some("sess-android-owner-ok".into()),
             lan_addrs: vec![],
             nonce: Some("n2".into()),
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await
@@ -2453,6 +2481,8 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             session_id: Some("sess-stranger-assist-disabled".into()),
             lan_addrs: vec![],
             nonce: None,
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await
@@ -2553,6 +2583,8 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             session_id: Some("sess-after-patch-false".into()),
             lan_addrs: vec![],
             nonce: None,
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await
@@ -2653,6 +2685,8 @@ async fn my_devices_orders_online_before_offline_even_when_offline_seen_later() 
             allow_remote_control: Some(true),
             mac_addr: None,
             wol_enabled: None,
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await
@@ -2685,6 +2719,8 @@ async fn my_devices_orders_online_before_offline_even_when_offline_seen_later() 
             allow_remote_control: Some(true),
             mac_addr: None,
             wol_enabled: None,
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await

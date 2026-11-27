@@ -33,8 +33,13 @@ use crate::store::{
 pub const UDP_PROBE_MAGIC: &[u8; 4] = b"RCSP";
 pub const UDP_ANSWER_MAGIC: &[u8; 4] = b"RCSA";
 pub const UDP_PROTO_VERSION: u8 = 1;
+pub const UDP_PROTO_VERSION_V2: u8 = 2;
 pub const UDP_PROBE_LEN: usize = 22;
+pub const UDP_PROBE_TOKEN_LEN: usize = 16;
+pub const UDP_PROBE_V2_LEN: usize = 38;
 pub const ANONYMOUS_DEVICE_ID: &str = "000000000";
+pub const NAT_PORT_DELTA_MIN: i16 = -1024;
+pub const NAT_PORT_DELTA_MAX: i16 = 1024;
 
 pub const MAX_SIGNAL_FRAME_LEN: usize = 65_536;
 pub const MAX_SESSION_ID_LEN: usize = 64;
@@ -108,6 +113,64 @@ pub fn canonical_socket_addr(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(canonical_ip(addr.ip()), addr.port())
 }
 
+/// Constant-time byte-slice equality check for UDP probe authentication tokens.
+pub fn constant_time_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    let max_len = a.len().max(b.len());
+    for i in 0..max_len {
+        let lhs = a.get(i).copied().unwrap_or(0);
+        let rhs = b.get(i).copied().unwrap_or(0);
+        diff |= usize::from(lhs ^ rhs);
+    }
+    std::hint::black_box(diff) == 0
+}
+
+/// Normalize client-reported NAT type to the canonical lowercase whitelist.
+/// Unknown or malformed values are safely ignored (`None`) to maintain backward compatibility.
+pub fn normalize_nat_type(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "unknown" => Some("unknown".to_string()),
+        "cone" => Some("cone".to_string()),
+        "symmetric_seq" => Some("symmetric_seq".to_string()),
+        "symmetric_random" => Some("symmetric_random".to_string()),
+        _ => None,
+    }
+}
+
+/// Clamp client-reported NAT port delta to `[-1024, 1024]`.
+pub fn normalize_nat_port_delta(raw: Option<i16>) -> Option<i16> {
+    raw.map(|d| d.clamp(NAT_PORT_DELTA_MIN, NAT_PORT_DELTA_MAX))
+}
+
+/// Select the legacy single-field `public_udp_addr` pair (`(a_addr, b_addr)`) for `PunchCoord`.
+///
+/// When both peers have an IPv4 endpoint in `*_all`, both legacy fields (`peer_public_udp_addr`
+/// and `self_public_udp_addr`) are pinned to IPv4 so older clients receive IPv4 and
+/// `same_public_ip` can perform same-family IPv4-vs-IPv4 comparison even if IPv6 probed last.
+/// Otherwise, each side prefers IPv4 from `*_all`, falling back to `*_fallback` or `*_all.first()`.
+pub fn select_legacy_public_udp_pair(
+    a_all: &[SocketAddr],
+    a_fallback: Option<SocketAddr>,
+    b_all: &[SocketAddr],
+    b_fallback: Option<SocketAddr>,
+) -> (Option<String>, Option<String>) {
+    let a_v4 = a_all.iter().copied().find(SocketAddr::is_ipv4);
+    let b_v4 = b_all.iter().copied().find(SocketAddr::is_ipv4);
+    if let (Some(a), Some(b)) = (a_v4, b_v4) {
+        return (Some(a.to_string()), Some(b.to_string()));
+    }
+    let pick = |all: &[SocketAddr], fallback: Option<SocketAddr>| -> Option<String> {
+        all.iter()
+            .copied()
+            .find(SocketAddr::is_ipv4)
+            .or(fallback)
+            .or_else(|| all.first().copied())
+            .map(|addr| addr.to_string())
+    };
+    (pick(a_all, a_fallback), pick(b_all, b_fallback))
+}
+
 #[derive(Debug, Error)]
 pub enum SignalError {
     #[error("invalid UDP packet: {0}")]
@@ -174,6 +237,102 @@ impl UdpProbeRequest {
         let mut nonce = [0u8; 8];
         nonce.copy_from_slice(&buf[14..22]);
         Ok(Self { device_id, nonce })
+    }
+}
+
+/// Wire layout (38 bytes fixed):
+/// `[b"RCSP" (4B)][ver=2 (1B)][device_id: 9B ASCII][nonce: 8B][token: 16B raw]`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdpProbeRequestV2 {
+    pub device_id: String,
+    pub nonce: [u8; 8],
+    pub token: [u8; UDP_PROBE_TOKEN_LEN],
+}
+
+impl UdpProbeRequestV2 {
+    pub fn encode(&self) -> Result<[u8; UDP_PROBE_V2_LEN], SignalError> {
+        let id_bytes = self.device_id.as_bytes();
+        if id_bytes.len() != 9 || !id_bytes.iter().all(u8::is_ascii_digit) {
+            return Err(SignalError::InvalidUdpPacket(
+                "device_id must be exactly 9 ASCII digits",
+            ));
+        }
+        let mut out = [0u8; UDP_PROBE_V2_LEN];
+        out[0..4].copy_from_slice(UDP_PROBE_MAGIC);
+        out[4] = UDP_PROTO_VERSION_V2;
+        out[5..14].copy_from_slice(id_bytes);
+        out[14..22].copy_from_slice(&self.nonce);
+        out[22..38].copy_from_slice(&self.token);
+        Ok(out)
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, SignalError> {
+        if buf.len() != UDP_PROBE_V2_LEN {
+            return Err(SignalError::InvalidUdpPacket(
+                "RCSP v2 packet must be exactly 38 bytes",
+            ));
+        }
+        if &buf[0..4] != UDP_PROBE_MAGIC {
+            return Err(SignalError::InvalidUdpPacket("bad RCSP magic"));
+        }
+        if buf[4] != UDP_PROTO_VERSION_V2 {
+            return Err(SignalError::InvalidUdpPacket("unsupported RCSP version"));
+        }
+        let id_bytes = &buf[5..14];
+        if !id_bytes.iter().all(u8::is_ascii_digit) {
+            return Err(SignalError::InvalidUdpPacket(
+                "device_id must be 9 ASCII digits",
+            ));
+        }
+        let device_id = std::str::from_utf8(id_bytes)
+            .map_err(|_| SignalError::InvalidUdpPacket("invalid UTF-8 device_id"))?
+            .to_string();
+        let mut nonce = [0u8; 8];
+        nonce.copy_from_slice(&buf[14..22]);
+        let mut token = [0u8; UDP_PROBE_TOKEN_LEN];
+        token.copy_from_slice(&buf[22..38]);
+        Ok(Self {
+            device_id,
+            nonce,
+            token,
+        })
+    }
+}
+
+/// Versioned RCSP request decoded by the UDP STUN-lite listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodedUdpProbe {
+    V1(UdpProbeRequest),
+    V2(UdpProbeRequestV2),
+}
+
+impl DecodedUdpProbe {
+    pub fn decode(buf: &[u8]) -> Result<Self, SignalError> {
+        if buf.len() < 5 {
+            return Err(SignalError::InvalidUdpPacket("RCSP packet too short"));
+        }
+        if &buf[0..4] != UDP_PROBE_MAGIC {
+            return Err(SignalError::InvalidUdpPacket("bad RCSP magic"));
+        }
+        match buf[4] {
+            UDP_PROTO_VERSION => Ok(Self::V1(UdpProbeRequest::decode(buf)?)),
+            UDP_PROTO_VERSION_V2 => Ok(Self::V2(UdpProbeRequestV2::decode(buf)?)),
+            _ => Err(SignalError::InvalidUdpPacket("unsupported RCSP version")),
+        }
+    }
+
+    pub fn device_id(&self) -> &str {
+        match self {
+            Self::V1(req) => &req.device_id,
+            Self::V2(req) => &req.device_id,
+        }
+    }
+
+    pub fn nonce(&self) -> [u8; 8] {
+        match self {
+            Self::V1(req) => req.nonce,
+            Self::V2(req) => req.nonce,
+        }
     }
 }
 
@@ -287,12 +446,20 @@ pub enum SignalMsg {
         mac_addr: Option<String>,
         #[serde(default)]
         wol_enabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nat_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nat_port_delta: Option<i16>,
     },
     Registered {
         device_id: String,
         formatted_id: String,
         server_time: DateTime<Utc>,
         udp_probe_addr: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        udp_probe_alt_addr: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        udp_probe_token: Option<String>,
         relay_addr: String,
     },
     Heartbeat {
@@ -302,6 +469,10 @@ pub enum SignalMsg {
         mac_addr: Option<String>,
         #[serde(default)]
         wol_enabled: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nat_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nat_port_delta: Option<i16>,
     },
     HeartbeatAck {
         server_time: DateTime<Utc>,
@@ -343,6 +514,10 @@ pub enum SignalMsg {
         lan_addrs: Vec<String>,
         #[serde(default)]
         nonce: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nat_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nat_port_delta: Option<i16>,
     },
     PunchCoord {
         session_id: String,
@@ -350,6 +525,14 @@ pub enum SignalMsg {
         peer_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         peer_public_udp_addr: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        peer_public_udp_addrs: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        self_public_udp_addr: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_nat_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_nat_port_delta: Option<i16>,
         peer_lan_addrs: Vec<String>,
         nonce: String,
         relay_token: String,
@@ -524,6 +707,7 @@ pub struct SignalConfig {
     pub wol_caller_rate_limit_window: Duration,
     pub allow_server_wol: bool,
     pub public_udp_probe_addr: String,
+    pub public_udp_probe_alt_addr: Option<String>,
     pub public_relay_addr: String,
     pub require_auth: bool,
 }
@@ -549,6 +733,7 @@ impl Default for SignalConfig {
             wol_caller_rate_limit_window: DEFAULT_WOL_CALLER_RATE_LIMIT_WINDOW,
             allow_server_wol: false,
             public_udp_probe_addr: "127.0.0.1:21116".to_string(),
+            public_udp_probe_alt_addr: None,
             public_relay_addr: "127.0.0.1:21117".to_string(),
             require_auth: true,
         }
@@ -1031,6 +1216,24 @@ struct ActivePeer {
     os: String,
     app_version: String,
     arch: String,
+    udp_probe_token: Option<[u8; UDP_PROBE_TOKEN_LEN]>,
+    nat_type: Option<String>,
+    nat_port_delta: Option<i16>,
+}
+
+fn apply_peer_nat_update(
+    peer: &mut ActivePeer,
+    nat_type: Option<&str>,
+    nat_port_delta: Option<i16>,
+) {
+    let norm_nat_type = normalize_nat_type(nat_type);
+    let norm_nat_delta = normalize_nat_port_delta(nat_port_delta);
+    if let Some(nt) = norm_nat_type {
+        peer.nat_type = Some(nt);
+        peer.nat_port_delta = norm_nat_delta;
+    } else if let Some(delta) = norm_nat_delta {
+        peer.nat_port_delta = Some(delta);
+    }
 }
 
 pub struct SignalHub {
@@ -1336,7 +1539,8 @@ impl SignalHub {
         self: Arc<Self>,
         socket: Arc<UdpSocket>,
     ) -> std::io::Result<()> {
-        self.serve_udp_probe_on_socket_inner(socket, None).await
+        self.serve_udp_probe_on_socket_inner(socket, None, true)
+            .await
     }
 
     /// Serve UDP STUN-lite probes on a bound `UdpSocket`, exiting cleanly on either
@@ -1346,7 +1550,27 @@ impl SignalHub {
         socket: Arc<UdpSocket>,
         shutdown: watch::Receiver<bool>,
     ) -> std::io::Result<()> {
-        self.serve_udp_probe_on_socket_inner(socket, Some(shutdown))
+        self.serve_udp_probe_on_socket_inner(socket, Some(shutdown), true)
+            .await
+    }
+
+    /// Serve secondary UDP STUN-lite echo-only probes (`RCSP` -> `RCSA`) without updating `EphemeralStore`.
+    pub async fn serve_udp_probe_alt_on_socket(
+        self: Arc<Self>,
+        socket: Arc<UdpSocket>,
+    ) -> std::io::Result<()> {
+        self.serve_udp_probe_on_socket_inner(socket, None, false)
+            .await
+    }
+
+    /// Serve secondary UDP STUN-lite echo-only probes on a bound `UdpSocket`, exiting cleanly on
+    /// either external `shutdown` signal or `shutdown_all()`.
+    pub async fn serve_udp_probe_alt_on_socket_with_shutdown(
+        self: Arc<Self>,
+        socket: Arc<UdpSocket>,
+        shutdown: watch::Receiver<bool>,
+    ) -> std::io::Result<()> {
+        self.serve_udp_probe_on_socket_inner(socket, Some(shutdown), false)
             .await
     }
 
@@ -1354,6 +1578,7 @@ impl SignalHub {
         self: Arc<Self>,
         socket: Arc<UdpSocket>,
         mut shutdown: Option<watch::Receiver<bool>>,
+        persist_endpoints: bool,
     ) -> std::io::Result<()> {
         let server_shutdown = self.shutdown.cancelled();
         tokio::pin!(server_shutdown);
@@ -1361,54 +1586,58 @@ impl SignalHub {
         tokio::pin!(external_shutdown);
 
         // Bounded background queue for `set_public_udp` updates so Redis/backend latency
-        // never head-of-line blocks UDP `RCSA` responses.
-        let (udp_update_tx, mut udp_update_rx) =
-            mpsc::channel::<(String, SocketAddr)>(UDP_EPHEMERAL_QUEUE_CAPACITY);
-        let worker_hub = Arc::clone(&self);
-        let worker_guard = SignalTaskGuard::enter(Arc::clone(&self));
-        let worker_handle = tokio::spawn(async move {
-            let _guard = worker_guard;
-            let worker_shutdown = worker_hub.shutdown.cancelled();
-            tokio::pin!(worker_shutdown);
-            loop {
-                let next = tokio::select! {
-                    biased;
-                    _ = &mut worker_shutdown => break,
-                    item = udp_update_rx.recv() => match item {
-                        Some(pair) => pair,
-                        None => break,
-                    },
-                };
-                let (device_id, canonical_src) = next;
-                match tokio::time::timeout(
-                    UDP_EPHEMERAL_UPDATE_TIMEOUT,
-                    worker_hub.ephemeral.set_public_udp(
-                        &device_id,
-                        canonical_src,
-                        worker_hub.config.udp_ttl,
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => {
-                        warn!(
-                            %device_id,
-                            %canonical_src,
-                            error = %err,
-                            "failed to store public UDP endpoint"
-                        );
-                    }
-                    Err(_) => {
-                        warn!(
-                            %device_id,
-                            %canonical_src,
-                            "timed out storing public UDP endpoint"
-                        );
+        // never head-of-line blocks UDP `RCSA` responses. Disabled on the secondary alt port.
+        let (udp_update_tx, worker_handle) = if persist_endpoints {
+            let (tx, mut rx) = mpsc::channel::<(String, SocketAddr)>(UDP_EPHEMERAL_QUEUE_CAPACITY);
+            let worker_hub = Arc::clone(&self);
+            let worker_guard = SignalTaskGuard::enter(Arc::clone(&self));
+            let handle = tokio::spawn(async move {
+                let _guard = worker_guard;
+                let worker_shutdown = worker_hub.shutdown.cancelled();
+                tokio::pin!(worker_shutdown);
+                loop {
+                    let next = tokio::select! {
+                        biased;
+                        _ = &mut worker_shutdown => break,
+                        item = rx.recv() => match item {
+                            Some(pair) => pair,
+                            None => break,
+                        },
+                    };
+                    let (device_id, canonical_src) = next;
+                    match tokio::time::timeout(
+                        UDP_EPHEMERAL_UPDATE_TIMEOUT,
+                        worker_hub.ephemeral.set_public_udp(
+                            &device_id,
+                            canonical_src,
+                            worker_hub.config.udp_ttl,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            warn!(
+                                %device_id,
+                                %canonical_src,
+                                error = %err,
+                                "failed to store public UDP endpoint"
+                            );
+                        }
+                        Err(_) => {
+                            warn!(
+                                %device_id,
+                                %canonical_src,
+                                "timed out storing public UDP endpoint"
+                            );
+                        }
                     }
                 }
-            }
-        });
+            });
+            (Some(tx), Some(handle))
+        } else {
+            (None, None)
+        };
 
         let mut buf = [0u8; 256];
         loop {
@@ -1461,7 +1690,7 @@ impl SignalHub {
                 continue;
             }
 
-            let req = match UdpProbeRequest::decode(&buf[..n]) {
+            let req = match DecodedUdpProbe::decode(&buf[..n]) {
                 Ok(req) => req,
                 Err(err) => {
                     debug!(%canonical_src, bytes = n, error = %err, "dropping malformed UDP RCSP packet");
@@ -1469,10 +1698,11 @@ impl SignalHub {
                 }
             };
 
-            if req.device_id != ANONYMOUS_DEVICE_ID && !is_valid_device_id(&req.device_id) {
+            let req_device_id = req.device_id();
+            if req_device_id != ANONYMOUS_DEVICE_ID && !is_valid_device_id(req_device_id) {
                 debug!(
                     %canonical_src,
-                    device_id = %req.device_id,
+                    device_id = %req_device_id,
                     "dropping UDP RCSP packet with invalid device_id"
                 );
                 continue;
@@ -1482,7 +1712,7 @@ impl SignalHub {
             // delays STUN-lite echo. Send back to original `src_addr` for dual-stack sockets.
             let resp = UdpProbeResponse {
                 observed_addr: canonical_src,
-                nonce: req.nonce,
+                nonce: req.nonce(),
             }
             .encode();
 
@@ -1490,33 +1720,46 @@ impl SignalHub {
                 debug!(%src_addr, error = %err, "failed to send UDP RCSA reply");
             }
 
-            // Only persist public UDP endpoint if the device is currently online over
-            // authenticated TCP signaling AND the canonical source IP matches!
-            if req.device_id != ANONYMOUS_DEVICE_ID {
-                let authorized = self
-                    .peers
-                    .get(&req.device_id)
-                    .is_some_and(|peer| canonical_ip(peer.remote_addr.ip()) == canonical_src.ip());
+            // Secondary alt port is echo-only and must never overwrite primary EphemeralStore state.
+            let Some(ref tx) = udp_update_tx else {
+                continue;
+            };
+
+            // Persist public UDP endpoint only for authenticated online devices:
+            // - RCSP v1: matching canonical TCP remote IP
+            // - RCSP v2: constant-time verification of the 16B udp_probe_token (supports multi-egress / dual-stack)
+            if req_device_id != ANONYMOUS_DEVICE_ID {
+                let authorized = match &req {
+                    DecodedUdpProbe::V1(v1) => self.peers.get(&v1.device_id).is_some_and(|peer| {
+                        canonical_ip(peer.remote_addr.ip()) == canonical_src.ip()
+                    }),
+                    DecodedUdpProbe::V2(v2) => self.peers.get(&v2.device_id).is_some_and(|peer| {
+                        peer.udp_probe_token
+                            .is_some_and(|expected| constant_time_eq_bytes(&expected, &v2.token))
+                    }),
+                };
                 if authorized {
-                    if let Err(err) = udp_update_tx.try_send((req.device_id, canonical_src)) {
+                    if let Err(err) = tx.try_send((req_device_id.to_string(), canonical_src)) {
                         debug!(%canonical_src, error = %err, "dropping public UDP update because background queue is full/closed");
                     }
                 } else {
                     debug!(
-                        device_id = %req.device_id,
+                        device_id = %req_device_id,
                         %canonical_src,
-                        "ignoring UDP endpoint update for offline device or mismatched IP"
+                        "ignoring UDP endpoint update for offline device, mismatched IP, or invalid probe token"
                     );
                 }
             }
         }
 
         drop(udp_update_tx);
-        let _ = tokio::time::timeout(
-            UDP_EPHEMERAL_UPDATE_TIMEOUT + Duration::from_millis(100),
-            worker_handle,
-        )
-        .await;
+        if let Some(handle) = worker_handle {
+            let _ = tokio::time::timeout(
+                UDP_EPHEMERAL_UPDATE_TIMEOUT + Duration::from_millis(100),
+                handle,
+            )
+            .await;
+        }
         Ok(())
     }
 
@@ -1831,6 +2074,8 @@ impl SignalHub {
             allow_remote_control_opt,
             mac_addr_opt,
             wol_enabled_opt,
+            nat_type_opt,
+            nat_port_delta_opt,
         ) = match first_frame {
             SignalMsg::Register {
                 device_id,
@@ -1847,6 +2092,8 @@ impl SignalHub {
                 allow_remote_control,
                 mac_addr,
                 wol_enabled,
+                nat_type,
+                nat_port_delta,
             } => {
                 if let Err(reason) = validate_register_fields(
                     &hostname,
@@ -1916,6 +2163,8 @@ impl SignalHub {
                     allow_remote_control,
                     normalized_mac,
                     wol_enabled,
+                    normalize_nat_type(nat_type.as_deref()),
+                    normalize_nat_port_delta(nat_port_delta),
                 )
             }
             _ => {
@@ -2344,6 +2593,9 @@ impl SignalHub {
             let effective_assist = latest.allow_remote_assist;
             let effective_remote_control = latest.allow_remote_control;
             let effective_wol_capable = latest.wol_capable();
+            let mut udp_probe_token = [0u8; UDP_PROBE_TOKEN_LEN];
+            OsRng.fill_bytes(&mut udp_probe_token);
+            let udp_probe_token_hex = hex::encode(udp_probe_token);
 
             if let Some(old_peer) = self.peers.insert(
                 device_id.clone(),
@@ -2364,6 +2616,9 @@ impl SignalHub {
                     os: latest.os.clone(),
                     app_version: latest.app_version.clone(),
                     arch: latest.arch.clone(),
+                    udp_probe_token: Some(udp_probe_token),
+                    nat_type: nat_type_opt,
+                    nat_port_delta: nat_port_delta_opt,
                 },
             ) {
                 old_peer.cancel.kick(err_code::REPLACED_BY_NEW_CONNECTION);
@@ -2383,6 +2638,8 @@ impl SignalHub {
                 formatted_id: format_device_id(&device_id),
                 server_time: Utc::now(),
                 udp_probe_addr: self.config.public_udp_probe_addr.clone(),
+                udp_probe_alt_addr: self.config.public_udp_probe_alt_addr.clone(),
+                udp_probe_token: Some(udp_probe_token_hex),
                 relay_addr: self.config.public_relay_addr.clone(),
             });
 
@@ -2633,14 +2890,31 @@ impl SignalHub {
         cancel: &PeerCancel,
         new_lan_addrs: Option<Vec<String>>,
     ) -> bool {
+        self.refresh_online_and_nat_under_lock(device_id, conn_id, cancel, new_lan_addrs, None)
+            .await
+    }
+
+    async fn refresh_online_and_nat_under_lock(
+        &self,
+        device_id: &str,
+        conn_id: u64,
+        cancel: &PeerCancel,
+        new_lan_addrs: Option<Vec<String>>,
+        nat_update: Option<(Option<String>, Option<i16>)>,
+    ) -> bool {
         let _guard = self.lock_device(device_id).await;
         if !self.is_active_conn(device_id, conn_id, cancel) {
             return false;
         }
-        if let Some(addrs) = new_lan_addrs {
+        if new_lan_addrs.is_some() || nat_update.is_some() {
             if let Some(mut peer) = self.peers.get_mut(device_id) {
                 if peer.conn_id == conn_id {
-                    peer.lan_addrs = addrs;
+                    if let Some(addrs) = new_lan_addrs {
+                        peer.lan_addrs = addrs;
+                    }
+                    if let Some((nat_type, nat_port_delta)) = nat_update {
+                        apply_peer_nat_update(&mut peer, nat_type.as_deref(), nat_port_delta);
+                    }
                 }
             }
         }
@@ -2856,6 +3130,8 @@ impl SignalHub {
                 lan_addrs,
                 mac_addr,
                 wol_enabled,
+                nat_type,
+                nat_port_delta,
             } => {
                 if let Err(reason) = validate_lan_addrs(&lan_addrs) {
                     Self::send_nonblocking(
@@ -2893,21 +3169,24 @@ impl SignalHub {
                         return;
                     }
 
-                    let (owner_uid, public_ip_str, lan_addrs_changed) =
-                        match self.peers.get_mut(device_id) {
-                            Some(mut peer) if peer.conn_id == conn_id => {
-                                let changed = !lan_addrs.is_empty() && peer.lan_addrs != lan_addrs;
-                                if changed {
-                                    peer.lan_addrs = lan_addrs.clone();
-                                }
-                                (
-                                    peer.owner_user_id,
-                                    canonical_ip(peer.remote_addr.ip()).to_string(),
-                                    changed,
-                                )
+                    let (owner_uid, public_ip_str, lan_addrs_changed) = match self
+                        .peers
+                        .get_mut(device_id)
+                    {
+                        Some(mut peer) if peer.conn_id == conn_id => {
+                            let changed = !lan_addrs.is_empty() && peer.lan_addrs != lan_addrs;
+                            if changed {
+                                peer.lan_addrs = lan_addrs.clone();
                             }
-                            _ => return,
-                        };
+                            apply_peer_nat_update(&mut peer, nat_type.as_deref(), nat_port_delta);
+                            (
+                                peer.owner_user_id,
+                                canonical_ip(peer.remote_addr.ip()).to_string(),
+                                changed,
+                            )
+                        }
+                        _ => return,
+                    };
 
                     if let Err(err) = self
                         .ephemeral
@@ -3294,6 +3573,8 @@ impl SignalHub {
                 session_id,
                 lan_addrs,
                 nonce,
+                nat_type,
+                nat_port_delta,
             } => {
                 let target_norm = normalize_device_id(&target_id);
                 if target_norm.is_empty() {
@@ -3387,29 +3668,55 @@ impl SignalHub {
                 } else {
                     Some(lan_addrs.clone())
                 };
+                let nat_update = if nat_type.is_some() || nat_port_delta.is_some() {
+                    Some((nat_type, nat_port_delta))
+                } else {
+                    None
+                };
                 if !self
-                    .refresh_online_under_lock(device_id, conn_id, cancel, updated_lan)
+                    .refresh_online_and_nat_under_lock(
+                        device_id,
+                        conn_id,
+                        cancel,
+                        updated_lan,
+                        nat_update,
+                    )
                     .await
                 {
                     return;
                 }
 
-                let client_lan_addrs = if !lan_addrs.is_empty() {
-                    lan_addrs
-                } else {
-                    self.peers
+                let (client_lan_addrs, client_nat_type, client_nat_port_delta) = {
+                    let snapshot = self
+                        .peers
                         .get(device_id)
                         .filter(|p| p.conn_id == conn_id)
-                        .map(|p| p.lan_addrs.clone())
-                        .unwrap_or_default()
+                        .map(|p| (p.lan_addrs.clone(), p.nat_type.clone(), p.nat_port_delta));
+                    match snapshot {
+                        Some((peer_lan, nt, delta)) => {
+                            let addrs = if !lan_addrs.is_empty() {
+                                lan_addrs
+                            } else {
+                                peer_lan
+                            };
+                            (addrs, nt, delta)
+                        }
+                        None => (lan_addrs, None, None),
+                    }
                 };
 
-                let target_snapshot = self
-                    .peers
-                    .get(&target_norm)
-                    .map(|p| (p.tx.clone(), p.lan_addrs.clone()));
+                let target_snapshot = self.peers.get(&target_norm).map(|p| {
+                    (
+                        p.tx.clone(),
+                        p.lan_addrs.clone(),
+                        p.nat_type.clone(),
+                        p.nat_port_delta,
+                    )
+                });
 
-                let Some((host_tx, host_lan_addrs)) = target_snapshot else {
+                let Some((host_tx, host_lan_addrs, host_nat_type, host_nat_port_delta)) =
+                    target_snapshot
+                else {
                     Self::send_nonblocking(
                         self_tx,
                         device_id,
@@ -3439,20 +3746,42 @@ impl SignalHub {
                     }
                 };
 
-                let client_udp = self
+                let client_udp_fallback = self
                     .ephemeral
                     .get_public_udp(device_id)
                     .await
                     .ok()
-                    .flatten()
-                    .map(|a| a.to_string());
-                let host_udp = self
+                    .flatten();
+                let client_udp_all_addrs = self
+                    .ephemeral
+                    .get_public_udp_all(device_id)
+                    .await
+                    .unwrap_or_default();
+                let host_udp_fallback = self
                     .ephemeral
                     .get_public_udp(&target_norm)
                     .await
                     .ok()
-                    .flatten()
-                    .map(|a| a.to_string());
+                    .flatten();
+                let host_udp_all_addrs = self
+                    .ephemeral
+                    .get_public_udp_all(&target_norm)
+                    .await
+                    .unwrap_or_default();
+                let (client_udp, host_udp) = select_legacy_public_udp_pair(
+                    &client_udp_all_addrs,
+                    client_udp_fallback,
+                    &host_udp_all_addrs,
+                    host_udp_fallback,
+                );
+                let client_udp_all: Vec<String> = client_udp_all_addrs
+                    .into_iter()
+                    .map(|a| a.to_string())
+                    .collect();
+                let host_udp_all: Vec<String> = host_udp_all_addrs
+                    .into_iter()
+                    .map(|a| a.to_string())
+                    .collect();
 
                 if !self.is_active_conn(device_id, conn_id, cancel) {
                     return;
@@ -3463,7 +3792,11 @@ impl SignalHub {
                     session_id: session_id.clone(),
                     role: "client".into(),
                     peer_id: target_norm.clone(),
-                    peer_public_udp_addr: host_udp,
+                    peer_public_udp_addr: host_udp.clone(),
+                    peer_public_udp_addrs: host_udp_all,
+                    self_public_udp_addr: client_udp.clone(),
+                    peer_nat_type: host_nat_type,
+                    peer_nat_port_delta: host_nat_port_delta,
                     peer_lan_addrs: host_lan_addrs,
                     nonce: nonce.clone(),
                     relay_token: relay_token.clone(),
@@ -3476,6 +3809,10 @@ impl SignalHub {
                     role: "host".into(),
                     peer_id: device_id.to_string(),
                     peer_public_udp_addr: client_udp,
+                    peer_public_udp_addrs: client_udp_all,
+                    self_public_udp_addr: host_udp,
+                    peer_nat_type: client_nat_type,
+                    peer_nat_port_delta: client_nat_port_delta,
                     peer_lan_addrs: client_lan_addrs,
                     nonce,
                     relay_token: relay_token.clone(),
@@ -4223,6 +4560,8 @@ mod tests {
             lan_addrs: vec!["192.168.1.10:50000".into()],
             mac_addr: None,
             wol_enabled: None,
+            nat_type: None,
+            nat_port_delta: None,
         };
         let frame = encode_signal_frame(&msg).expect("encode frame");
         let len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
@@ -4273,6 +4612,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -4351,6 +4692,8 @@ mod tests {
                     lan_addrs: vec![],
                     mac_addr: None,
                     wol_enabled: None,
+                    nat_type: None,
+                    nat_port_delta: None,
                 },
             )
             .await
@@ -4381,6 +4724,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -4408,6 +4753,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -4436,6 +4783,8 @@ mod tests {
                 lan_addrs: vec!["192.168.1.20:50001".into()],
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -4460,6 +4809,8 @@ mod tests {
                 session_id: Some("sess-punch-1".into()),
                 lan_addrs: vec!["192.168.1.20:50001".into()],
                 nonce: Some("deadbeef".into()),
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -4559,6 +4910,8 @@ mod tests {
                 session_id: Some("sess-off".into()),
                 lan_addrs: vec![],
                 nonce: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -4599,6 +4952,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -4643,6 +4998,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -4676,6 +5033,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -4704,6 +5063,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -4746,6 +5107,8 @@ mod tests {
                 lan_addrs: vec![],
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             };
             if write_signal_frame(stream, &msg).await.is_err() {
                 break;
@@ -4791,6 +5154,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -4824,6 +5189,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -4850,6 +5217,8 @@ mod tests {
                 lan_addrs: vec!["10.99.99.99:9999".into()],
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await;
@@ -4886,6 +5255,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -4917,6 +5288,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -4933,6 +5306,8 @@ mod tests {
                 lan_addrs: vec!["10.99.99.99:9999".into()],
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await;
@@ -4992,6 +5367,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -5074,6 +5451,8 @@ mod tests {
                     allow_remote_control: None,
                     mac_addr: None,
                     wol_enabled: None,
+                    nat_type: None,
+                    nat_port_delta: None,
                 },
             )
             .await
@@ -5104,6 +5483,8 @@ mod tests {
                     allow_remote_control: None,
                     mac_addr: None,
                     wol_enabled: None,
+                    nat_type: None,
+                    nat_port_delta: None,
                 },
             )
             .await
@@ -5134,6 +5515,8 @@ mod tests {
                     allow_remote_control: None,
                     mac_addr: None,
                     wol_enabled: None,
+                    nat_type: None,
+                    nat_port_delta: None,
                 },
             )
             .await
@@ -5227,6 +5610,13 @@ mod tests {
             self.inner.get_public_udp(device_id).await
         }
 
+        async fn get_public_udp_all(
+            &self,
+            device_id: &str,
+        ) -> Result<Vec<SocketAddr>, crate::ephemeral::EphemeralError> {
+            self.inner.get_public_udp_all(device_id).await
+        }
+
         async fn put_relay_token(
             &self,
             token: &str,
@@ -5300,6 +5690,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -5354,6 +5746,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -5370,6 +5764,8 @@ mod tests {
                 lan_addrs: vec!["10.0.0.5:5000".into()],
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -5426,6 +5822,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -5479,6 +5877,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -5633,6 +6033,12 @@ mod tests {
         ) -> Result<Option<SocketAddr>, EphemeralError> {
             self.inner.get_public_udp(device_id).await
         }
+        async fn get_public_udp_all(
+            &self,
+            device_id: &str,
+        ) -> Result<Vec<SocketAddr>, EphemeralError> {
+            self.inner.get_public_udp_all(device_id).await
+        }
         async fn put_relay_token(
             &self,
             token: &str,
@@ -5757,6 +6163,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
             SignalMsg::Register {
                 device_id: None,
@@ -5773,6 +6181,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
             SignalMsg::Register {
                 device_id: None,
@@ -5789,6 +6199,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         ] {
             let mut s = TcpStream::connect(tcp_addr).await.unwrap();
@@ -5811,30 +6223,40 @@ mod tests {
                 session_id: Some("a".repeat(MAX_SESSION_ID_LEN + 1)),
                 lan_addrs: vec![],
                 nonce: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
             SignalMsg::ConnectRequest {
                 target_id: victim_id.clone(),
                 session_id: Some("bad\nsess".into()),
                 lan_addrs: vec![],
                 nonce: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
             SignalMsg::ConnectRequest {
                 target_id: victim_id.clone(),
                 session_id: Some("ok-sess".into()),
                 lan_addrs: vec![],
                 nonce: Some("n".repeat(MAX_NONCE_LEN + 1)),
+                nat_type: None,
+                nat_port_delta: None,
             },
             SignalMsg::ConnectRequest {
                 target_id: victim_id.clone(),
                 session_id: Some("ok-sess".into()),
                 lan_addrs: vec!["10.0.0.9:5000".into(); MAX_LAN_ADDRS + 1],
                 nonce: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
             SignalMsg::ConnectRequest {
                 target_id: victim_id.clone(),
                 session_id: Some("ok-sess".into()),
                 lan_addrs: vec!["x".repeat(MAX_LAN_ADDR_LEN + 1)],
                 nonce: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
             SignalMsg::RelayAlloc {
                 target_id: victim_id.clone(),
@@ -5868,6 +6290,8 @@ mod tests {
                 lan_addrs: vec![],
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -5919,6 +6343,8 @@ mod tests {
                     session_id: Some("s1".into()),
                     lan_addrs: vec![],
                     nonce: None,
+                    nat_type: None,
+                    nat_port_delta: None,
                 },
             )
             .await
@@ -6065,6 +6491,8 @@ mod tests {
                     lan_addrs: vec![],
                     mac_addr: None,
                     wol_enabled: None,
+                    nat_type: None,
+                    nat_port_delta: None,
                 })
                 .unwrap();
             let full_host_id = "888777666".to_string();
@@ -6087,6 +6515,9 @@ mod tests {
                     os: String::new(),
                     app_version: String::new(),
                     arch: String::new(),
+                    udp_probe_token: None,
+                    nat_type: None,
+                    nat_port_delta: None,
                 },
             );
 
@@ -6098,6 +6529,8 @@ mod tests {
                     session_id: Some("full-punch".into()),
                     lan_addrs: vec![],
                     nonce: None,
+                    nat_type: None,
+                    nat_port_delta: None,
                 },
             )
             .await
@@ -6207,6 +6640,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -6285,6 +6720,8 @@ mod tests {
                         allow_remote_control: None,
                         mac_addr: None,
                         wol_enabled: None,
+                        nat_type: None,
+                        nat_port_delta: None,
                     },
                 )
                 .await;
@@ -6341,6 +6778,8 @@ mod tests {
                         allow_remote_control: None,
                         mac_addr: None,
                         wol_enabled: None,
+                        nat_type: None,
+                        nat_port_delta: None,
                     },
                 )
                 .await;
@@ -6399,6 +6838,8 @@ mod tests {
                 session_id: Some("l5-keepalive".into()),
                 lan_addrs: vec![],
                 nonce: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -6612,6 +7053,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -6632,6 +7075,8 @@ mod tests {
                 session_id: Some("anon-blocked-punch".into()),
                 lan_addrs: vec![],
                 nonce: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -6679,6 +7124,9 @@ mod tests {
                 os: "android".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                udp_probe_token: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         );
         write_signal_frame(
@@ -6688,6 +7136,8 @@ mod tests {
                 session_id: Some("synth-blocked".into()),
                 lan_addrs: vec![],
                 nonce: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -7022,6 +7472,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -7086,6 +7538,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -7113,6 +7567,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: Some("AA-BB-CC-DD-EE-FF".into()),
                 wol_enabled: Some(false),
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -7149,6 +7605,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -7401,6 +7859,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -7429,6 +7889,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -7457,6 +7919,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -7665,6 +8129,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: Some("02:66:66:66:66:66".into()),
                 wol_enabled: Some(false),
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -7680,6 +8146,8 @@ mod tests {
                 lan_addrs: vec!["10.77.77.77:50000".into()],
                 mac_addr: Some("02:77:77:77:77:77".into()),
                 wol_enabled: Some(false),
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -7740,6 +8208,8 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         )
         .await
@@ -7830,6 +8300,9 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                udp_probe_token: None,
+                nat_type: None,
+                nat_port_delta: None,
             },
         );
         write_signal_frame(
@@ -7862,5 +8335,798 @@ mod tests {
         drop(caller);
         hub.shutdown_all().await;
         let _ = server_task.await;
+    }
+
+    #[test]
+    fn rcsp_v1_and_v2_codec_and_constant_time_eq() {
+        let req_v1 = UdpProbeRequest {
+            device_id: "123456789".into(),
+            nonce: *b"nonce001",
+        };
+        let enc_v1 = req_v1.encode().unwrap();
+        assert_eq!(enc_v1.len(), UDP_PROBE_LEN);
+        assert_eq!(enc_v1[4], UDP_PROTO_VERSION);
+        assert_eq!(
+            DecodedUdpProbe::decode(&enc_v1).unwrap(),
+            DecodedUdpProbe::V1(req_v1.clone())
+        );
+
+        let token = [0xABu8; UDP_PROBE_TOKEN_LEN];
+        let req_v2 = UdpProbeRequestV2 {
+            device_id: "987654321".into(),
+            nonce: *b"nonce002",
+            token,
+        };
+        let enc_v2 = req_v2.encode().unwrap();
+        assert_eq!(enc_v2.len(), UDP_PROBE_V2_LEN);
+        assert_eq!(enc_v2[4], UDP_PROTO_VERSION_V2);
+        assert_eq!(&enc_v2[22..38], &token);
+        assert_eq!(UdpProbeRequestV2::decode(&enc_v2).unwrap(), req_v2);
+        assert_eq!(
+            DecodedUdpProbe::decode(&enc_v2).unwrap(),
+            DecodedUdpProbe::V2(req_v2.clone())
+        );
+
+        // Wrong lengths or unknown versions must fail.
+        assert!(UdpProbeRequest::decode(&enc_v2).is_err());
+        assert!(UdpProbeRequestV2::decode(&enc_v1).is_err());
+        let mut bad_ver = enc_v2;
+        bad_ver[4] = 0x03;
+        assert!(DecodedUdpProbe::decode(&bad_ver).is_err());
+        assert!(DecodedUdpProbe::decode(&enc_v2[..37]).is_err());
+
+        // Constant-time byte comparison.
+        assert!(constant_time_eq_bytes(&token, &[0xABu8; 16]));
+        let mut diff_token = token;
+        diff_token[15] ^= 0x01;
+        assert!(!constant_time_eq_bytes(&token, &diff_token));
+        assert!(!constant_time_eq_bytes(&token, &[0xABu8; 15]));
+    }
+
+    #[tokio::test]
+    async fn rcsp_v2_cross_ip_token_verification_and_alt_port_no_overwrite() {
+        let store = Arc::new(MemoryDeviceStore::new());
+        let ephemeral = Arc::new(MemoryEphemeralStore::new());
+
+        let primary_udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let primary_addr = primary_udp.local_addr().unwrap();
+        let alt_udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let alt_addr = alt_udp.local_addr().unwrap();
+
+        let hub = Arc::new(SignalHub::new(
+            store,
+            ephemeral.clone(),
+            SignalConfig {
+                public_udp_probe_addr: primary_addr.to_string(),
+                public_udp_probe_alt_addr: Some(alt_addr.to_string()),
+                ..SignalConfig::default()
+            },
+        ));
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let tcp_task = tokio::spawn(hub.clone().serve_tcp_signaling_on_listener(tcp_listener));
+        let primary_task = tokio::spawn(hub.clone().serve_udp_probe_on_socket(primary_udp));
+        let alt_task = tokio::spawn(hub.clone().serve_udp_probe_alt_on_socket(alt_udp));
+
+        let mut sig = TcpStream::connect(tcp_addr).await.unwrap();
+        write_signal_frame(
+            &mut sig,
+            &SignalMsg::Register {
+                device_id: None,
+                device_key: "ed25519:v2-probe-key".into(),
+                hostname: "v2-box".into(),
+                os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
+                device_group: String::new(),
+                lan_addrs: vec![],
+                access_token: None,
+                device_pubkey: None,
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
+                nat_type: Some("Cone".into()),
+                nat_port_delta: Some(0),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (device_id, probe_token_hex) = match read_signal_frame(&mut sig).await.unwrap().unwrap()
+        {
+            SignalMsg::Registered {
+                device_id,
+                udp_probe_alt_addr,
+                udp_probe_token,
+                ..
+            } => {
+                assert_eq!(
+                    udp_probe_alt_addr.as_deref(),
+                    Some(alt_addr.to_string().as_str())
+                );
+                let tok = udp_probe_token.expect("udp_probe_token must be issued");
+                assert_eq!(tok.len(), 32);
+                assert!(tok
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+                (device_id, tok)
+            }
+            other => panic!("expected Registered, got {other:?}"),
+        };
+        let mut token_bytes = [0u8; UDP_PROBE_TOKEN_LEN];
+        hex::decode_to_slice(&probe_token_hex, &mut token_bytes).unwrap();
+
+        // Simulate TCP connection from a different public IP (multi-egress NAT / IPv6 TCP + IPv4 UDP).
+        hub.peers.get_mut(&device_id).unwrap().remote_addr = "198.51.100.99:55555".parse().unwrap();
+
+        let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+        let mut buf = [0u8; 64];
+
+        // 1. RCSP v1 from mismatched IP (127.0.0.1 != 198.51.100.99) replies RCSA but does NOT store.
+        let v1_req = UdpProbeRequest {
+            device_id: device_id.clone(),
+            nonce: *b"v1mismat",
+        };
+        client_sock
+            .send_to(&v1_req.encode().unwrap(), primary_addr)
+            .await
+            .unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), client_sock.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let rcsa_v1 = UdpProbeResponse::decode(&buf[..n]).unwrap();
+        assert_eq!(rcsa_v1.observed_addr, client_addr);
+        assert_eq!(rcsa_v1.nonce, *b"v1mismat");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(ephemeral.get_public_udp(&device_id).await.unwrap(), None);
+
+        // 2. RCSP v2 with WRONG token replies RCSA but does NOT store.
+        let mut wrong_token = token_bytes;
+        wrong_token[0] ^= 0xFF;
+        let bad_v2_req = UdpProbeRequestV2 {
+            device_id: device_id.clone(),
+            nonce: *b"v2wrongt",
+            token: wrong_token,
+        };
+        client_sock
+            .send_to(&bad_v2_req.encode().unwrap(), primary_addr)
+            .await
+            .unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), client_sock.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            UdpProbeResponse::decode(&buf[..n]).unwrap().nonce,
+            *b"v2wrongt"
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(ephemeral.get_public_udp(&device_id).await.unwrap(), None);
+
+        // 3. RCSP v2 with CORRECT token succeeds even when TCP IP != UDP IP!
+        let good_v2_req = UdpProbeRequestV2 {
+            device_id: device_id.clone(),
+            nonce: *b"v2goodok",
+            token: token_bytes,
+        };
+        client_sock
+            .send_to(&good_v2_req.encode().unwrap(), primary_addr)
+            .await
+            .unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), client_sock.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let rcsa_v2 = UdpProbeResponse::decode(&buf[..n]).unwrap();
+        assert_eq!(rcsa_v2.observed_addr, client_addr);
+        assert_eq!(rcsa_v2.nonce, *b"v2goodok");
+
+        let mut stored = None;
+        for _ in 0..100 {
+            stored = ephemeral.get_public_udp(&device_id).await.unwrap();
+            if stored.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(stored, Some(client_addr));
+
+        // 4. Secondary alt UDP port echoes RCSA from a distinct client socket/port but NEVER overwrites EphemeralStore!
+        let alt_client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let alt_client_addr = alt_client_sock.local_addr().unwrap();
+        assert_ne!(alt_client_addr, client_addr);
+        let alt_req = UdpProbeRequestV2 {
+            device_id: device_id.clone(),
+            nonce: *b"altprobe",
+            token: token_bytes,
+        };
+        alt_client_sock
+            .send_to(&alt_req.encode().unwrap(), alt_addr)
+            .await
+            .unwrap();
+        let (n, _) =
+            tokio::time::timeout(Duration::from_secs(2), alt_client_sock.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        let alt_resp = UdpProbeResponse::decode(&buf[..n]).unwrap();
+        assert_eq!(alt_resp.observed_addr, alt_client_addr);
+        assert_eq!(alt_resp.nonce, *b"altprobe");
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            ephemeral.get_public_udp(&device_id).await.unwrap(),
+            Some(client_addr)
+        );
+        assert_eq!(
+            ephemeral.get_public_udp_all(&device_id).await.unwrap(),
+            vec![client_addr]
+        );
+
+        drop(sig);
+        hub.shutdown_all().await;
+        let _ = primary_task.await;
+        let _ = alt_task.await;
+        let _ = tcp_task.await;
+    }
+
+    #[tokio::test]
+    async fn dual_stack_udp_and_nat_fields_propagate_in_punch_coord() {
+        let store = Arc::new(MemoryDeviceStore::new());
+        let ephemeral = Arc::new(MemoryEphemeralStore::new());
+        let hub = Arc::new(SignalHub::new(
+            store,
+            ephemeral.clone(),
+            SignalConfig::default(),
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(hub.clone().serve_tcp_signaling_on_listener(listener));
+
+        // Host registers with mixed-case nat_type="Symmetric_Seq" and nat_port_delta=3.
+        let mut host = TcpStream::connect(tcp_addr).await.unwrap();
+        write_signal_frame(
+            &mut host,
+            &SignalMsg::Register {
+                device_id: None,
+                device_key: "ed25519:ds-host".into(),
+                hostname: "ds-host".into(),
+                os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
+                device_group: String::new(),
+                lan_addrs: vec!["192.168.10.2:50000".into()],
+                access_token: None,
+                device_pubkey: None,
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
+                nat_type: Some("Symmetric_Seq".into()),
+                nat_port_delta: Some(3),
+            },
+        )
+        .await
+        .unwrap();
+        let host_id = match read_signal_frame(&mut host).await.unwrap().unwrap() {
+            SignalMsg::Registered { device_id, .. } => device_id,
+            other => panic!("expected Registered for host, got {other:?}"),
+        };
+
+        // Client registers with invalid nat_type (ignored -> None) and oversized delta (clamped -> 1024).
+        let mut client = TcpStream::connect(tcp_addr).await.unwrap();
+        write_signal_frame(
+            &mut client,
+            &SignalMsg::Register {
+                device_id: None,
+                device_key: "ed25519:ds-client".into(),
+                hostname: "ds-client".into(),
+                os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
+                device_group: String::new(),
+                lan_addrs: vec!["192.168.20.2:50001".into()],
+                access_token: None,
+                device_pubkey: None,
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
+                nat_type: Some("bogus_nat".into()),
+                nat_port_delta: Some(9999),
+            },
+        )
+        .await
+        .unwrap();
+        let client_id = match read_signal_frame(&mut client).await.unwrap().unwrap() {
+            SignalMsg::Registered { device_id, .. } => device_id,
+            other => panic!("expected Registered for client, got {other:?}"),
+        };
+        {
+            let client_peer = hub.peers.get(&client_id).unwrap();
+            assert_eq!(client_peer.nat_type, None);
+            assert_eq!(client_peer.nat_port_delta, Some(NAT_PORT_DELTA_MAX));
+        }
+
+        // Client updates via Heartbeat to "CONE" / 0.
+        write_signal_frame(
+            &mut client,
+            &SignalMsg::Heartbeat {
+                lan_addrs: vec![],
+                mac_addr: None,
+                wol_enabled: None,
+                nat_type: Some("CONE".into()),
+                nat_port_delta: Some(0),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut client).await.unwrap().unwrap(),
+            SignalMsg::HeartbeatAck { .. }
+        ));
+
+        // Seed dual-stack endpoints for host (v6 + v4) and single v4 for client.
+        let host_v6: SocketAddr = "[2001:db8::20]:50002".parse().unwrap();
+        let host_v4: SocketAddr = "198.51.100.20:50001".parse().unwrap();
+        let client_v4: SocketAddr = "203.0.113.10:40001".parse().unwrap();
+        ephemeral
+            .set_public_udp(&host_id, host_v6, Duration::from_secs(60))
+            .await
+            .unwrap();
+        ephemeral
+            .set_public_udp(&host_id, host_v4, Duration::from_secs(60))
+            .await
+            .unwrap();
+        ephemeral
+            .set_public_udp(&client_id, client_v4, Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        // Client updates NAT profile in ConnectRequest (clamped to -1024).
+        write_signal_frame(
+            &mut client,
+            &SignalMsg::ConnectRequest {
+                target_id: host_id.clone(),
+                session_id: Some("sess-ds-1".into()),
+                lan_addrs: vec![],
+                nonce: Some("dsnonce1".into()),
+                nat_type: Some("symmetric_random".into()),
+                nat_port_delta: Some(-5000),
+            },
+        )
+        .await
+        .unwrap();
+
+        let client_punch = read_signal_frame(&mut client).await.unwrap().unwrap();
+        let host_punch = read_signal_frame(&mut host).await.unwrap().unwrap();
+
+        match client_punch {
+            SignalMsg::PunchCoord {
+                peer_public_udp_addr,
+                peer_public_udp_addrs,
+                self_public_udp_addr,
+                peer_nat_type,
+                peer_nat_port_delta,
+                ..
+            } => {
+                assert_eq!(peer_public_udp_addr.as_deref(), Some("198.51.100.20:50001"));
+                assert_eq!(
+                    peer_public_udp_addrs,
+                    vec![
+                        "[2001:db8::20]:50002".to_string(),
+                        "198.51.100.20:50001".to_string()
+                    ]
+                );
+                assert_eq!(self_public_udp_addr.as_deref(), Some("203.0.113.10:40001"));
+                assert_eq!(peer_nat_type.as_deref(), Some("symmetric_seq"));
+                assert_eq!(peer_nat_port_delta, Some(3));
+            }
+            other => panic!("expected PunchCoord for client, got {other:?}"),
+        }
+
+        match host_punch {
+            SignalMsg::PunchCoord {
+                peer_public_udp_addr,
+                peer_public_udp_addrs,
+                self_public_udp_addr,
+                peer_nat_type,
+                peer_nat_port_delta,
+                ..
+            } => {
+                assert_eq!(peer_public_udp_addr.as_deref(), Some("203.0.113.10:40001"));
+                assert_eq!(
+                    peer_public_udp_addrs,
+                    vec!["203.0.113.10:40001".to_string()]
+                );
+                assert_eq!(self_public_udp_addr.as_deref(), Some("198.51.100.20:50001"));
+                assert_eq!(peer_nat_type.as_deref(), Some("symmetric_random"));
+                assert_eq!(peer_nat_port_delta, Some(-1024));
+            }
+            other => panic!("expected PunchCoord for host, got {other:?}"),
+        }
+
+        drop(client);
+        drop(host);
+        hub.shutdown_all().await;
+        let _ = server_task.await;
+    }
+
+    #[test]
+    fn legacy_json_without_p1_udp_fields_remains_compatible() {
+        let legacy_register = br#"{"type":"register","device_key":"ed25519:old"}"#;
+        let reg: SignalMsg = serde_json::from_slice(legacy_register).unwrap();
+        assert!(matches!(
+            reg,
+            SignalMsg::Register {
+                nat_type: None,
+                nat_port_delta: None,
+                ..
+            }
+        ));
+
+        let legacy_registered = br#"{"type":"registered","device_id":"123456789","formatted_id":"123 456 789","server_time":"2026-11-22T10:00:00Z","udp_probe_addr":"172.16.1.2:21116","relay_addr":"172.16.1.2:21117"}"#;
+        let reg_ack: SignalMsg = serde_json::from_slice(legacy_registered).unwrap();
+        assert!(matches!(
+            reg_ack,
+            SignalMsg::Registered {
+                udp_probe_alt_addr: None,
+                udp_probe_token: None,
+                ..
+            }
+        ));
+
+        let legacy_hb = br#"{"type":"heartbeat"}"#;
+        let hb: SignalMsg = serde_json::from_slice(legacy_hb).unwrap();
+        assert!(matches!(
+            hb,
+            SignalMsg::Heartbeat {
+                nat_type: None,
+                nat_port_delta: None,
+                ..
+            }
+        ));
+
+        let legacy_conn = br#"{"type":"connect_request","target_id":"987654321"}"#;
+        let conn: SignalMsg = serde_json::from_slice(legacy_conn).unwrap();
+        assert!(matches!(
+            conn,
+            SignalMsg::ConnectRequest {
+                nat_type: None,
+                nat_port_delta: None,
+                ..
+            }
+        ));
+
+        let legacy_punch = br#"{"type":"punch_coord","session_id":"s1","role":"client","peer_id":"987654321","peer_lan_addrs":[],"nonce":"n1","relay_token":"t1","relay_addr":"172.16.1.2:21117"}"#;
+        let punch: SignalMsg = serde_json::from_slice(legacy_punch).unwrap();
+        assert!(matches!(
+            punch,
+            SignalMsg::PunchCoord {
+                ref peer_public_udp_addrs,
+                self_public_udp_addr: None,
+                peer_nat_type: None,
+                peer_nat_port_delta: None,
+                ..
+            } if peer_public_udp_addrs.is_empty()
+        ));
+
+        let serialized = serde_json::to_string(&punch).unwrap();
+        assert!(!serialized.contains("peer_public_udp_addrs"));
+        assert!(!serialized.contains("self_public_udp_addr"));
+        assert!(!serialized.contains("peer_nat_type"));
+        assert!(!serialized.contains("peer_nat_port_delta"));
+    }
+
+    #[test]
+    fn select_legacy_public_udp_pair_prefers_same_family_ipv4_and_fallbacks() {
+        let a_v4: SocketAddr = "203.0.113.10:40001".parse().unwrap();
+        let a_v6: SocketAddr = "[2001:db8::10]:40002".parse().unwrap();
+        let b_v4: SocketAddr = "198.51.100.20:50001".parse().unwrap();
+        let b_v6: SocketAddr = "[2001:db8::20]:50002".parse().unwrap();
+
+        // Both have IPv4 in *_all even when fallback is IPv6 (e.g. IPv6 probed last).
+        assert_eq!(
+            select_legacy_public_udp_pair(&[a_v6, a_v4], Some(a_v6), &[b_v4], Some(b_v4)),
+            (Some(a_v4.to_string()), Some(b_v4.to_string()))
+        );
+
+        // One side dual-stack, other side IPv6-only: IPv4 preferred where present, fallback/first otherwise.
+        assert_eq!(
+            select_legacy_public_udp_pair(&[a_v6, a_v4], Some(a_v6), &[b_v6], Some(b_v6)),
+            (Some(a_v4.to_string()), Some(b_v6.to_string()))
+        );
+
+        // Empty *_all falls back to *_fallback; missing fallback falls back to *_all.first().
+        assert_eq!(
+            select_legacy_public_udp_pair(&[], Some(a_v4), &[b_v6], None),
+            (Some(a_v4.to_string()), Some(b_v6.to_string()))
+        );
+
+        // Neither side has any endpoints.
+        assert_eq!(
+            select_legacy_public_udp_pair(&[], None, &[], None),
+            (None, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn rcsp_v2_ipv4_then_ipv6_keeps_legacy_punch_coord_ipv4_while_preserving_dual_stack_addrs(
+    ) {
+        let store = Arc::new(MemoryDeviceStore::new());
+        let ephemeral = Arc::new(MemoryEphemeralStore::new());
+
+        let udp_v4 = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let udp_v4_addr = udp_v4.local_addr().unwrap();
+        let udp_v6 = Arc::new(UdpSocket::bind("[::1]:0").await.unwrap());
+        let udp_v6_addr = udp_v6.local_addr().unwrap();
+
+        let hub = Arc::new(SignalHub::new(
+            store,
+            ephemeral.clone(),
+            SignalConfig {
+                public_udp_probe_addr: udp_v4_addr.to_string(),
+                ..SignalConfig::default()
+            },
+        ));
+
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let tcp_task = tokio::spawn(hub.clone().serve_tcp_signaling_on_listener(tcp_listener));
+        let udp_v4_task = tokio::spawn(hub.clone().serve_udp_probe_on_socket(udp_v4));
+        let udp_v6_task = tokio::spawn(hub.clone().serve_udp_probe_on_socket(udp_v6));
+
+        // Peer A registers over TCP.
+        let mut peer_a = TcpStream::connect(tcp_addr).await.unwrap();
+        write_signal_frame(
+            &mut peer_a,
+            &SignalMsg::Register {
+                device_id: None,
+                device_key: "ed25519:peer-a-dual".into(),
+                hostname: "peer-a".into(),
+                os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
+                device_group: String::new(),
+                lan_addrs: vec![],
+                access_token: None,
+                device_pubkey: None,
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
+                nat_type: Some("cone".into()),
+                nat_port_delta: Some(0),
+            },
+        )
+        .await
+        .unwrap();
+        let (peer_a_id, peer_a_tok_hex) =
+            match read_signal_frame(&mut peer_a).await.unwrap().unwrap() {
+                SignalMsg::Registered {
+                    device_id,
+                    udp_probe_token,
+                    ..
+                } => (
+                    device_id,
+                    udp_probe_token.expect("peer_a udp_probe_token must be issued"),
+                ),
+                other => panic!("expected Registered for peer A, got {other:?}"),
+            };
+        let mut peer_a_tok = [0u8; UDP_PROBE_TOKEN_LEN];
+        hex::decode_to_slice(&peer_a_tok_hex, &mut peer_a_tok).unwrap();
+
+        // Peer B registers over TCP.
+        let mut peer_b = TcpStream::connect(tcp_addr).await.unwrap();
+        write_signal_frame(
+            &mut peer_b,
+            &SignalMsg::Register {
+                device_id: None,
+                device_key: "ed25519:peer-b-v4".into(),
+                hostname: "peer-b".into(),
+                os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
+                device_group: String::new(),
+                lan_addrs: vec![],
+                access_token: None,
+                device_pubkey: None,
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
+                nat_type: Some("cone".into()),
+                nat_port_delta: Some(0),
+            },
+        )
+        .await
+        .unwrap();
+        let (peer_b_id, peer_b_tok_hex) =
+            match read_signal_frame(&mut peer_b).await.unwrap().unwrap() {
+                SignalMsg::Registered {
+                    device_id,
+                    udp_probe_token,
+                    ..
+                } => (
+                    device_id,
+                    udp_probe_token.expect("peer_b udp_probe_token must be issued"),
+                ),
+                other => panic!("expected Registered for peer B, got {other:?}"),
+            };
+        let mut peer_b_tok = [0u8; UDP_PROBE_TOKEN_LEN];
+        hex::decode_to_slice(&peer_b_tok_hex, &mut peer_b_tok).unwrap();
+
+        let mut buf = [0u8; 64];
+
+        // Peer A probes IPv4 FIRST via RCSP v2.
+        let peer_a_v4_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_a_v4_addr = peer_a_v4_sock.local_addr().unwrap();
+        let req_a_v4 = UdpProbeRequestV2 {
+            device_id: peer_a_id.clone(),
+            nonce: *b"peera_v4",
+            token: peer_a_tok,
+        };
+        peer_a_v4_sock
+            .send_to(&req_a_v4.encode().unwrap(), udp_v4_addr)
+            .await
+            .unwrap();
+        let (n, _) =
+            tokio::time::timeout(Duration::from_secs(2), peer_a_v4_sock.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            UdpProbeResponse::decode(&buf[..n]).unwrap().observed_addr,
+            peer_a_v4_addr
+        );
+        for _ in 0..100 {
+            if ephemeral.get_public_udp(&peer_a_id).await.unwrap() == Some(peer_a_v4_addr) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            ephemeral.get_public_udp(&peer_a_id).await.unwrap(),
+            Some(peer_a_v4_addr)
+        );
+
+        // Peer A probes IPv6 SECOND via RCSP v2 (so legacy get_public_udp becomes IPv6).
+        let peer_a_v6_sock = UdpSocket::bind("[::1]:0").await.unwrap();
+        let peer_a_v6_addr = peer_a_v6_sock.local_addr().unwrap();
+        let req_a_v6 = UdpProbeRequestV2 {
+            device_id: peer_a_id.clone(),
+            nonce: *b"peera_v6",
+            token: peer_a_tok,
+        };
+        peer_a_v6_sock
+            .send_to(&req_a_v6.encode().unwrap(), udp_v6_addr)
+            .await
+            .unwrap();
+        let (n, _) =
+            tokio::time::timeout(Duration::from_secs(2), peer_a_v6_sock.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            UdpProbeResponse::decode(&buf[..n]).unwrap().observed_addr,
+            peer_a_v6_addr
+        );
+        for _ in 0..100 {
+            if ephemeral.get_public_udp(&peer_a_id).await.unwrap() == Some(peer_a_v6_addr) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            ephemeral.get_public_udp(&peer_a_id).await.unwrap(),
+            Some(peer_a_v6_addr)
+        );
+
+        // Peer B probes IPv4 ONLY via RCSP v2.
+        let peer_b_v4_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_b_v4_addr = peer_b_v4_sock.local_addr().unwrap();
+        let req_b_v4 = UdpProbeRequestV2 {
+            device_id: peer_b_id.clone(),
+            nonce: *b"peerb_v4",
+            token: peer_b_tok,
+        };
+        peer_b_v4_sock
+            .send_to(&req_b_v4.encode().unwrap(), udp_v4_addr)
+            .await
+            .unwrap();
+        let (n, _) =
+            tokio::time::timeout(Duration::from_secs(2), peer_b_v4_sock.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            UdpProbeResponse::decode(&buf[..n]).unwrap().observed_addr,
+            peer_b_v4_addr
+        );
+        for _ in 0..100 {
+            if ephemeral.get_public_udp(&peer_b_id).await.unwrap() == Some(peer_b_v4_addr) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            ephemeral.get_public_udp(&peer_b_id).await.unwrap(),
+            Some(peer_b_v4_addr)
+        );
+
+        // Peer B sends ConnectRequest to Peer A.
+        write_signal_frame(
+            &mut peer_b,
+            &SignalMsg::ConnectRequest {
+                target_id: peer_a_id.clone(),
+                session_id: Some("sess-v4-v6-legacy".into()),
+                lan_addrs: vec![],
+                nonce: Some("v4v6nonce".into()),
+                nat_type: Some("cone".into()),
+                nat_port_delta: Some(0),
+            },
+        )
+        .await
+        .unwrap();
+
+        let peer_b_punch = read_signal_frame(&mut peer_b).await.unwrap().unwrap();
+        let peer_a_punch = read_signal_frame(&mut peer_a).await.unwrap().unwrap();
+
+        match peer_b_punch {
+            SignalMsg::PunchCoord {
+                peer_public_udp_addr,
+                peer_public_udp_addrs,
+                self_public_udp_addr,
+                ..
+            } => {
+                assert_eq!(
+                    peer_public_udp_addr.as_deref(),
+                    Some(peer_a_v4_addr.to_string().as_str())
+                );
+                assert_eq!(
+                    self_public_udp_addr.as_deref(),
+                    Some(peer_b_v4_addr.to_string().as_str())
+                );
+                assert!(
+                    peer_public_udp_addrs.contains(&peer_a_v6_addr.to_string())
+                        && peer_public_udp_addrs.contains(&peer_a_v4_addr.to_string()),
+                    "expected both IPv6 and IPv4 endpoints for Peer A, got {peer_public_udp_addrs:?}"
+                );
+                assert_eq!(peer_public_udp_addrs.len(), 2);
+            }
+            other => panic!("expected PunchCoord for Peer B, got {other:?}"),
+        }
+
+        match peer_a_punch {
+            SignalMsg::PunchCoord {
+                peer_public_udp_addr,
+                peer_public_udp_addrs,
+                self_public_udp_addr,
+                ..
+            } => {
+                assert_eq!(
+                    peer_public_udp_addr.as_deref(),
+                    Some(peer_b_v4_addr.to_string().as_str())
+                );
+                assert_eq!(
+                    self_public_udp_addr.as_deref(),
+                    Some(peer_a_v4_addr.to_string().as_str())
+                );
+                assert_eq!(peer_public_udp_addrs, vec![peer_b_v4_addr.to_string()]);
+            }
+            other => panic!("expected PunchCoord for Peer A, got {other:?}"),
+        }
+
+        drop(peer_a);
+        drop(peer_b);
+        hub.shutdown_all().await;
+        let _ = udp_v4_task.await;
+        let _ = udp_v6_task.await;
+        let _ = tcp_task.await;
     }
 }

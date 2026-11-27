@@ -94,6 +94,7 @@ impl TestCluster {
             endpoints: AdvertisedEndpoints {
                 signal_tcp_addr: signal_addr.to_string(),
                 udp_probe_addr: udp_addr.to_string(),
+                udp_probe_alt_addr: None,
                 tcp_relay_addr: relay_addr.to_string(),
             },
             started_at: Instant::now(),
@@ -332,6 +333,8 @@ async fn full_flow_register_udp_signal_relay_2mib_and_api_stats() {
             allow_remote_control: None,
             mac_addr: None,
             wol_enabled: None,
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await
@@ -359,6 +362,8 @@ async fn full_flow_register_udp_signal_relay_2mib_and_api_stats() {
             allow_remote_control: None,
             mac_addr: None,
             wol_enabled: None,
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await
@@ -440,6 +445,8 @@ async fn full_flow_register_udp_signal_relay_2mib_and_api_stats() {
             session_id: Some("sess-e2e-2mib".into()),
             lan_addrs: vec!["192.168.10.3:50001".into()],
             nonce: Some("cafe1234".into()),
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await
@@ -866,6 +873,8 @@ async fn admin_disable_device_kicks_online_peer_and_blocks_reregister() {
             allow_remote_control: None,
             mac_addr: None,
             wol_enabled: None,
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await
@@ -930,6 +939,8 @@ async fn admin_disable_device_kicks_online_peer_and_blocks_reregister() {
             allow_remote_control: None,
             mac_addr: None,
             wol_enabled: None,
+            nat_type: None,
+            nat_port_delta: None,
         },
     )
     .await

@@ -37,6 +37,7 @@ services:
     ports:
       - "21116:21116/tcp"
       - "21116:21116/udp"
+      - "21119:21119/udp"
       - "21117:21117/tcp"
       - "21118:21118/tcp"
       # Enable with RC_WEB_ADDR=0.0.0.0:21119 to expose Admin Web UI & Admin API only to localhost Nginx reverse proxy:
@@ -47,6 +48,8 @@ services:
       RC_HTTP_ADDR: ${RC_HTTP_ADDR:-0.0.0.0:21118}
       RC_WEB_ADDR: ${RC_WEB_ADDR:-}
       RC_SIGNAL_ADDR: ${RC_SIGNAL_ADDR:-0.0.0.0:21116}
+      # Defaults to RC_SIGNAL_ADDR IP + port+3 (0.0.0.0:21119/udp); set "disabled" or "none" to disable
+      RC_UDP_PROBE_ALT_ADDR: ${RC_UDP_PROBE_ALT_ADDR:-}
       RC_RELAY_ADDR: ${RC_RELAY_ADDR:-0.0.0.0:21117}
       RC_LISTEN_BACKLOG: ${RC_LISTEN_BACKLOG:-4096}
       RC_PUBLIC_HOST: ${RC_PUBLIC_HOST:-}

@@ -18,6 +18,8 @@ use crate::store::{SettingsStore, StoreError};
 const REDIS_ONLINE_PREFIX: &str = "rc:online:";
 const REDIS_ONLINE_ZSET: &str = "rc:online_zset";
 const REDIS_UDP_PREFIX: &str = "rc:udp:";
+const REDIS_UDP4_PREFIX: &str = "rc:udp4:";
+const REDIS_UDP6_PREFIX: &str = "rc:udp6:";
 const REDIS_TOKEN_PREFIX: &str = "rc:token:";
 const REDIS_ALLOW_REGISTRATION_KEY: &str = "rc:setting:allow_registration";
 const REDIS_REVOKED_CERT_PREFIX: &str = "rc:revoked_cert:";
@@ -69,6 +71,9 @@ pub trait EphemeralStore: Send + Sync {
         ttl: Duration,
     ) -> Result<(), EphemeralError>;
     async fn get_public_udp(&self, device_id: &str) -> Result<Option<SocketAddr>, EphemeralError>;
+    async fn get_public_udp_all(&self, device_id: &str) -> Result<Vec<SocketAddr>, EphemeralError> {
+        Ok(self.get_public_udp(device_id).await?.into_iter().collect())
+    }
 
     async fn put_relay_token(
         &self,
@@ -129,6 +134,8 @@ pub trait EphemeralStore: Send + Sync {
 pub struct MemoryEphemeralStore {
     online: DashMap<String, Instant>,
     public_udp: DashMap<String, (SocketAddr, Instant)>,
+    public_udp_v4: DashMap<String, (SocketAddr, Instant)>,
+    public_udp_v6: DashMap<String, (SocketAddr, Instant)>,
     relay_tokens: DashMap<String, (RelayTokenRecord, Instant)>,
     allow_registration: Mutex<Option<(bool, Instant)>>,
     revoked_certs: DashMap<String, Instant>,
@@ -151,6 +158,8 @@ impl MemoryEphemeralStore {
         Self {
             online: DashMap::new(),
             public_udp: DashMap::new(),
+            public_udp_v4: DashMap::new(),
+            public_udp_v6: DashMap::new(),
             relay_tokens: DashMap::new(),
             allow_registration: Mutex::new(None),
             revoked_certs: DashMap::new(),
@@ -179,6 +188,8 @@ impl MemoryEphemeralStore {
         let now = Instant::now();
         self.online.retain(|_, exp| *exp > now);
         self.public_udp.retain(|_, (_, exp)| *exp > now);
+        self.public_udp_v4.retain(|_, (_, exp)| *exp > now);
+        self.public_udp_v6.retain(|_, (_, exp)| *exp > now);
         self.relay_tokens.retain(|_, (_, exp)| *exp > now);
         self.revoked_certs.retain(|_, exp| *exp > now);
         let mut reg = self
@@ -311,10 +322,22 @@ impl EphemeralStore for MemoryEphemeralStore {
     ) -> Result<(), EphemeralError> {
         let Some(expires_at) = Self::compute_expiry(ttl)? else {
             self.public_udp.remove(device_id);
+            if addr.is_ipv4() {
+                self.public_udp_v4.remove(device_id);
+            } else {
+                self.public_udp_v6.remove(device_id);
+            }
             return Ok(());
         };
         self.public_udp
             .insert(device_id.to_string(), (addr, expires_at));
+        if addr.is_ipv4() {
+            self.public_udp_v4
+                .insert(device_id.to_string(), (addr, expires_at));
+        } else {
+            self.public_udp_v6
+                .insert(device_id.to_string(), (addr, expires_at));
+        }
         Ok(())
     }
 
@@ -330,6 +353,42 @@ impl EphemeralStore for MemoryEphemeralStore {
                 .remove_if(device_id, |_, (_, exp)| *exp <= now);
         }
         Ok(None)
+    }
+
+    async fn get_public_udp_all(&self, device_id: &str) -> Result<Vec<SocketAddr>, EphemeralError> {
+        let now = Instant::now();
+        let mut addrs = Vec::with_capacity(2);
+
+        let v6_expired = match self.public_udp_v6.get(device_id) {
+            Some(entry) if entry.value().1 > now => {
+                addrs.push(entry.value().0);
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
+        if v6_expired {
+            self.public_udp_v6
+                .remove_if(device_id, |_, (_, exp)| *exp <= now);
+        }
+
+        let v4_expired = match self.public_udp_v4.get(device_id) {
+            Some(entry) if entry.value().1 > now => {
+                let addr = entry.value().0;
+                if !addrs.contains(&addr) {
+                    addrs.push(addr);
+                }
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
+        if v4_expired {
+            self.public_udp_v4
+                .remove_if(device_id, |_, (_, exp)| *exp <= now);
+        }
+
+        Ok(addrs)
     }
 
     async fn put_relay_token(
@@ -598,17 +657,39 @@ impl EphemeralStore for RedisEphemeralStore {
     ) -> Result<(), EphemeralError> {
         let mut conn = self.conn.clone();
         let key = format!("{REDIS_UDP_PREFIX}{device_id}");
+        let family_key = if addr.is_ipv4() {
+            format!("{REDIS_UDP4_PREFIX}{device_id}")
+        } else {
+            format!("{REDIS_UDP6_PREFIX}{device_id}")
+        };
         let Some(ttl_ms) = Self::ttl_millis(ttl)? else {
-            let _: () = conn.del(&key).await?;
+            let mut pipe = redis::pipe();
+            pipe.atomic()
+                .cmd("DEL")
+                .arg(&key)
+                .ignore()
+                .cmd("DEL")
+                .arg(&family_key)
+                .ignore();
+            let _: () = pipe.query_async(&mut conn).await?;
             return Ok(());
         };
-        let _: () = redis::cmd("SET")
+        let addr_str = addr.to_string();
+        let mut pipe = redis::pipe();
+        pipe.atomic()
+            .cmd("SET")
             .arg(&key)
-            .arg(addr.to_string())
+            .arg(&addr_str)
             .arg("PX")
             .arg(ttl_ms)
-            .query_async(&mut conn)
-            .await?;
+            .ignore()
+            .cmd("SET")
+            .arg(&family_key)
+            .arg(&addr_str)
+            .arg("PX")
+            .arg(ttl_ms)
+            .ignore();
+        let _: () = pipe.query_async(&mut conn).await?;
         Ok(())
     }
 
@@ -625,6 +706,29 @@ impl EphemeralStore for RedisEphemeralStore {
             }
             None => Ok(None),
         }
+    }
+
+    async fn get_public_udp_all(&self, device_id: &str) -> Result<Vec<SocketAddr>, EphemeralError> {
+        let mut conn = self.conn.clone();
+        let key6 = format!("{REDIS_UDP6_PREFIX}{device_id}");
+        let key4 = format!("{REDIS_UDP4_PREFIX}{device_id}");
+        let key_compat = format!("{REDIS_UDP_PREFIX}{device_id}");
+        let vals: Vec<Option<String>> = redis::cmd("MGET")
+            .arg(&key6)
+            .arg(&key4)
+            .arg(&key_compat)
+            .query_async(&mut conn)
+            .await?;
+        let mut addrs = Vec::with_capacity(2);
+        for raw in vals.into_iter().flatten() {
+            let addr = raw
+                .parse::<SocketAddr>()
+                .map_err(|_| EphemeralError::InvalidAddress(raw))?;
+            if !addrs.contains(&addr) {
+                addrs.push(addr);
+            }
+        }
+        Ok(addrs)
     }
 
     async fn put_relay_token(
@@ -1135,5 +1239,49 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert!(!ephemeral.is_cert_revoked("ABCD1234").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn memory_dual_stack_public_udp_v4_v6_and_expiry() {
+        let store = MemoryEphemeralStore::new();
+        let v4: SocketAddr = "203.0.113.10:51234".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::10]:51235".parse().unwrap();
+
+        // Store v6 then v4 with different TTLs so v4 expires first.
+        store
+            .set_public_udp("111222333", v6, Duration::from_secs(5))
+            .await
+            .unwrap();
+        store
+            .set_public_udp("111222333", v4, Duration::from_millis(45))
+            .await
+            .unwrap();
+
+        // Legacy get_public_udp returns most recently updated endpoint; get_public_udp_all returns [v6, v4].
+        assert_eq!(store.get_public_udp("111222333").await.unwrap(), Some(v4));
+        assert_eq!(
+            store.get_public_udp_all("111222333").await.unwrap(),
+            vec![v6, v4]
+        );
+
+        // Wait for v4 to expire while v6 remains valid; cleanup_expired purges expired v4 only.
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        store.cleanup_expired();
+        assert_eq!(store.get_public_udp("111222333").await.unwrap(), None);
+        assert_eq!(
+            store.get_public_udp_all("111222333").await.unwrap(),
+            vec![v6]
+        );
+
+        // Zero TTL on v6 removes it from get_public_udp_all.
+        store
+            .set_public_udp("111222333", v6, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(store
+            .get_public_udp_all("111222333")
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
