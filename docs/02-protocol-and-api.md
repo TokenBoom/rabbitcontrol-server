@@ -23,6 +23,7 @@ This document defines the exact wire protocols, storage contracts, and HTTP REST
 | Native TCP Signaling | `:21116` | TCP (`TCP_NODELAY=true`, TLS 1.3 default; `--no-tls` opt-out) | Framed JSON signaling (**NO WebSocket**): device/owner registration (`access_token`, `device_pubkey`), `UpdateAssistState`, `DeviceStatusChanged`, P2P punch coordination (`punch_coord` with dual-stack endpoints & NAT hints) & `OwnerGrantTicket` issuance, relay token allocation, device/user kick |
 | UDP STUN-lite Probe (Primary) | `:21116` | UDP | Dual-stack public `IP:Port` discovery (`RCSP` v1/v2 → `RCSA`) and `EphemeralStore` NAT mapping publication |
 | UDP STUN-lite Probe (Secondary) | `:21119` (configurable via `--udp-probe-alt` / `RC_UDP_PROBE_ALT_ADDR`; defaults to `--signal` IP + port+3, `"disabled"`/`"none"` to disable) | UDP | Echo-only `RCSA` probe target for client-side Cone vs Symmetric NAT classification; shares per-IP rate limiter and **never** overwrites `EphemeralStore` |
+| UDP STUN-lite Probe (Alt-IP, optional) | Unset by default (`--udp-probe-alt-ip` / `RC_UDP_PROBE_ALT_IP`, default `None`) | UDP | Optional self-hosted second public IP `RCSP`/`RCSA` probe endpoint advertised via `registered.udp_probe_alt_ip_addr` and REST endpoint/status snapshots (100% private STUN; third-party public STUN is forbidden) |
 | mTLS TCP Relay | `:21117` | TCP (`TCP_NODELAY=true`, mandatory TLS 1.3 mTLS) | Mutual-TLS authenticated full-duplex relay with `RCR1` header & SAN (`urn:rabbitcontrol:user:{uid}:device:{did}`) binding + serial revocation check |
 | Axum 0.8 REST API / Admin Web | `:21118` | HTTP/1.1 (TLS-capable via `rc-server`) | Health check, Root CA fetch, Auth/Refresh/ChangePassword/Logout, CSR device cert issue, My Devices bind/rename/unbind, plus Admin routes & Admin Web UI unless `--web-addr` / `RC_WEB_ADDR` is set |
 | Split Admin Web UI / Admin REST API (optional) | `--web-addr` / `RC_WEB_ADDR` | Plain HTTP/1.1 (reverse proxy only) | When configured, serves `RC_WEB_DIR` SPA static bundle + `/api/v1/health`, `/api/v1/pki/ca`, `/api/v1/auth/{login,refresh,logout,change-password}`, `/api/v1/me`, and all admin endpoints (`/api/v1/admin/*`, `/api/v1/stats`, `/api/v1/devices*`, `/api/v1/sessions*`); `:21118` drops admin routes & SPA hosting (`ClientApiOnly`) |
@@ -79,7 +80,8 @@ Every message in both directions is length-prefixed:
   "mac_addr": "aa:bb:cc:dd:ee:ff",
   "wol_enabled": true,
   "nat_type": "cone",
-  "nat_port_delta": 0
+  "nat_port_delta": 0,
+  "nat_port_range": [10000, 20000]
 }
 ```
 
@@ -90,8 +92,9 @@ Every message in both directions is length-prefixed:
 - `allow_remote_assist` (optional bool): gates non-owner third-party assistance (effective only when `allow_remote_control == true`).
 - `mac_addr` (optional string): primary Ethernet/Wi-Fi unicast MAC address for Wake-on-LAN (`:` or `-` separated 6 hex bytes, normalized to lowercase `"aa:bb:cc:dd:ee:ff"`). All-zero (`00:00:00:00:00:00`), broadcast (`ff:ff:ff:ff:ff:ff`), and multicast (`(b0 & 0x01) != 0`) MACs are strictly rejected with `error` (`code = "invalid_input"`). When omitted or empty, previously stored `mac_addr` is preserved.
 - `wol_enabled` (optional bool): whether this device allows Wake-on-LAN remote wake by its account owner (defaults to `false`; omitted preserves the stored DB value).
-- `nat_type` (optional string): client-classified NAT behavior (`"unknown"`, `"cone"`, `"symmetric_seq"`, `"symmetric_random"`, normalized case-insensitively; unrecognized values are safely ignored as `None`).
+- `nat_type` (optional string): client-classified NAT behavior (`"unknown"`, `"public"`, `"cone"`, `"cone_verified"`, `"cone_unverified"`, `"symmetric_seq"`, `"symmetric_random"`, `"adm_seq"`, `"adm_random"`, `"apdm_seq"`, `"apdm_random"`, `"udp_blocked"`, normalized case-insensitively; unrecognized values are safely ignored as `None` for backward compatibility).
 - `nat_port_delta` (optional `i16`): observed sequential NAT port allocation step, clamped to `-1024..=1024`.
+- `nat_port_range` (optional `[u16; 2]`): observed NAT port allocation range hint `[min, max]` (`1 <= min <= max <= 65535`; invalid ranges or `0` ports are safely ignored as `None`).
 - `device_status_changed` broadcasts and `/api/v1/me/devices`, `/api/v1/devices` views also expose `app_version`, `arch`, `allow_remote_assist`, `allow_remote_control`, and `wol_capable` (`wol_enabled && valid(mac_addr)`). Raw `mac_addr` is **never** exposed in device list or status broadcasts.
 
 #### `update_assist_state` (Client -> Server)
@@ -134,7 +137,7 @@ Updates the device's remote-assist, remote-control, and/or Wake-on-LAN configura
 
 Pushed to other online peers belonging to the same `owner_user_id` on register (online), disconnect/kick (offline), `update_assist_state`, and `heartbeat` (when `wol_capable` changes). `wol_capable` is `true` iff `wol_enabled == true` and a valid unicast `mac_addr` is stored; raw `mac_addr` is never included. On REST `PATCH /api/v1/me/devices/{id}`, `device_status_changed` is pushed both to other same-account online peers **and** to the target device itself (if online) so the device can synchronize its local policy cache without stale overwrite on reconnect.
 
-#### `registered` (Server -> Client)
+#### `registered` (`RegisterAck`, Server -> Client)
 
 ```json
 {
@@ -144,17 +147,19 @@ Pushed to other online peers belonging to the same `owner_user_id` on register (
   "server_time": "2026-11-22T10:00:00Z",
   "udp_probe_addr": "172.16.1.2:21116",
   "udp_probe_alt_addr": "172.16.1.2:21119",
+  "udp_probe_alt_ip_addr": "172.16.1.3:21116",
   "udp_probe_token": "0123456789abcdef0123456789abcdef",
   "relay_addr": "172.16.1.2:21117"
 }
 ```
 
 - `udp_probe_alt_addr` (optional string, omitted when disabled): secondary UDP STUN-lite echo-only endpoint (`:21119/udp` by default) used to distinguish Cone vs Symmetric NAT.
+- `udp_probe_alt_ip_addr` (optional string, omitted when unset): optional self-hosted secondary public IP UDP STUN-lite probe address configured via `--udp-probe-alt-ip` / `RC_UDP_PROBE_ALT_IP` (default `None`; third-party public STUN is forbidden).
 - `udp_probe_token` (optional string): 32-char lowercase hex encoding of a random 16-byte per-connection probe token used in `RCSP v2` packets for constant-time cross-IP/dual-stack endpoint authentication.
 
 #### `heartbeat` (Client -> Server)
 
-Refreshes online TTL in `EphemeralStore`, updates `last_seen_at`, `last_lan_addrs`, and `last_public_ip` in `DeviceStore`, and optionally synchronizes `mac_addr` / `wol_enabled` and NAT telemetry (`nat_type`, `nat_port_delta`).
+Refreshes online TTL in `EphemeralStore`, updates `last_seen_at`, `last_lan_addrs`, and `last_public_ip` in `DeviceStore`, and optionally synchronizes `mac_addr` / `wol_enabled`, NAT telemetry (`nat_type`, `nat_port_delta`, `nat_port_range`), and observed signaling RTT (`rtt_ms`).
 
 ```json
 {
@@ -163,12 +168,15 @@ Refreshes online TTL in `EphemeralStore`, updates `last_seen_at`, `last_lan_addr
   "mac_addr": "aa:bb:cc:dd:ee:ff",
   "wol_enabled": true,
   "nat_type": "cone",
-  "nat_port_delta": 0
+  "nat_port_delta": 0,
+  "nat_port_range": [10000, 20000],
+  "rtt_ms": 24
 }
 ```
 
 - `mac_addr` (optional string) and `wol_enabled` (optional bool): backward-compatible optional fields; omitted preserves stored values. Invalid non-empty `mac_addr` returns `error` (`code = "invalid_input"`).
-- `nat_type` / `nat_port_delta` (optional): updates the peer's in-memory NAT profile using the same whitelist/clamping rules as `register`.
+- `nat_type` / `nat_port_delta` / `nat_port_range` (optional): updates the peer's in-memory NAT profile using the same whitelist/clamping/range-validation rules as `register`.
+- `rtt_ms` (optional `u32`): client-observed heartbeat/signaling RTT in milliseconds; updates the server's per-peer EWMA smoothed RTT estimate (clamped to `0..=10_000` ms; when no sample has been observed, the peer's RTT estimate falls back to `0`).
 
 #### `heartbeat_ack` (Server -> Client)
 
@@ -193,13 +201,14 @@ Initiates P2P hole-punching coordination with `target_id`.
   "lan_addrs": ["192.168.1.10:50000"],
   "nonce": "a1b2c3d4",
   "nat_type": "cone",
-  "nat_port_delta": 0
+  "nat_port_delta": 0,
+  "nat_port_range": [10000, 20000]
 }
 ```
 
-- `nat_type` / `nat_port_delta` (optional): updates the caller's in-memory NAT profile before issuing `punch_coord`.
+- `nat_type` / `nat_port_delta` / `nat_port_range` (optional): updates the caller's in-memory NAT profile before issuing `punch_coord`.
 - If `target_id` is offline, the server responds only to the requester with `peer_offline`.
-- If `target_id` is online, the server reads both sides' observed public UDP endpoints (`get_public_udp` and dual-stack `get_public_udp_all`) from `EphemeralStore`, allocates a one-time fallback `relay_token` in `EphemeralStore`, and pushes `punch_coord` to **both** the client (`role = "client"`) and target host (`role = "host"`).
+- If `target_id` is online, the server reads both sides' observed public UDP endpoints (`get_public_udp` and dual-stack `get_public_udp_all`) from `EphemeralStore`, allocates a one-time fallback `relay_token` in `EphemeralStore`, generates a per-session 128-bit `OsRng` `punch_secret`, computes synchronized `start_after_ms` from both peers' smoothed RTT estimates (falling back to `0` when unsampled), and pushes `punch_coord` to **both** the client (`role = "client"`) and target host (`role = "host"`).
 
 #### `punch_coord` (Server -> Both Peers)
 
@@ -214,8 +223,13 @@ Initiates P2P hole-punching coordination with `target_id`.
   "self_public_udp_addr": "203.0.113.10:51234",
   "peer_nat_type": "symmetric_seq",
   "peer_nat_port_delta": 3,
+  "self_nat_port_range": [10000, 20000],
+  "peer_nat_port_range": [30000, 40000],
   "peer_lan_addrs": ["192.168.1.20:50000"],
   "nonce": "a1b2c3d4",
+  "punch_secret": "0123456789abcdef0123456789abcdef",
+  "start_after_ms": 40,
+  "relay_fallback_after_ms": 400,
   "relay_token": "9f8e7d6c...",
   "relay_addr": "172.16.1.2:21117"
 }
@@ -225,6 +239,10 @@ Initiates P2P hole-punching coordination with `target_id`.
 - `peer_public_udp_addrs` (optional array, omitted when empty): all non-expired dual-stack public UDP addresses of the peer (IPv6 + IPv4, deduplicated).
 - `self_public_udp_addr` (optional string): the recipient's own observed public UDP address (for hairpin / same-public-IP detection).
 - `peer_nat_type` / `peer_nat_port_delta` (optional): the peer's normalized NAT classification and port step hint.
+- `self_nat_port_range` / `peer_nat_port_range` (optional `[u16; 2]`): validated NAT port range hints (`[min, max]`, `1 <= min <= max <= 65535`) for the recipient and peer respectively.
+- `punch_secret` (optional string): 32-char lowercase hex encoding of a per-session 128-bit `OsRng` secret shared identically by both `client` and `host` for `RCP2 v2` HMAC-SHA256 punch authentication.
+- `start_after_ms` (optional `u16`): fast-side punch launch delay in milliseconds, computed as `clamp((rtt_slow - rtt_fast) / 2, 0, 500)` for the lower-RTT peer and `0` for the slower peer (unsampled peers fall back to `0` ms).
+- `relay_fallback_after_ms` (optional `u16`): synchronized delay threshold in milliseconds (default `400`) after which both peers concurrently initiate Relay-first dialing.
 
 #### `relay_alloc` (Client -> Server)
 
@@ -458,9 +476,9 @@ All responses — including malformed JSON, body-limit (`413`), and auth (`401`)
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `GET` | `/api/v1/health` | Public | Liveness & dependency health (`status`, `postgres`, `ephemeral_backend`, `relay_engine`, `uptime_sec`, `version`) |
+| `GET` | `/api/v1/health` | Public | Liveness & dependency health (`status`, `postgres`, `ephemeral_backend`, `relay_engine`, `uptime_sec`, `version`, optional `udp_probe_alt_ip_addr`) |
 | `POST` | `/api/v1/devices/register` | Public | Idempotently register device by `device_key` and issue/return permanent 9-digit `device_id` (`400` on invalid input, `403` if disabled, `413` if body > 8 KiB) |
-| `GET` | `/api/v1/stats` | Admin | Server metrics: `online_count`, `registered_count`, `active_relay_sessions`, `total_relay_sessions`, `total_relay_bytes`, `total_bytes_up`, `total_bytes_down`, `punch_coord_count`, `ephemeral_backend`, `relay_engine`, `uptime_sec` |
+| `GET` | `/api/v1/stats` | Admin | Server metrics: `online_count`, `registered_count`, `active_relay_sessions`, `total_relay_sessions`, `total_relay_bytes`, `total_bytes_up`, `total_bytes_down`, `punch_coord_count`, `ephemeral_backend`, `relay_engine`, `uptime_sec`, optional `udp_probe_alt_ip_addr` |
 | `GET` | `/api/v1/devices` | Admin | Paginated device list (`?q=<search>&status=online\|offline\|in_session\|all&limit=1..=500&offset=0..`; default `limit=100`, `offset=0`). Searches `device_id`, `hostname`, `os`, `device_group`, and owner email (`owner_email`; excludes `device_key`). Invalid `status` always returns `400`. |
 | `GET` | `/api/v1/sessions` | Admin | List currently active TCP relay sessions (`session_id`, `host_id`, `client_id`, `started_at`, `duration_sec`, `bytes_up`, `bytes_down`, `engine`) |
 | `DELETE` | `/api/v1/sessions/:id` | Admin | Force-terminate an active relay session (`200 OK` or `404 Not Found`) |
@@ -501,6 +519,7 @@ Response (`200 OK`):
   "signal_tcp_addr": "172.16.1.2:21116",
   "udp_probe_addr": "172.16.1.2:21116",
   "udp_probe_alt_addr": "172.16.1.2:21119",
+  "udp_probe_alt_ip_addr": "172.16.1.3:21116",
   "tcp_relay_addr": "172.16.1.2:21117",
   "relay_addr": "172.16.1.2:21117"
 }

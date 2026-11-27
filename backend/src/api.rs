@@ -66,6 +66,7 @@ pub struct AdvertisedEndpoints {
     pub signal_tcp_addr: String,
     pub udp_probe_addr: String,
     pub udp_probe_alt_addr: Option<String>,
+    pub udp_probe_alt_ip_addr: Option<String>,
     pub tcp_relay_addr: String,
 }
 
@@ -755,6 +756,8 @@ pub struct HealthResponse {
     pub allow_registration: bool,
     pub uptime_sec: u64,
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_probe_alt_ip_addr: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1083,6 +1086,8 @@ pub struct RegisterResponse {
     pub udp_probe_addr: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub udp_probe_alt_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_probe_alt_ip_addr: Option<String>,
     pub tcp_relay_addr: String,
     pub relay_addr: String,
 }
@@ -1100,6 +1105,8 @@ pub struct StatsResponse {
     pub ephemeral_backend: String,
     pub relay_engine: String,
     pub uptime_sec: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_probe_alt_ip_addr: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1465,6 +1472,7 @@ async fn get_health(State(state): State<AppState>) -> impl IntoResponse {
             allow_registration,
             uptime_sec: state.started_at.elapsed().as_secs(),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            udp_probe_alt_ip_addr: state.endpoints.udp_probe_alt_ip_addr.clone(),
         }),
     )
 }
@@ -3295,6 +3303,7 @@ async fn post_register_device(
                 signal_tcp_addr: state.endpoints.signal_tcp_addr.clone(),
                 udp_probe_addr: state.endpoints.udp_probe_addr.clone(),
                 udp_probe_alt_addr: state.endpoints.udp_probe_alt_addr.clone(),
+                udp_probe_alt_ip_addr: state.endpoints.udp_probe_alt_ip_addr.clone(),
                 tcp_relay_addr: state.endpoints.tcp_relay_addr.clone(),
                 relay_addr: state.endpoints.tcp_relay_addr.clone(),
             };
@@ -3356,6 +3365,7 @@ async fn get_stats(State(state): State<AppState>) -> Response {
             ephemeral_backend: state.ephemeral.backend_name().to_string(),
             relay_engine: relay_stats.engine,
             uptime_sec: state.started_at.elapsed().as_secs(),
+            udp_probe_alt_ip_addr: state.endpoints.udp_probe_alt_ip_addr.clone(),
         }),
     )
         .into_response()
@@ -3980,6 +3990,7 @@ mod tests {
                 signal_tcp_addr: "127.0.0.1:21116".into(),
                 udp_probe_addr: "127.0.0.1:21116".into(),
                 udp_probe_alt_addr: None,
+                udp_probe_alt_ip_addr: None,
                 tcp_relay_addr: "127.0.0.1:21117".into(),
             },
             started_at: Instant::now(),
@@ -4055,5 +4066,149 @@ mod tests {
             .unwrap();
         assert!(on_me.wol_capable);
         assert!(!off_me.wol_capable);
+    }
+
+    #[tokio::test]
+    async fn health_register_and_stats_expose_udp_probe_alt_ip_addr() {
+        use crate::ephemeral::MemoryEphemeralStore;
+        use crate::relay::RelayConfig;
+        use crate::signal::SignalConfig;
+        use crate::store::{MemoryDeviceStore, UserStore};
+
+        let store = Arc::new(MemoryDeviceStore::new());
+        let ephemeral = Arc::new(MemoryEphemeralStore::new());
+        let auth_authority = Arc::new(AuthAuthority::load_or_create(store.as_ref()).await.unwrap());
+        let pki_authority = Arc::new(PkiAuthority::load_or_create(store.as_ref()).await.unwrap());
+        let settings_cache = Arc::new(SettingsCache::new(store.clone(), ephemeral.clone()));
+        let signal_hub = Arc::new(SignalHub::with_auth(
+            store.clone(),
+            ephemeral.clone(),
+            auth_authority.clone(),
+            SignalConfig::default(),
+        ));
+        let relay_server = Arc::new(RelayServer::new(
+            store.clone(),
+            ephemeral.clone(),
+            RelayConfig::default(),
+        ));
+
+        let admin = store
+            .create_user(CreateUserInput {
+                email: "admin-alt-ip@example.com".into(),
+                display_name: "Admin".into(),
+                password_hash: "hash".into(),
+                role: ROLE_ADMIN.into(),
+                status: STATUS_ACTIVE.into(),
+                must_change_password: false,
+            })
+            .await
+            .unwrap();
+        let sess = store
+            .create_user_session(CreateSessionInput {
+                user_id: admin.id,
+                device_id: None,
+                family_id: None,
+                token_hash: format!("{:064x}", admin.id.as_u128()),
+                expires_at: Utc::now() + chrono::Duration::hours(24),
+                client_info: "test".into(),
+            })
+            .await
+            .unwrap();
+        let jwt = auth_authority
+            .issue_access_token_for_user(&admin, sess.id, None, ACCESS_TOKEN_TTL)
+            .unwrap();
+
+        let state = AppState {
+            device_store: store.clone(),
+            auth_store: store,
+            ephemeral,
+            auth_authority,
+            pki_authority,
+            settings_cache,
+            signal_hub,
+            relay_server,
+            endpoints: AdvertisedEndpoints {
+                signal_tcp_addr: "198.51.100.1:21116".into(),
+                udp_probe_addr: "198.51.100.1:21116".into(),
+                udp_probe_alt_addr: Some("198.51.100.1:21119".into()),
+                udp_probe_alt_ip_addr: Some("198.51.100.2:21116".into()),
+                tcp_relay_addr: "198.51.100.1:21117".into(),
+            },
+            started_at: Instant::now(),
+            admin_token: None,
+            cors_origins: Vec::new(),
+            tls_enabled: false,
+            web_dir: None,
+            auth_rate_limiter: Arc::new(AuthRateLimiter::default()),
+            allow_unauthenticated_legacy_admin: false,
+        };
+        let app = router(state);
+
+        // 1. /api/v1/health
+        let resp_health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_health.status(), StatusCode::OK);
+        let body_health = axum::body::to_bytes(resp_health.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let health: HealthResponse = serde_json::from_slice(&body_health).unwrap();
+        assert_eq!(
+            health.udp_probe_alt_ip_addr.as_deref(),
+            Some("198.51.100.2:21116")
+        );
+
+        // 2. POST /api/v1/devices/register
+        let resp_reg = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/devices/register")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"device_key":"ed25519:alt-ip-reg","hostname":"mac","os":"macos"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_reg.status(), StatusCode::OK);
+        let body_reg = axum::body::to_bytes(resp_reg.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let reg: RegisterResponse = serde_json::from_slice(&body_reg).unwrap();
+        assert_eq!(
+            reg.udp_probe_alt_ip_addr.as_deref(),
+            Some("198.51.100.2:21116")
+        );
+
+        // 3. GET /api/v1/stats
+        let resp_stats = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/stats")
+                    .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_stats.status(), StatusCode::OK);
+        let body_stats = axum::body::to_bytes(resp_stats.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let stats: StatsResponse = serde_json::from_slice(&body_stats).unwrap();
+        assert_eq!(
+            stats.udp_probe_alt_ip_addr.as_deref(),
+            Some("198.51.100.2:21116")
+        );
     }
 }

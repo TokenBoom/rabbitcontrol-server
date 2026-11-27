@@ -37,6 +37,10 @@ pub const UDP_PROTO_VERSION_V2: u8 = 2;
 pub const UDP_PROBE_LEN: usize = 22;
 pub const UDP_PROBE_TOKEN_LEN: usize = 16;
 pub const UDP_PROBE_V2_LEN: usize = 38;
+pub const PUNCH_SECRET_LEN: usize = 16;
+pub const PUNCH_START_AFTER_MAX_MS: u16 = 500;
+pub const DEFAULT_RELAY_FALLBACK_AFTER_MS: u16 = 400;
+pub const PEER_RTT_MAX_MS: u32 = 10_000;
 pub const ANONYMOUS_DEVICE_ID: &str = "000000000";
 pub const NAT_PORT_DELTA_MIN: i16 = -1024;
 pub const NAT_PORT_DELTA_MAX: i16 = 1024;
@@ -131,9 +135,17 @@ pub fn normalize_nat_type(raw: Option<&str>) -> Option<String> {
     let trimmed = raw?.trim();
     match trimmed.to_ascii_lowercase().as_str() {
         "unknown" => Some("unknown".to_string()),
+        "public" => Some("public".to_string()),
         "cone" => Some("cone".to_string()),
+        "cone_verified" => Some("cone_verified".to_string()),
+        "cone_unverified" => Some("cone_unverified".to_string()),
         "symmetric_seq" => Some("symmetric_seq".to_string()),
         "symmetric_random" => Some("symmetric_random".to_string()),
+        "adm_seq" => Some("adm_seq".to_string()),
+        "adm_random" => Some("adm_random".to_string()),
+        "apdm_seq" => Some("apdm_seq".to_string()),
+        "apdm_random" => Some("apdm_random".to_string()),
+        "udp_blocked" => Some("udp_blocked".to_string()),
         _ => None,
     }
 }
@@ -141,6 +153,39 @@ pub fn normalize_nat_type(raw: Option<&str>) -> Option<String> {
 /// Clamp client-reported NAT port delta to `[-1024, 1024]`.
 pub fn normalize_nat_port_delta(raw: Option<i16>) -> Option<i16> {
     raw.map(|d| d.clamp(NAT_PORT_DELTA_MIN, NAT_PORT_DELTA_MAX))
+}
+
+/// Validate client-reported NAT port range `[min, max]` (`1 <= min <= max <= 65535`).
+/// Invalid or zero-port ranges are safely ignored as `None`.
+pub fn normalize_nat_port_range(raw: Option<[u16; 2]>) -> Option<[u16; 2]> {
+    let [min_port, max_port] = raw?;
+    if min_port == 0 || max_port == 0 || min_port > max_port {
+        return None;
+    }
+    Some([min_port, max_port])
+}
+
+/// Update EWMA smoothed RTT estimate in milliseconds (`(3 * prev + sample + 2) / 4`),
+/// clamping each sample to `0..=PEER_RTT_MAX_MS`.
+pub fn update_smoothed_rtt_ms(prev: Option<u32>, sample_ms: u32) -> u32 {
+    let clamped = sample_ms.min(PEER_RTT_MAX_MS);
+    match prev {
+        Some(old) => (old.saturating_mul(3).saturating_add(clamped) + 2) / 4,
+        None => clamped,
+    }
+}
+
+/// Compute synchronized punch delay `start_after_ms` for a peer:
+/// faster peer waits `clamp((peer_rtt - self_rtt) / 2, 0, 500)`, slower peer starts immediately (`0`).
+pub fn compute_punch_start_after_ms(self_rtt_ms: u32, peer_rtt_ms: u32) -> u16 {
+    if self_rtt_ms >= peer_rtt_ms {
+        0
+    } else {
+        let half_diff = (peer_rtt_ms - self_rtt_ms) / 2;
+        u16::try_from(half_diff)
+            .unwrap_or(PUNCH_START_AFTER_MAX_MS)
+            .min(PUNCH_START_AFTER_MAX_MS)
+    }
 }
 
 /// Select the legacy single-field `public_udp_addr` pair (`(a_addr, b_addr)`) for `PunchCoord`.
@@ -450,6 +495,8 @@ pub enum SignalMsg {
         nat_type: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         nat_port_delta: Option<i16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nat_port_range: Option<[u16; 2]>,
     },
     Registered {
         device_id: String,
@@ -458,6 +505,8 @@ pub enum SignalMsg {
         udp_probe_addr: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         udp_probe_alt_addr: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        udp_probe_alt_ip_addr: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         udp_probe_token: Option<String>,
         relay_addr: String,
@@ -473,6 +522,10 @@ pub enum SignalMsg {
         nat_type: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         nat_port_delta: Option<i16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nat_port_range: Option<[u16; 2]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rtt_ms: Option<u32>,
     },
     HeartbeatAck {
         server_time: DateTime<Utc>,
@@ -518,6 +571,8 @@ pub enum SignalMsg {
         nat_type: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         nat_port_delta: Option<i16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nat_port_range: Option<[u16; 2]>,
     },
     PunchCoord {
         session_id: String,
@@ -533,8 +588,18 @@ pub enum SignalMsg {
         peer_nat_type: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         peer_nat_port_delta: Option<i16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        self_nat_port_range: Option<[u16; 2]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_nat_port_range: Option<[u16; 2]>,
         peer_lan_addrs: Vec<String>,
         nonce: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        punch_secret: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_after_ms: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay_fallback_after_ms: Option<u16>,
         relay_token: String,
         relay_addr: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -708,7 +773,9 @@ pub struct SignalConfig {
     pub allow_server_wol: bool,
     pub public_udp_probe_addr: String,
     pub public_udp_probe_alt_addr: Option<String>,
+    pub public_udp_probe_alt_ip_addr: Option<String>,
     pub public_relay_addr: String,
+    pub relay_fallback_after_ms: u16,
     pub require_auth: bool,
 }
 
@@ -734,7 +801,9 @@ impl Default for SignalConfig {
             allow_server_wol: false,
             public_udp_probe_addr: "127.0.0.1:21116".to_string(),
             public_udp_probe_alt_addr: None,
+            public_udp_probe_alt_ip_addr: None,
             public_relay_addr: "127.0.0.1:21117".to_string(),
+            relay_fallback_after_ms: DEFAULT_RELAY_FALLBACK_AFTER_MS,
             require_auth: true,
         }
     }
@@ -1219,20 +1288,37 @@ struct ActivePeer {
     udp_probe_token: Option<[u8; UDP_PROBE_TOKEN_LEN]>,
     nat_type: Option<String>,
     nat_port_delta: Option<i16>,
+    nat_port_range: Option<[u16; 2]>,
+    smoothed_rtt_ms: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct PeerNatUpdate {
+    nat_type: Option<String>,
+    nat_port_delta: Option<i16>,
+    nat_port_range: Option<[u16; 2]>,
 }
 
 fn apply_peer_nat_update(
     peer: &mut ActivePeer,
     nat_type: Option<&str>,
     nat_port_delta: Option<i16>,
+    nat_port_range: Option<[u16; 2]>,
 ) {
     let norm_nat_type = normalize_nat_type(nat_type);
     let norm_nat_delta = normalize_nat_port_delta(nat_port_delta);
+    let norm_nat_range = normalize_nat_port_range(nat_port_range);
     if let Some(nt) = norm_nat_type {
         peer.nat_type = Some(nt);
         peer.nat_port_delta = norm_nat_delta;
-    } else if let Some(delta) = norm_nat_delta {
-        peer.nat_port_delta = Some(delta);
+        peer.nat_port_range = norm_nat_range;
+    } else {
+        if let Some(delta) = norm_nat_delta {
+            peer.nat_port_delta = Some(delta);
+        }
+        if let Some(range) = norm_nat_range {
+            peer.nat_port_range = Some(range);
+        }
     }
 }
 
@@ -1353,6 +1439,26 @@ impl SignalHub {
     pub fn peer_connected_at(&self, device_id: &str) -> Option<DateTime<Utc>> {
         let norm = normalize_device_id(device_id);
         self.peers.get(&norm).map(|p| p.connected_at)
+    }
+
+    /// Return the peer's smoothed signaling RTT estimate in milliseconds, falling back to `0`
+    /// when no RTT sample has been observed yet (or the peer is offline).
+    pub fn peer_smoothed_rtt_ms(&self, device_id: &str) -> u32 {
+        let norm = normalize_device_id(device_id);
+        self.peers
+            .get(&norm)
+            .and_then(|p| p.smoothed_rtt_ms)
+            .unwrap_or(0)
+    }
+
+    /// Record an observed RTT sample (in ms) for an online peer using EWMA smoothing.
+    pub fn record_peer_rtt_ms(&self, device_id: &str, sample_ms: u32) -> Option<u32> {
+        let norm = normalize_device_id(device_id);
+        self.peers.get_mut(&norm).map(|mut p| {
+            let next = update_smoothed_rtt_ms(p.smoothed_rtt_ms, sample_ms);
+            p.smoothed_rtt_ms = Some(next);
+            next
+        })
     }
 
     async fn lock_device(&self, device_id: &str) -> tokio::sync::MutexGuard<'_, ()> {
@@ -2076,6 +2182,7 @@ impl SignalHub {
             wol_enabled_opt,
             nat_type_opt,
             nat_port_delta_opt,
+            nat_port_range_opt,
         ) = match first_frame {
             SignalMsg::Register {
                 device_id,
@@ -2094,6 +2201,7 @@ impl SignalHub {
                 wol_enabled,
                 nat_type,
                 nat_port_delta,
+                nat_port_range,
             } => {
                 if let Err(reason) = validate_register_fields(
                     &hostname,
@@ -2165,6 +2273,7 @@ impl SignalHub {
                     wol_enabled,
                     normalize_nat_type(nat_type.as_deref()),
                     normalize_nat_port_delta(nat_port_delta),
+                    normalize_nat_port_range(nat_port_range),
                 )
             }
             _ => {
@@ -2619,6 +2728,8 @@ impl SignalHub {
                     udp_probe_token: Some(udp_probe_token),
                     nat_type: nat_type_opt,
                     nat_port_delta: nat_port_delta_opt,
+                    nat_port_range: nat_port_range_opt,
+                    smoothed_rtt_ms: None,
                 },
             ) {
                 old_peer.cancel.kick(err_code::REPLACED_BY_NEW_CONNECTION);
@@ -2639,6 +2750,7 @@ impl SignalHub {
                 server_time: Utc::now(),
                 udp_probe_addr: self.config.public_udp_probe_addr.clone(),
                 udp_probe_alt_addr: self.config.public_udp_probe_alt_addr.clone(),
+                udp_probe_alt_ip_addr: self.config.public_udp_probe_alt_ip_addr.clone(),
                 udp_probe_token: Some(udp_probe_token_hex),
                 relay_addr: self.config.public_relay_addr.clone(),
             });
@@ -2900,7 +3012,7 @@ impl SignalHub {
         conn_id: u64,
         cancel: &PeerCancel,
         new_lan_addrs: Option<Vec<String>>,
-        nat_update: Option<(Option<String>, Option<i16>)>,
+        nat_update: Option<PeerNatUpdate>,
     ) -> bool {
         let _guard = self.lock_device(device_id).await;
         if !self.is_active_conn(device_id, conn_id, cancel) {
@@ -2912,8 +3024,13 @@ impl SignalHub {
                     if let Some(addrs) = new_lan_addrs {
                         peer.lan_addrs = addrs;
                     }
-                    if let Some((nat_type, nat_port_delta)) = nat_update {
-                        apply_peer_nat_update(&mut peer, nat_type.as_deref(), nat_port_delta);
+                    if let Some(nat) = nat_update {
+                        apply_peer_nat_update(
+                            &mut peer,
+                            nat.nat_type.as_deref(),
+                            nat.nat_port_delta,
+                            nat.nat_port_range,
+                        );
                     }
                 }
             }
@@ -3132,6 +3249,8 @@ impl SignalHub {
                 wol_enabled,
                 nat_type,
                 nat_port_delta,
+                nat_port_range,
+                rtt_ms,
             } => {
                 if let Err(reason) = validate_lan_addrs(&lan_addrs) {
                     Self::send_nonblocking(
@@ -3178,7 +3297,16 @@ impl SignalHub {
                             if changed {
                                 peer.lan_addrs = lan_addrs.clone();
                             }
-                            apply_peer_nat_update(&mut peer, nat_type.as_deref(), nat_port_delta);
+                            apply_peer_nat_update(
+                                &mut peer,
+                                nat_type.as_deref(),
+                                nat_port_delta,
+                                nat_port_range,
+                            );
+                            if let Some(sample_ms) = rtt_ms {
+                                peer.smoothed_rtt_ms =
+                                    Some(update_smoothed_rtt_ms(peer.smoothed_rtt_ms, sample_ms));
+                            }
                             (
                                 peer.owner_user_id,
                                 canonical_ip(peer.remote_addr.ip()).to_string(),
@@ -3575,6 +3703,7 @@ impl SignalHub {
                 nonce,
                 nat_type,
                 nat_port_delta,
+                nat_port_range,
             } => {
                 let target_norm = normalize_device_id(&target_id);
                 if target_norm.is_empty() {
@@ -3668,11 +3797,16 @@ impl SignalHub {
                 } else {
                     Some(lan_addrs.clone())
                 };
-                let nat_update = if nat_type.is_some() || nat_port_delta.is_some() {
-                    Some((nat_type, nat_port_delta))
-                } else {
-                    None
-                };
+                let nat_update =
+                    if nat_type.is_some() || nat_port_delta.is_some() || nat_port_range.is_some() {
+                        Some(PeerNatUpdate {
+                            nat_type,
+                            nat_port_delta,
+                            nat_port_range,
+                        })
+                    } else {
+                        None
+                    };
                 if !self
                     .refresh_online_and_nat_under_lock(
                         device_id,
@@ -3686,22 +3820,36 @@ impl SignalHub {
                     return;
                 }
 
-                let (client_lan_addrs, client_nat_type, client_nat_port_delta) = {
+                let (
+                    client_lan_addrs,
+                    client_nat_type,
+                    client_nat_port_delta,
+                    client_nat_port_range,
+                    client_rtt_ms,
+                ) = {
                     let snapshot = self
                         .peers
                         .get(device_id)
                         .filter(|p| p.conn_id == conn_id)
-                        .map(|p| (p.lan_addrs.clone(), p.nat_type.clone(), p.nat_port_delta));
+                        .map(|p| {
+                            (
+                                p.lan_addrs.clone(),
+                                p.nat_type.clone(),
+                                p.nat_port_delta,
+                                p.nat_port_range,
+                                p.smoothed_rtt_ms.unwrap_or(0),
+                            )
+                        });
                     match snapshot {
-                        Some((peer_lan, nt, delta)) => {
+                        Some((peer_lan, nt, delta, range, rtt)) => {
                             let addrs = if !lan_addrs.is_empty() {
                                 lan_addrs
                             } else {
                                 peer_lan
                             };
-                            (addrs, nt, delta)
+                            (addrs, nt, delta, range, rtt)
                         }
-                        None => (lan_addrs, None, None),
+                        None => (lan_addrs, None, None, None, 0),
                     }
                 };
 
@@ -3711,11 +3859,19 @@ impl SignalHub {
                         p.lan_addrs.clone(),
                         p.nat_type.clone(),
                         p.nat_port_delta,
+                        p.nat_port_range,
+                        p.smoothed_rtt_ms.unwrap_or(0),
                     )
                 });
 
-                let Some((host_tx, host_lan_addrs, host_nat_type, host_nat_port_delta)) =
-                    target_snapshot
+                let Some((
+                    host_tx,
+                    host_lan_addrs,
+                    host_nat_type,
+                    host_nat_port_delta,
+                    host_nat_port_range,
+                    host_rtt_ms,
+                )) = target_snapshot
                 else {
                     Self::send_nonblocking(
                         self_tx,
@@ -3788,6 +3944,11 @@ impl SignalHub {
                 }
 
                 let relay_token = random_hex(32);
+                let punch_secret = random_hex(PUNCH_SECRET_LEN);
+                let client_start_after_ms =
+                    compute_punch_start_after_ms(client_rtt_ms, host_rtt_ms);
+                let host_start_after_ms = compute_punch_start_after_ms(host_rtt_ms, client_rtt_ms);
+                let relay_fallback_after_ms = Some(self.config.relay_fallback_after_ms);
                 let client_msg = SignalMsg::PunchCoord {
                     session_id: session_id.clone(),
                     role: "client".into(),
@@ -3797,8 +3958,13 @@ impl SignalHub {
                     self_public_udp_addr: client_udp.clone(),
                     peer_nat_type: host_nat_type,
                     peer_nat_port_delta: host_nat_port_delta,
+                    self_nat_port_range: client_nat_port_range,
+                    peer_nat_port_range: host_nat_port_range,
                     peer_lan_addrs: host_lan_addrs,
                     nonce: nonce.clone(),
+                    punch_secret: Some(punch_secret.clone()),
+                    start_after_ms: Some(client_start_after_ms),
+                    relay_fallback_after_ms,
                     relay_token: relay_token.clone(),
                     relay_addr: self.config.public_relay_addr.clone(),
                     owner_grant,
@@ -3813,8 +3979,13 @@ impl SignalHub {
                     self_public_udp_addr: host_udp,
                     peer_nat_type: client_nat_type,
                     peer_nat_port_delta: client_nat_port_delta,
+                    self_nat_port_range: host_nat_port_range,
+                    peer_nat_port_range: client_nat_port_range,
                     peer_lan_addrs: client_lan_addrs,
                     nonce,
+                    punch_secret: Some(punch_secret),
+                    start_after_ms: Some(host_start_after_ms),
+                    relay_fallback_after_ms,
                     relay_token: relay_token.clone(),
                     relay_addr: self.config.public_relay_addr.clone(),
                     owner_grant: None,
@@ -4562,6 +4733,8 @@ mod tests {
             wol_enabled: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
+            rtt_ms: None,
         };
         let frame = encode_signal_frame(&msg).expect("encode frame");
         let len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
@@ -4614,6 +4787,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -4694,6 +4868,8 @@ mod tests {
                     wol_enabled: None,
                     nat_type: None,
                     nat_port_delta: None,
+                    nat_port_range: None,
+                    rtt_ms: None,
                 },
             )
             .await
@@ -4726,6 +4902,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -4755,6 +4932,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -4785,6 +4963,8 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
+                rtt_ms: None,
             },
         )
         .await
@@ -4811,6 +4991,7 @@ mod tests {
                 nonce: Some("deadbeef".into()),
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -4912,6 +5093,7 @@ mod tests {
                 nonce: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -4954,6 +5136,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -5000,6 +5183,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -5035,6 +5219,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -5065,6 +5250,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -5109,6 +5295,8 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
+                rtt_ms: None,
             };
             if write_signal_frame(stream, &msg).await.is_err() {
                 break;
@@ -5156,6 +5344,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -5191,6 +5380,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -5219,6 +5409,8 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
+                rtt_ms: None,
             },
         )
         .await;
@@ -5257,6 +5449,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -5290,6 +5483,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -5308,6 +5502,8 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
+                rtt_ms: None,
             },
         )
         .await;
@@ -5369,6 +5565,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -5453,6 +5650,7 @@ mod tests {
                     wol_enabled: None,
                     nat_type: None,
                     nat_port_delta: None,
+                    nat_port_range: None,
                 },
             )
             .await
@@ -5485,6 +5683,7 @@ mod tests {
                     wol_enabled: None,
                     nat_type: None,
                     nat_port_delta: None,
+                    nat_port_range: None,
                 },
             )
             .await
@@ -5517,6 +5716,7 @@ mod tests {
                     wol_enabled: None,
                     nat_type: None,
                     nat_port_delta: None,
+                    nat_port_range: None,
                 },
             )
             .await
@@ -5692,6 +5892,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -5748,6 +5949,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -5766,6 +5968,8 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
+                rtt_ms: None,
             },
         )
         .await
@@ -5824,6 +6028,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -5879,6 +6084,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -6165,6 +6371,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
             SignalMsg::Register {
                 device_id: None,
@@ -6183,6 +6390,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
             SignalMsg::Register {
                 device_id: None,
@@ -6201,6 +6409,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         ] {
             let mut s = TcpStream::connect(tcp_addr).await.unwrap();
@@ -6225,6 +6434,7 @@ mod tests {
                 nonce: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
             SignalMsg::ConnectRequest {
                 target_id: victim_id.clone(),
@@ -6233,6 +6443,7 @@ mod tests {
                 nonce: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
             SignalMsg::ConnectRequest {
                 target_id: victim_id.clone(),
@@ -6241,6 +6452,7 @@ mod tests {
                 nonce: Some("n".repeat(MAX_NONCE_LEN + 1)),
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
             SignalMsg::ConnectRequest {
                 target_id: victim_id.clone(),
@@ -6249,6 +6461,7 @@ mod tests {
                 nonce: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
             SignalMsg::ConnectRequest {
                 target_id: victim_id.clone(),
@@ -6257,6 +6470,7 @@ mod tests {
                 nonce: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
             SignalMsg::RelayAlloc {
                 target_id: victim_id.clone(),
@@ -6292,6 +6506,8 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
+                rtt_ms: None,
             },
         )
         .await
@@ -6345,6 +6561,7 @@ mod tests {
                     nonce: None,
                     nat_type: None,
                     nat_port_delta: None,
+                    nat_port_range: None,
                 },
             )
             .await
@@ -6493,6 +6710,8 @@ mod tests {
                     wol_enabled: None,
                     nat_type: None,
                     nat_port_delta: None,
+                    nat_port_range: None,
+                    rtt_ms: None,
                 })
                 .unwrap();
             let full_host_id = "888777666".to_string();
@@ -6518,6 +6737,8 @@ mod tests {
                     udp_probe_token: None,
                     nat_type: None,
                     nat_port_delta: None,
+                    nat_port_range: None,
+                    smoothed_rtt_ms: None,
                 },
             );
 
@@ -6531,6 +6752,7 @@ mod tests {
                     nonce: None,
                     nat_type: None,
                     nat_port_delta: None,
+                    nat_port_range: None,
                 },
             )
             .await
@@ -6642,6 +6864,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -6722,6 +6945,7 @@ mod tests {
                         wol_enabled: None,
                         nat_type: None,
                         nat_port_delta: None,
+                        nat_port_range: None,
                     },
                 )
                 .await;
@@ -6780,6 +7004,7 @@ mod tests {
                         wol_enabled: None,
                         nat_type: None,
                         nat_port_delta: None,
+                        nat_port_range: None,
                     },
                 )
                 .await;
@@ -6840,6 +7065,7 @@ mod tests {
                 nonce: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -7055,6 +7281,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -7077,6 +7304,7 @@ mod tests {
                 nonce: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -7127,6 +7355,8 @@ mod tests {
                 udp_probe_token: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
+                smoothed_rtt_ms: None,
             },
         );
         write_signal_frame(
@@ -7138,6 +7368,7 @@ mod tests {
                 nonce: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -7474,6 +7705,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -7540,6 +7772,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -7569,6 +7802,7 @@ mod tests {
                 wol_enabled: Some(false),
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -7607,6 +7841,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -7861,6 +8096,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -7891,6 +8127,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -7921,6 +8158,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -8131,6 +8369,7 @@ mod tests {
                 wol_enabled: Some(false),
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -8148,6 +8387,8 @@ mod tests {
                 wol_enabled: Some(false),
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
+                rtt_ms: None,
             },
         )
         .await
@@ -8210,6 +8451,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
             },
         )
         .await
@@ -8303,6 +8545,8 @@ mod tests {
                 udp_probe_token: None,
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
+                smoothed_rtt_ms: None,
             },
         );
         write_signal_frame(
@@ -8429,6 +8673,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: Some("Cone".into()),
                 nat_port_delta: Some(0),
+                nat_port_range: None,
             },
         )
         .await
@@ -8609,6 +8854,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: Some("Symmetric_Seq".into()),
                 nat_port_delta: Some(3),
+                nat_port_range: None,
             },
         )
         .await
@@ -8639,6 +8885,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: Some("bogus_nat".into()),
                 nat_port_delta: Some(9999),
+                nat_port_range: None,
             },
         )
         .await
@@ -8662,6 +8909,8 @@ mod tests {
                 wol_enabled: None,
                 nat_type: Some("CONE".into()),
                 nat_port_delta: Some(0),
+                nat_port_range: None,
+                rtt_ms: None,
             },
         )
         .await
@@ -8698,6 +8947,7 @@ mod tests {
                 nonce: Some("dsnonce1".into()),
                 nat_type: Some("symmetric_random".into()),
                 nat_port_delta: Some(-5000),
+                nat_port_range: None,
             },
         )
         .await
@@ -8766,6 +9016,7 @@ mod tests {
             SignalMsg::Register {
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
                 ..
             }
         ));
@@ -8788,6 +9039,8 @@ mod tests {
             SignalMsg::Heartbeat {
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
+                rtt_ms: None,
                 ..
             }
         ));
@@ -8799,6 +9052,7 @@ mod tests {
             SignalMsg::ConnectRequest {
                 nat_type: None,
                 nat_port_delta: None,
+                nat_port_range: None,
                 ..
             }
         ));
@@ -8902,6 +9156,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: Some("cone".into()),
                 nat_port_delta: Some(0),
+                nat_port_range: None,
             },
         )
         .await
@@ -8942,6 +9197,7 @@ mod tests {
                 wol_enabled: None,
                 nat_type: Some("cone".into()),
                 nat_port_delta: Some(0),
+                nat_port_range: None,
             },
         )
         .await
@@ -9069,6 +9325,7 @@ mod tests {
                 nonce: Some("v4v6nonce".into()),
                 nat_type: Some("cone".into()),
                 nat_port_delta: Some(0),
+                nat_port_range: None,
             },
         )
         .await
@@ -9128,5 +9385,447 @@ mod tests {
         let _ = udp_v4_task.await;
         let _ = udp_v6_task.await;
         let _ = tcp_task.await;
+    }
+
+    #[test]
+    fn extended_nat_type_and_nat_port_range_validation() {
+        for valid in [
+            "unknown",
+            "public",
+            "cone",
+            "cone_verified",
+            "cone_unverified",
+            "symmetric_seq",
+            "symmetric_random",
+            "adm_seq",
+            "adm_random",
+            "apdm_seq",
+            "apdm_random",
+            "udp_blocked",
+        ] {
+            let upper = valid.to_ascii_uppercase();
+            assert_eq!(normalize_nat_type(Some(valid)).as_deref(), Some(valid));
+            assert_eq!(
+                normalize_nat_type(Some(&format!("  {upper}  "))).as_deref(),
+                Some(valid)
+            );
+        }
+        assert_eq!(normalize_nat_type(Some("bogus_type")), None);
+        assert_eq!(normalize_nat_type(None), None);
+
+        // Valid port ranges: 1..=min<=max<=65535
+        assert_eq!(normalize_nat_port_range(Some([1, 65535])), Some([1, 65535]));
+        assert_eq!(
+            normalize_nat_port_range(Some([20000, 20000])),
+            Some([20000, 20000])
+        );
+        // Invalid port ranges: zero port or inverted range
+        assert_eq!(normalize_nat_port_range(Some([0, 1000])), None);
+        assert_eq!(normalize_nat_port_range(Some([0, 0])), None);
+        assert_eq!(normalize_nat_port_range(Some([5000, 4000])), None);
+        assert_eq!(normalize_nat_port_range(None), None);
+
+        // Malformed array lengths in JSON must be rejected at deserialization
+        let bad_len_1 = br#"{"type":"register","device_key":"k","nat_port_range":[1000]}"#;
+        assert!(serde_json::from_slice::<SignalMsg>(bad_len_1).is_err());
+        let bad_len_3 = br#"{"type":"heartbeat","nat_port_range":[1000,2000,3000]}"#;
+        assert!(serde_json::from_slice::<SignalMsg>(bad_len_3).is_err());
+    }
+
+    #[test]
+    fn rtt_smoothing_and_punch_start_after_clamping() {
+        // No previous sample -> takes sample clamped to PEER_RTT_MAX_MS
+        assert_eq!(update_smoothed_rtt_ms(None, 40), 40);
+        assert_eq!(update_smoothed_rtt_ms(None, 25_000), PEER_RTT_MAX_MS);
+        // EWMA: (3 * 40 + 80 + 2) / 4 = 50
+        assert_eq!(update_smoothed_rtt_ms(Some(40), 80), 50);
+
+        // Equal / zero RTT -> 0 on both sides
+        assert_eq!(compute_punch_start_after_ms(0, 0), 0);
+        assert_eq!(compute_punch_start_after_ms(50, 50), 0);
+
+        // Fast side waits (rtt_slow - rtt_fast) / 2, slow side waits 0
+        assert_eq!(compute_punch_start_after_ms(20, 120), 50);
+        assert_eq!(compute_punch_start_after_ms(120, 20), 0);
+
+        // Difference > 1000ms clamps delay to 500ms
+        assert_eq!(compute_punch_start_after_ms(10, 1_500), 500);
+        assert_eq!(compute_punch_start_after_ms(0, u32::MAX), 500);
+        assert_eq!(compute_punch_start_after_ms(1_500, 10), 0);
+    }
+
+    #[test]
+    fn legacy_json_without_p2_nat_or_punch_sync_fields_remains_compatible() {
+        let legacy_register = br#"{"type":"register","device_key":"ed25519:old"}"#;
+        assert!(matches!(
+            serde_json::from_slice::<SignalMsg>(legacy_register).unwrap(),
+            SignalMsg::Register {
+                nat_type: None,
+                nat_port_delta: None,
+                nat_port_range: None,
+                ..
+            }
+        ));
+
+        let legacy_registered = br#"{"type":"registered","device_id":"123456789","formatted_id":"123 456 789","server_time":"2026-11-22T10:00:00Z","udp_probe_addr":"172.16.1.2:21116","relay_addr":"172.16.1.2:21117"}"#;
+        let reg_ack: SignalMsg = serde_json::from_slice(legacy_registered).unwrap();
+        assert!(matches!(
+            reg_ack,
+            SignalMsg::Registered {
+                udp_probe_alt_addr: None,
+                udp_probe_alt_ip_addr: None,
+                udp_probe_token: None,
+                ..
+            }
+        ));
+        let reg_ack_json = serde_json::to_string(&reg_ack).unwrap();
+        assert!(!reg_ack_json.contains("udp_probe_alt_ip_addr"));
+
+        let legacy_hb = br#"{"type":"heartbeat"}"#;
+        assert!(matches!(
+            serde_json::from_slice::<SignalMsg>(legacy_hb).unwrap(),
+            SignalMsg::Heartbeat {
+                nat_type: None,
+                nat_port_delta: None,
+                nat_port_range: None,
+                rtt_ms: None,
+                ..
+            }
+        ));
+
+        let legacy_conn = br#"{"type":"connect_request","target_id":"987654321"}"#;
+        assert!(matches!(
+            serde_json::from_slice::<SignalMsg>(legacy_conn).unwrap(),
+            SignalMsg::ConnectRequest {
+                nat_type: None,
+                nat_port_delta: None,
+                nat_port_range: None,
+                ..
+            }
+        ));
+
+        let legacy_punch = br#"{"type":"punch_coord","session_id":"s1","role":"client","peer_id":"987654321","peer_lan_addrs":[],"nonce":"n1","relay_token":"t1","relay_addr":"172.16.1.2:21117"}"#;
+        let punch: SignalMsg = serde_json::from_slice(legacy_punch).unwrap();
+        assert!(matches!(
+            punch,
+            SignalMsg::PunchCoord {
+                self_nat_port_range: None,
+                peer_nat_port_range: None,
+                punch_secret: None,
+                start_after_ms: None,
+                relay_fallback_after_ms: None,
+                ..
+            }
+        ));
+        let serialized = serde_json::to_string(&punch).unwrap();
+        assert!(!serialized.contains("self_nat_port_range"));
+        assert!(!serialized.contains("peer_nat_port_range"));
+        assert!(!serialized.contains("punch_secret"));
+        assert!(!serialized.contains("start_after_ms"));
+        assert!(!serialized.contains("relay_fallback_after_ms"));
+    }
+
+    #[tokio::test]
+    async fn punch_coord_delivers_alt_ip_secret_rtt_sync_and_nat_port_ranges() {
+        let store = Arc::new(MemoryDeviceStore::new());
+        let ephemeral = Arc::new(MemoryEphemeralStore::new());
+        let hub = Arc::new(SignalHub::new(
+            store,
+            ephemeral,
+            SignalConfig {
+                public_udp_probe_addr: "198.51.100.1:21116".into(),
+                public_udp_probe_alt_addr: Some("198.51.100.1:21119".into()),
+                public_udp_probe_alt_ip_addr: Some("198.51.100.2:21116".into()),
+                ..SignalConfig::default()
+            },
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(hub.clone().serve_tcp_signaling_on_listener(listener));
+
+        // Host registers with adm_seq and valid nat_port_range [30000, 31000]
+        let mut host = TcpStream::connect(tcp_addr).await.unwrap();
+        write_signal_frame(
+            &mut host,
+            &SignalMsg::Register {
+                device_id: None,
+                device_key: "ed25519:p2-host".into(),
+                hostname: "p2-host".into(),
+                os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
+                device_group: String::new(),
+                lan_addrs: vec![],
+                access_token: None,
+                device_pubkey: None,
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
+                nat_type: Some("adm_seq".into()),
+                nat_port_delta: Some(2),
+                nat_port_range: Some([30_000, 31_000]),
+            },
+        )
+        .await
+        .unwrap();
+        let host_id = match read_signal_frame(&mut host).await.unwrap().unwrap() {
+            SignalMsg::Registered {
+                device_id,
+                udp_probe_alt_ip_addr,
+                ..
+            } => {
+                assert_eq!(udp_probe_alt_ip_addr.as_deref(), Some("198.51.100.2:21116"));
+                device_id
+            }
+            other => panic!("expected Registered for host, got {other:?}"),
+        };
+
+        // Client registers with apdm_random and invalid nat_port_range [0, 1000] (ignored -> None)
+        let mut client = TcpStream::connect(tcp_addr).await.unwrap();
+        write_signal_frame(
+            &mut client,
+            &SignalMsg::Register {
+                device_id: None,
+                device_key: "ed25519:p2-client".into(),
+                hostname: "p2-client".into(),
+                os: "macos".into(),
+                app_version: String::new(),
+                arch: String::new(),
+                device_group: String::new(),
+                lan_addrs: vec![],
+                access_token: None,
+                device_pubkey: None,
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
+                nat_type: Some("apdm_random".into()),
+                nat_port_delta: None,
+                nat_port_range: Some([0, 1000]),
+            },
+        )
+        .await
+        .unwrap();
+        let client_id = match read_signal_frame(&mut client).await.unwrap().unwrap() {
+            SignalMsg::Registered {
+                device_id,
+                udp_probe_alt_ip_addr,
+                ..
+            } => {
+                assert_eq!(udp_probe_alt_ip_addr.as_deref(), Some("198.51.100.2:21116"));
+                device_id
+            }
+            other => panic!("expected Registered for client, got {other:?}"),
+        };
+        assert_eq!(hub.peer_smoothed_rtt_ms(&host_id), 0);
+        assert_eq!(hub.peer_smoothed_rtt_ms(&client_id), 0);
+
+        // Session 1 (before any RTT samples): both fallback to 0 -> start_after_ms == Some(0)
+        write_signal_frame(
+            &mut client,
+            &SignalMsg::ConnectRequest {
+                target_id: host_id.clone(),
+                session_id: Some("sess-p2-1".into()),
+                lan_addrs: vec![],
+                nonce: Some("n1".into()),
+                nat_type: None,
+                nat_port_delta: None,
+                nat_port_range: None,
+            },
+        )
+        .await
+        .unwrap();
+        let c1 = read_signal_frame(&mut client).await.unwrap().unwrap();
+        let h1 = read_signal_frame(&mut host).await.unwrap().unwrap();
+
+        let secret1 = match (c1, h1) {
+            (
+                SignalMsg::PunchCoord {
+                    punch_secret: cs,
+                    start_after_ms: c_start,
+                    relay_fallback_after_ms: c_fb,
+                    peer_nat_type: c_peer_nat,
+                    self_nat_port_range: c_self_range,
+                    peer_nat_port_range: c_peer_range,
+                    ..
+                },
+                SignalMsg::PunchCoord {
+                    punch_secret: hs,
+                    start_after_ms: h_start,
+                    relay_fallback_after_ms: h_fb,
+                    peer_nat_type: h_peer_nat,
+                    self_nat_port_range: h_self_range,
+                    peer_nat_port_range: h_peer_range,
+                    ..
+                },
+            ) => {
+                let cs = cs.expect("client punch_secret must be set");
+                let hs = hs.expect("host punch_secret must be set");
+                assert_eq!(cs, hs);
+                assert_eq!(cs.len(), 32);
+                assert!(cs
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+                assert_eq!(c_start, Some(0));
+                assert_eq!(h_start, Some(0));
+                assert_eq!(c_fb, Some(400));
+                assert_eq!(h_fb, Some(400));
+                assert_eq!(c_peer_nat.as_deref(), Some("adm_seq"));
+                assert_eq!(h_peer_nat.as_deref(), Some("apdm_random"));
+                // Client's invalid [0, 1000] was ignored -> None
+                assert_eq!(c_self_range, None);
+                assert_eq!(c_peer_range, Some([30_000, 31_000]));
+                assert_eq!(h_self_range, Some([30_000, 31_000]));
+                assert_eq!(h_peer_range, None);
+                cs
+            }
+            other => panic!("expected PunchCoord pair, got {other:?}"),
+        };
+
+        // Host reports RTT=160ms via Heartbeat; Client reports RTT=40ms + valid nat_port_range via Heartbeat
+        write_signal_frame(
+            &mut host,
+            &SignalMsg::Heartbeat {
+                lan_addrs: vec![],
+                mac_addr: None,
+                wol_enabled: None,
+                nat_type: Some("cone_verified".into()),
+                nat_port_delta: Some(0),
+                nat_port_range: Some([40_000, 41_000]),
+                rtt_ms: Some(160),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut host).await.unwrap().unwrap(),
+            SignalMsg::HeartbeatAck { .. }
+        ));
+
+        write_signal_frame(
+            &mut client,
+            &SignalMsg::Heartbeat {
+                lan_addrs: vec![],
+                mac_addr: None,
+                wol_enabled: None,
+                nat_type: Some("cone_unverified".into()),
+                nat_port_delta: None,
+                nat_port_range: Some([12_000, 12_500]),
+                rtt_ms: Some(40),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut client).await.unwrap().unwrap(),
+            SignalMsg::HeartbeatAck { .. }
+        ));
+
+        // Session 2: fast client (40ms) gets (160 - 40)/2 = 60ms, slow host (160ms) gets 0ms
+        // and punch_secret differs from Session 1.
+        write_signal_frame(
+            &mut client,
+            &SignalMsg::ConnectRequest {
+                target_id: host_id.clone(),
+                session_id: Some("sess-p2-2".into()),
+                lan_addrs: vec![],
+                nonce: Some("n2".into()),
+                nat_type: None,
+                nat_port_delta: None,
+                nat_port_range: None,
+            },
+        )
+        .await
+        .unwrap();
+        let c2 = read_signal_frame(&mut client).await.unwrap().unwrap();
+        let h2 = read_signal_frame(&mut host).await.unwrap().unwrap();
+
+        let secret2 = match (c2, h2) {
+            (
+                SignalMsg::PunchCoord {
+                    punch_secret: cs,
+                    start_after_ms: c_start,
+                    relay_fallback_after_ms: c_fb,
+                    peer_nat_type: c_peer_nat,
+                    self_nat_port_range: c_self_range,
+                    peer_nat_port_range: c_peer_range,
+                    ..
+                },
+                SignalMsg::PunchCoord {
+                    punch_secret: hs,
+                    start_after_ms: h_start,
+                    relay_fallback_after_ms: h_fb,
+                    peer_nat_type: h_peer_nat,
+                    self_nat_port_range: h_self_range,
+                    peer_nat_port_range: h_peer_range,
+                    ..
+                },
+            ) => {
+                assert_eq!(cs, hs);
+                assert_eq!(c_start, Some(60));
+                assert_eq!(h_start, Some(0));
+                assert_eq!(c_fb, Some(400));
+                assert_eq!(h_fb, Some(400));
+                assert_eq!(c_peer_nat.as_deref(), Some("cone_verified"));
+                assert_eq!(h_peer_nat.as_deref(), Some("cone_unverified"));
+                assert_eq!(c_self_range, Some([12_000, 12_500]));
+                assert_eq!(c_peer_range, Some([40_000, 41_000]));
+                assert_eq!(h_self_range, Some([40_000, 41_000]));
+                assert_eq!(h_peer_range, Some([12_000, 12_500]));
+                cs.unwrap()
+            }
+            other => panic!("expected PunchCoord pair, got {other:?}"),
+        };
+        assert_ne!(secret1, secret2);
+
+        // Session 3: host RTT jumps high (e.g. 2000ms) -> client clamped to 500ms
+        hub.record_peer_rtt_ms(&host_id, 2000);
+        // After EWMA (3*160 + 2000 + 2)/4 = 620ms, (620 - 40)/2 = 290ms; push again to exceed 1040ms
+        for _ in 0..8 {
+            hub.record_peer_rtt_ms(&host_id, 2000);
+        }
+        write_signal_frame(
+            &mut client,
+            &SignalMsg::ConnectRequest {
+                target_id: host_id.clone(),
+                session_id: Some("sess-p2-3".into()),
+                lan_addrs: vec![],
+                nonce: Some("n3".into()),
+                nat_type: None,
+                nat_port_delta: None,
+                nat_port_range: None,
+            },
+        )
+        .await
+        .unwrap();
+        let c3 = read_signal_frame(&mut client).await.unwrap().unwrap();
+        let h3 = read_signal_frame(&mut host).await.unwrap().unwrap();
+        match (c3, h3) {
+            (
+                SignalMsg::PunchCoord {
+                    start_after_ms: c_start,
+                    relay_fallback_after_ms: c_fb,
+                    ..
+                },
+                SignalMsg::PunchCoord {
+                    start_after_ms: h_start,
+                    relay_fallback_after_ms: h_fb,
+                    ..
+                },
+            ) => {
+                assert_eq!(c_start, Some(500));
+                assert_eq!(h_start, Some(0));
+                assert_eq!(c_fb, Some(400));
+                assert_eq!(h_fb, Some(400));
+            }
+            other => panic!("expected PunchCoord pair, got {other:?}"),
+        }
+
+        drop(client);
+        drop(host);
+        hub.shutdown_all().await;
+        let _ = server_task.await;
     }
 }

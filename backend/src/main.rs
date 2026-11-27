@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -61,6 +61,14 @@ struct Args {
         value_name = "ADDR"
     )]
     udp_probe_alt: Option<String>,
+
+    /// Optional secondary public IP UDP STUN-lite probe address advertised to clients (e.g. 203.0.113.2:21116 or 203.0.113.2; default: None; third-party public STUN is forbidden)
+    #[arg(
+        long = "udp-probe-alt-ip",
+        env = "RC_UDP_PROBE_ALT_IP",
+        value_name = "ADDR"
+    )]
+    udp_probe_alt_ip: Option<String>,
 
     /// Mandatory TLS 1.3 mTLS TCP relay listen address (RCR1 binary handshake) [default: 0.0.0.0:21117]
     #[arg(long, env = "RC_RELAY_ADDR", value_name = "ADDR")]
@@ -123,12 +131,19 @@ struct Args {
     allow_server_wol: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UdpProbeAltIpSpec {
+    Socket(SocketAddr),
+    IpOnly(IpAddr),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedConfig {
     http: SocketAddr,
     web_addr: Option<SocketAddr>,
     signal: SocketAddr,
     udp_probe_alt: Option<SocketAddr>,
+    udp_probe_alt_ip: Option<UdpProbeAltIpSpec>,
     relay: SocketAddr,
     database_url: String,
     redis_url: Option<String>,
@@ -250,6 +265,52 @@ fn resolve_udp_probe_alt(
     })
 }
 
+fn resolve_udp_probe_alt_ip(raw: Option<String>) -> Result<Option<UdpProbeAltIpSpec>, String> {
+    let Some(val) = trim_non_empty(raw) else {
+        return Ok(None);
+    };
+    if val.eq_ignore_ascii_case("disabled") || val.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    if val.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(
+            "invalid --udp-probe-alt-ip / RC_UDP_PROBE_ALT_IP: whitespace and control characters are not allowed"
+                .to_string(),
+        );
+    }
+    if let Ok(addr) = val.parse::<SocketAddr>() {
+        if addr.ip().is_unspecified() {
+            return Err(format!(
+                "invalid --udp-probe-alt-ip / RC_UDP_PROBE_ALT_IP '{val}': unspecified IP is not allowed"
+            ));
+        }
+        if addr.port() == 0 {
+            return Err(format!(
+                "invalid --udp-probe-alt-ip / RC_UDP_PROBE_ALT_IP '{val}': port must be >= 1"
+            ));
+        }
+        return Ok(Some(UdpProbeAltIpSpec::Socket(addr)));
+    }
+    if let Ok(ip) = val.parse::<IpAddr>() {
+        if ip.is_unspecified() {
+            return Err(format!(
+                "invalid --udp-probe-alt-ip / RC_UDP_PROBE_ALT_IP '{val}': unspecified IP is not allowed"
+            ));
+        }
+        return Ok(Some(UdpProbeAltIpSpec::IpOnly(ip)));
+    }
+    Err(format!(
+        "invalid IP or socket address '{val}' for --udp-probe-alt-ip / RC_UDP_PROBE_ALT_IP (must be IP or IP:port; third-party public STUN hostnames are forbidden)"
+    ))
+}
+
+fn format_udp_probe_alt_ip(spec: Option<UdpProbeAltIpSpec>, udp_local_port: u16) -> Option<String> {
+    spec.map(|s| match s {
+        UdpProbeAltIpSpec::Socket(addr) => addr.to_string(),
+        UdpProbeAltIpSpec::IpOnly(ip) => SocketAddr::new(ip, udp_local_port).to_string(),
+    })
+}
+
 fn resolve_config(
     args: Args,
     env_lookup: impl Fn(&str) -> Option<String>,
@@ -262,6 +323,7 @@ fn resolve_config(
         "--signal / RC_SIGNAL_ADDR",
     )?;
     let udp_probe_alt = resolve_udp_probe_alt(args.udp_probe_alt, signal)?;
+    let udp_probe_alt_ip = resolve_udp_probe_alt_ip(args.udp_probe_alt_ip)?;
     let relay =
         parse_socket_addr_or_default(args.relay, DEFAULT_RELAY_ADDR, "--relay / RC_RELAY_ADDR")?;
 
@@ -310,6 +372,7 @@ fn resolve_config(
         web_addr,
         signal,
         udp_probe_alt,
+        udp_probe_alt_ip,
         relay,
         database_url,
         redis_url,
@@ -536,6 +599,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let advertised_udp = format_advertised_addr(cfg.public_host.as_deref(), udp_local);
     let advertised_udp_alt =
         udp_alt_local.map(|addr| format_advertised_addr(cfg.public_host.as_deref(), addr));
+    let advertised_udp_alt_ip = format_udp_probe_alt_ip(cfg.udp_probe_alt_ip, udp_local.port());
     let advertised_relay = format_advertised_addr(cfg.public_host.as_deref(), relay_local);
 
     let signal_hub = Arc::new(SignalHub::with_auth(
@@ -545,6 +609,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SignalConfig {
             public_udp_probe_addr: advertised_udp.clone(),
             public_udp_probe_alt_addr: advertised_udp_alt.clone(),
+            public_udp_probe_alt_ip_addr: advertised_udp_alt_ip.clone(),
             public_relay_addr: advertised_relay.clone(),
             allow_server_wol: cfg.allow_server_wol,
             ..SignalConfig::default()
@@ -571,6 +636,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             signal_tcp_addr: advertised_signal.clone(),
             udp_probe_addr: advertised_udp.clone(),
             udp_probe_alt_addr: advertised_udp_alt.clone(),
+            udp_probe_alt_ip_addr: advertised_udp_alt_ip.clone(),
             tcp_relay_addr: advertised_relay.clone(),
         },
         started_at: Instant::now(),
@@ -606,6 +672,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         advertised_signal = %advertised_signal,
         advertised_udp = %advertised_udp,
         advertised_udp_alt = ?advertised_udp_alt,
+        advertised_udp_alt_ip = ?advertised_udp_alt_ip,
         advertised_relay = %advertised_relay,
         ca_fingerprint_sha256 = %pki_authority.ca_fingerprint_sha256(),
         auth_pubkey_hex = %auth_authority.public_key_hex(),
@@ -829,6 +896,7 @@ mod tests {
             web_addr: None,
             signal: None,
             udp_probe_alt: None,
+            udp_probe_alt_ip: None,
             relay: None,
             database_url: None,
             redis_url: None,
@@ -1097,5 +1165,73 @@ mod tests {
         args.database_url = Some("postgres://u:p@127.0.0.1/rc".into());
         args.udp_probe_alt = Some("not-an-addr".into());
         assert!(resolve_config(args, lookup_from(&env)).is_err());
+    }
+
+    #[test]
+    fn resolve_config_handles_udp_probe_alt_ip_validation_and_formatting() {
+        let env = HashMap::new();
+
+        // Default is None (no third-party public STUN).
+        let parsed_default =
+            Args::try_parse_from(["rc-server", "--database-url", "postgres://cli:p@db/rc"])
+                .unwrap();
+        let cfg_default = resolve_config(parsed_default, lookup_from(&env)).unwrap();
+        assert_eq!(cfg_default.udp_probe_alt_ip, None);
+        assert_eq!(
+            format_udp_probe_alt_ip(cfg_default.udp_probe_alt_ip, 21116),
+            None
+        );
+
+        // Explicit IP:port and IPv6:port are accepted.
+        let parsed_sock = Args::try_parse_from([
+            "rc-server",
+            "--database-url",
+            "postgres://cli:p@db/rc",
+            "--udp-probe-alt-ip",
+            "198.51.100.2:21116",
+        ])
+        .unwrap();
+        let cfg_sock = resolve_config(parsed_sock, lookup_from(&env)).unwrap();
+        assert_eq!(
+            format_udp_probe_alt_ip(cfg_sock.udp_probe_alt_ip, 21116).as_deref(),
+            Some("198.51.100.2:21116")
+        );
+
+        // Bare IP inherits the primary UDP probe port.
+        let mut args = empty_args();
+        args.database_url = Some("postgres://u:p@127.0.0.1/rc".into());
+        args.udp_probe_alt_ip = Some("198.51.100.2".into());
+        let cfg_ip = resolve_config(args, lookup_from(&env)).unwrap();
+        assert_eq!(
+            format_udp_probe_alt_ip(cfg_ip.udp_probe_alt_ip, 21116).as_deref(),
+            Some("198.51.100.2:21116")
+        );
+
+        // "disabled" / "none" clears it.
+        for val in ["disabled", "none", "  "] {
+            let mut args = empty_args();
+            args.database_url = Some("postgres://u:p@127.0.0.1/rc".into());
+            args.udp_probe_alt_ip = Some(val.into());
+            let cfg = resolve_config(args, lookup_from(&env)).unwrap();
+            assert_eq!(cfg.udp_probe_alt_ip, None);
+        }
+
+        // Reject third-party STUN hostnames, unspecified IPs, zero ports, and malformed values.
+        for bad in [
+            "stun.cloudflare.com:3478",
+            "stun.qq.com:3478",
+            "0.0.0.0:21116",
+            "0.0.0.0",
+            "198.51.100.2:0",
+            "not-an-addr",
+        ] {
+            let mut args = empty_args();
+            args.database_url = Some("postgres://u:p@127.0.0.1/rc".into());
+            args.udp_probe_alt_ip = Some(bad.into());
+            assert!(
+                resolve_config(args, lookup_from(&env)).is_err(),
+                "expected '{bad}' to be rejected"
+            );
+        }
     }
 }

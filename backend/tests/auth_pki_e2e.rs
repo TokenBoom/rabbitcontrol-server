@@ -128,6 +128,7 @@ impl SecureTestCluster {
                 signal_tcp_addr: signal_addr.to_string(),
                 udp_probe_addr: signal_addr.to_string(),
                 udp_probe_alt_addr: None,
+                udp_probe_alt_ip_addr: None,
                 tcp_relay_addr: relay_addr.to_string(),
             },
             started_at: Instant::now(),
@@ -490,6 +491,7 @@ async fn initial_admin_must_change_password_gate_and_settings_toggle() {
             wol_enabled: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
@@ -856,6 +858,7 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             wol_enabled: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
@@ -886,6 +889,7 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             wol_enabled: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
@@ -928,6 +932,7 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             wol_enabled: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
@@ -947,6 +952,7 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             nonce: Some("n1".into()),
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
@@ -999,6 +1005,7 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             nonce: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
@@ -1247,6 +1254,7 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             nonce: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
@@ -1412,6 +1420,7 @@ async fn admin_disable_and_delete_user_kicks_signal_relay_and_protects_last_admi
             wol_enabled: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
@@ -1832,6 +1841,7 @@ async fn split_web_admin_and_client_api_ports_isolate_routes_and_static_ui() {
             signal_tcp_addr: signal_addr.to_string(),
             udp_probe_addr: signal_addr.to_string(),
             udp_probe_alt_addr: None,
+            udp_probe_alt_ip_addr: None,
             tcp_relay_addr: relay_addr.to_string(),
         },
         started_at: Instant::now(),
@@ -2243,6 +2253,7 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             wol_enabled: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
@@ -2292,6 +2303,7 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             wol_enabled: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
@@ -2313,6 +2325,7 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             nonce: Some("n1".into()),
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
@@ -2394,6 +2407,7 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             nonce: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
@@ -2437,6 +2451,7 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             nonce: Some("n2".into()),
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
@@ -2483,6 +2498,7 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             nonce: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
@@ -2585,6 +2601,7 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             nonce: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
@@ -2687,6 +2704,7 @@ async fn my_devices_orders_online_before_offline_even_when_offline_seen_later() 
             wol_enabled: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
@@ -2721,6 +2739,7 @@ async fn my_devices_orders_online_before_offline_even_when_offline_seen_later() 
             wol_enabled: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await

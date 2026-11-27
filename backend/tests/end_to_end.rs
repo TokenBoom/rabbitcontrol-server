@@ -95,6 +95,7 @@ impl TestCluster {
                 signal_tcp_addr: signal_addr.to_string(),
                 udp_probe_addr: udp_addr.to_string(),
                 udp_probe_alt_addr: None,
+                udp_probe_alt_ip_addr: None,
                 tcp_relay_addr: relay_addr.to_string(),
             },
             started_at: Instant::now(),
@@ -335,6 +336,7 @@ async fn full_flow_register_udp_signal_relay_2mib_and_api_stats() {
             wol_enabled: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
@@ -364,6 +366,7 @@ async fn full_flow_register_udp_signal_relay_2mib_and_api_stats() {
             wol_enabled: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
@@ -447,6 +450,7 @@ async fn full_flow_register_udp_signal_relay_2mib_and_api_stats() {
             nonce: Some("cafe1234".into()),
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
@@ -875,6 +879,7 @@ async fn admin_disable_device_kicks_online_peer_and_blocks_reregister() {
             wol_enabled: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
@@ -941,6 +946,7 @@ async fn admin_disable_device_kicks_online_peer_and_blocks_reregister() {
             wol_enabled: None,
             nat_type: None,
             nat_port_delta: None,
+            nat_port_range: None,
         },
     )
     .await
