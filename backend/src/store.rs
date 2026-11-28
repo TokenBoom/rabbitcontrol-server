@@ -17,6 +17,11 @@ pub const MAX_HOSTNAME_LEN: usize = 128;
 pub const MAX_OS_LEN: usize = 128;
 pub const MAX_APP_VERSION_LEN: usize = 32;
 pub const MAX_ARCH_LEN: usize = 32;
+pub const MAX_CPU_MODEL_LEN: usize = 128;
+pub const MAX_MAC_ADDRESS_LEN: usize = 64;
+pub const MAX_OS_VERSION_LEN: usize = 128;
+pub const MAX_GPU_MODEL_LEN: usize = 128;
+pub const MAX_TOTAL_MEMORY_MB: u64 = i64::MAX as u64;
 pub const MAX_DEVICE_GROUP_LEN: usize = 64;
 pub const MAX_DEVICE_ALIAS_LEN: usize = 128;
 pub const MAX_DEVICE_PUBKEY_LEN: usize = 256;
@@ -69,6 +74,16 @@ fn default_true() -> bool {
     true
 }
 
+/// Deserialize a field that may be omitted or explicitly `null` in JSON using `T::default()`.
+pub fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
 /// Default `allow_remote_control` value inferred from the device's `os` string.
 /// Mobile platforms (`android` / `ios`) default to `false` (require explicit opt-in even for
 /// same-account self-control); desktop platforms default to `true`.
@@ -87,6 +102,16 @@ pub struct DeviceRecord {
     pub app_version: String,
     #[serde(default)]
     pub arch: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub cpu_model: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub mac_address: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub total_memory_mb: u64,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub os_version: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub gpu_model: String,
     pub device_group: String,
     pub disabled: bool,
     pub created_at: DateTime<Utc>,
@@ -123,6 +148,16 @@ impl DeviceRecord {
                 .and_then(normalize_mac_addr)
                 .is_some()
     }
+
+    /// Returns the display hardware MAC address, falling back to the Wake-on-LAN `mac_addr`
+    /// when `mac_address` has not been separately reported.
+    pub fn effective_mac_address(&self) -> String {
+        if !self.mac_address.is_empty() {
+            self.mac_address.clone()
+        } else {
+            self.mac_addr.clone().unwrap_or_default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -136,6 +171,16 @@ pub struct RegisterInput {
     pub app_version: String,
     #[serde(default)]
     pub arch: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub cpu_model: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub mac_address: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub total_memory_mb: u64,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub os_version: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub gpu_model: String,
     #[serde(default, alias = "group")]
     pub device_group: String,
     #[serde(default)]
@@ -530,12 +575,111 @@ fn validate_optional_public_ip(raw: Option<&str>) -> Result<Option<String>, Stor
     Ok(Some(canonical.to_string()))
 }
 
+pub fn normalize_display_mac_address(raw: &str) -> Result<String, StoreError> {
+    let cleaned = validate_text_field(raw, MAX_MAC_ADDRESS_LEN, "mac_address")?;
+    if cleaned.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(normalize_mac_addr(&cleaned).unwrap_or(cleaned))
+}
+
+pub fn validate_total_memory_mb(val: u64) -> Result<u64, StoreError> {
+    if val > MAX_TOTAL_MEMORY_MB {
+        return Err(StoreError::InvalidInput(
+            "total_memory_mb exceeds maximum supported value".into(),
+        ));
+    }
+    Ok(val)
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DeviceHardwareUpdate<'a> {
+    pub cpu_model: Option<&'a str>,
+    pub mac_address: Option<&'a str>,
+    pub total_memory_mb: Option<u64>,
+    pub os_version: Option<&'a str>,
+    pub gpu_model: Option<&'a str>,
+}
+
+struct ValidatedHardwareUpdate {
+    cpu_model: Option<String>,
+    mac_address: Option<String>,
+    total_memory_mb: Option<i64>,
+    os_version: Option<String>,
+    gpu_model: Option<String>,
+}
+
+fn validate_optional_non_empty_text(
+    raw: Option<&str>,
+    max_len: usize,
+    field: &'static str,
+) -> Result<Option<String>, StoreError> {
+    let Some(val) = raw else {
+        return Ok(None);
+    };
+    let cleaned = validate_text_field(val, max_len, field)?;
+    if cleaned.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(cleaned))
+    }
+}
+
+fn validate_hardware_update(
+    update: &DeviceHardwareUpdate<'_>,
+) -> Result<ValidatedHardwareUpdate, StoreError> {
+    let cpu_model =
+        validate_optional_non_empty_text(update.cpu_model, MAX_CPU_MODEL_LEN, "cpu_model")?;
+    let mac_address = match update.mac_address {
+        Some(raw) => {
+            let norm = normalize_display_mac_address(raw)?;
+            if norm.is_empty() {
+                None
+            } else {
+                Some(norm)
+            }
+        }
+        None => None,
+    };
+    let total_memory_mb = match update.total_memory_mb {
+        Some(val) => {
+            let checked = validate_total_memory_mb(val)?;
+            if checked == 0 {
+                None
+            } else {
+                Some(i64::try_from(checked).map_err(|_| {
+                    StoreError::InvalidInput(
+                        "total_memory_mb exceeds maximum supported value".into(),
+                    )
+                })?)
+            }
+        }
+        None => None,
+    };
+    let os_version =
+        validate_optional_non_empty_text(update.os_version, MAX_OS_VERSION_LEN, "os_version")?;
+    let gpu_model =
+        validate_optional_non_empty_text(update.gpu_model, MAX_GPU_MODEL_LEN, "gpu_model")?;
+    Ok(ValidatedHardwareUpdate {
+        cpu_model,
+        mac_address,
+        total_memory_mb,
+        os_version,
+        gpu_model,
+    })
+}
+
 struct ValidatedRegisterInput {
     device_key: String,
     hostname: String,
     os: String,
     app_version: String,
     arch: String,
+    cpu_model: String,
+    mac_address: String,
+    total_memory_mb: u64,
+    os_version: String,
+    gpu_model: String,
     device_group: String,
     mac_addr: Option<String>,
     wol_enabled: Option<bool>,
@@ -555,6 +699,11 @@ fn validate_register_input(input: &RegisterInput) -> Result<ValidatedRegisterInp
     let os = validate_text_field(&input.os, MAX_OS_LEN, "os")?;
     let app_version = validate_text_field(&input.app_version, MAX_APP_VERSION_LEN, "app_version")?;
     let arch = validate_text_field(&input.arch, MAX_ARCH_LEN, "arch")?;
+    let cpu_model = validate_text_field(&input.cpu_model, MAX_CPU_MODEL_LEN, "cpu_model")?;
+    let mac_address = normalize_display_mac_address(&input.mac_address)?;
+    let total_memory_mb = validate_total_memory_mb(input.total_memory_mb)?;
+    let os_version = validate_text_field(&input.os_version, MAX_OS_VERSION_LEN, "os_version")?;
+    let gpu_model = validate_text_field(&input.gpu_model, MAX_GPU_MODEL_LEN, "gpu_model")?;
     let device_group =
         validate_text_field(&input.device_group, MAX_DEVICE_GROUP_LEN, "device_group")?;
     let mac_addr = validate_optional_mac_addr(input.mac_addr.as_deref())?;
@@ -570,6 +719,11 @@ fn validate_register_input(input: &RegisterInput) -> Result<ValidatedRegisterInp
         os,
         app_version,
         arch,
+        cpu_model,
+        mac_address,
+        total_memory_mb,
+        os_version,
+        gpu_model,
         device_group,
         mac_addr,
         wol_enabled: input.wol_enabled,
@@ -708,6 +862,13 @@ pub trait DeviceStore: Send + Sync {
         wol_enabled: Option<bool>,
         last_lan_addrs: Option<&[String]>,
         last_public_ip: Option<&str>,
+    ) -> Result<bool, StoreError>;
+
+    async fn update_device_hardware_info(
+        &self,
+        device_id: &str,
+        owner_user_id: Option<Uuid>,
+        hardware: DeviceHardwareUpdate<'_>,
     ) -> Result<bool, StoreError>;
 }
 
@@ -880,6 +1041,11 @@ struct DeviceRow {
     os: String,
     app_version: String,
     arch: String,
+    cpu_model: String,
+    mac_address: String,
+    total_memory_mb: i64,
+    os_version: String,
+    gpu_model: String,
     device_group: String,
     disabled: bool,
     created_at: DateTime<Utc>,
@@ -900,6 +1066,7 @@ impl From<DeviceRow> for DeviceRecord {
     fn from(row: DeviceRow) -> Self {
         let last_lan_addrs =
             serde_json::from_str::<Vec<String>>(&row.last_lan_addrs).unwrap_or_default();
+        let mac_address = normalize_mac_addr(&row.mac_address).unwrap_or(row.mac_address);
         Self {
             device_id: row.device_id.trim().to_string(),
             device_key: row.device_key,
@@ -907,6 +1074,11 @@ impl From<DeviceRow> for DeviceRecord {
             os: row.os,
             app_version: row.app_version,
             arch: row.arch,
+            cpu_model: row.cpu_model,
+            mac_address,
+            total_memory_mb: u64::try_from(row.total_memory_mb.max(0)).unwrap_or(0),
+            os_version: row.os_version,
+            gpu_model: row.gpu_model,
             device_group: row.device_group,
             disabled: row.disabled,
             created_at: row.created_at,
@@ -1123,7 +1295,8 @@ impl From<AuditLogRow> for AuditLogRecord {
 }
 
 const DEVICE_COLUMNS: &str =
-    "device_id, device_key, hostname, os, app_version, arch, device_group, disabled, \
+    "device_id, device_key, hostname, os, app_version, arch, cpu_model, mac_address, \
+    total_memory_mb, os_version, gpu_model, device_group, disabled, \
     created_at, last_seen_at, owner_user_id, alias, device_pubkey, allow_remote_assist, \
     allow_remote_control, bound_at, mac_addr, wol_enabled, last_lan_addrs, last_public_ip";
 
@@ -1179,23 +1352,29 @@ impl PgDeviceStore {
         &self,
         v: &ValidatedRegisterInput,
     ) -> Result<Option<DeviceRecord>, StoreError> {
+        let total_memory_i64 = i64::try_from(v.total_memory_mb).unwrap_or(i64::MAX);
         let sql = format!(
             "UPDATE devices
              SET hostname = COALESCE(NULLIF($1, ''), hostname),
                  os = COALESCE(NULLIF($2, ''), os),
                  app_version = COALESCE(NULLIF($3, ''), app_version),
                  arch = COALESCE(NULLIF($4, ''), arch),
-                 device_group = COALESCE(NULLIF($5, ''), device_group),
+                 cpu_model = COALESCE(NULLIF($5, ''), cpu_model),
+                 mac_address = COALESCE(NULLIF($6, ''), mac_address),
+                 total_memory_mb = CASE WHEN $7 > 0 THEN $7 ELSE total_memory_mb END,
+                 os_version = COALESCE(NULLIF($8, ''), os_version),
+                 gpu_model = COALESCE(NULLIF($9, ''), gpu_model),
+                 device_group = COALESCE(NULLIF($10, ''), device_group),
                  allow_remote_control = CASE
                      WHEN os = '' AND $2 <> '' AND (LOWER($2) LIKE '%android%' OR LOWER($2) LIKE '%ios%') THEN FALSE
                      ELSE allow_remote_control
                  END,
-                 mac_addr = COALESCE($6, mac_addr),
-                 wol_enabled = COALESCE($7, wol_enabled),
-                 last_lan_addrs = COALESCE($8, last_lan_addrs),
-                 last_public_ip = COALESCE($9, last_public_ip),
+                 mac_addr = COALESCE($11, mac_addr),
+                 wol_enabled = COALESCE($12, wol_enabled),
+                 last_lan_addrs = COALESCE($13, last_lan_addrs),
+                 last_public_ip = COALESCE($14, last_public_ip),
                  last_seen_at = NOW()
-             WHERE device_key = $10 AND disabled = FALSE
+             WHERE device_key = $15 AND disabled = FALSE
              RETURNING {DEVICE_COLUMNS}"
         );
         let row: Option<DeviceRow> = sqlx::query_as(&sql)
@@ -1203,6 +1382,11 @@ impl PgDeviceStore {
             .bind(&v.os)
             .bind(&v.app_version)
             .bind(&v.arch)
+            .bind(&v.cpu_model)
+            .bind(&v.mac_address)
+            .bind(total_memory_i64)
+            .bind(&v.os_version)
+            .bind(&v.gpu_model)
             .bind(&v.device_group)
             .bind(v.mac_addr.as_deref())
             .bind(v.wol_enabled)
@@ -1236,12 +1420,15 @@ impl DeviceStore for PgDeviceStore {
         }
 
         let default_allow_rc = default_allow_remote_control_for_os(&v.os);
+        let total_memory_i64 = i64::try_from(v.total_memory_mb).unwrap_or(i64::MAX);
         let insert_sql = format!(
             "INSERT INTO devices (
-                device_id, device_key, hostname, os, app_version, arch, device_group,
-                allow_remote_control, mac_addr, wol_enabled, last_lan_addrs, last_public_ip
+                device_id, device_key, hostname, os, app_version, arch,
+                cpu_model, mac_address, total_memory_mb, os_version, gpu_model,
+                device_group, allow_remote_control, mac_addr, wol_enabled,
+                last_lan_addrs, last_public_ip
              )
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
              ON CONFLICT DO NOTHING
              RETURNING {DEVICE_COLUMNS}"
         );
@@ -1255,6 +1442,11 @@ impl DeviceStore for PgDeviceStore {
                 .bind(&v.os)
                 .bind(&v.app_version)
                 .bind(&v.arch)
+                .bind(&v.cpu_model)
+                .bind(&v.mac_address)
+                .bind(total_memory_i64)
+                .bind(&v.os_version)
+                .bind(&v.gpu_model)
                 .bind(&v.device_group)
                 .bind(default_allow_rc)
                 .bind(v.mac_addr.as_deref())
@@ -1786,6 +1978,62 @@ impl DeviceStore for PgDeviceStore {
                 .bind(wol_enabled)
                 .bind(lan_json.as_deref())
                 .bind(norm_public_ip.as_deref())
+                .bind(&norm)
+                .execute(&self.pool)
+                .await?
+            }
+        };
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn update_device_hardware_info(
+        &self,
+        device_id: &str,
+        owner_user_id: Option<Uuid>,
+        hardware: DeviceHardwareUpdate<'_>,
+    ) -> Result<bool, StoreError> {
+        let norm = normalize_device_id(device_id);
+        if !is_valid_device_id(&norm) {
+            return Ok(false);
+        }
+        let v = validate_hardware_update(&hardware)?;
+
+        let res = match owner_user_id {
+            Some(uid) => {
+                sqlx::query(
+                    "UPDATE devices
+                     SET cpu_model = COALESCE($1, cpu_model),
+                         mac_address = COALESCE($2, mac_address),
+                         total_memory_mb = COALESCE($3, total_memory_mb),
+                         os_version = COALESCE($4, os_version),
+                         gpu_model = COALESCE($5, gpu_model)
+                     WHERE device_id = $6 AND owner_user_id = $7",
+                )
+                .bind(v.cpu_model.as_deref())
+                .bind(v.mac_address.as_deref())
+                .bind(v.total_memory_mb)
+                .bind(v.os_version.as_deref())
+                .bind(v.gpu_model.as_deref())
+                .bind(&norm)
+                .bind(uid)
+                .execute(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "UPDATE devices
+                     SET cpu_model = COALESCE($1, cpu_model),
+                         mac_address = COALESCE($2, mac_address),
+                         total_memory_mb = COALESCE($3, total_memory_mb),
+                         os_version = COALESCE($4, os_version),
+                         gpu_model = COALESCE($5, gpu_model)
+                     WHERE device_id = $6 AND owner_user_id IS NULL",
+                )
+                .bind(v.cpu_model.as_deref())
+                .bind(v.mac_address.as_deref())
+                .bind(v.total_memory_mb)
+                .bind(v.os_version.as_deref())
+                .bind(v.gpu_model.as_deref())
                 .bind(&norm)
                 .execute(&self.pool)
                 .await?
@@ -2813,6 +3061,21 @@ impl DeviceStore for MemoryDeviceStore {
                 if !v.arch.is_empty() {
                     existing.arch = v.arch;
                 }
+                if !v.cpu_model.is_empty() {
+                    existing.cpu_model = v.cpu_model;
+                }
+                if !v.mac_address.is_empty() {
+                    existing.mac_address = v.mac_address;
+                }
+                if v.total_memory_mb > 0 {
+                    existing.total_memory_mb = v.total_memory_mb;
+                }
+                if !v.os_version.is_empty() {
+                    existing.os_version = v.os_version;
+                }
+                if !v.gpu_model.is_empty() {
+                    existing.gpu_model = v.gpu_model;
+                }
                 if !v.device_group.is_empty() {
                     existing.device_group = v.device_group;
                 }
@@ -2844,6 +3107,11 @@ impl DeviceStore for MemoryDeviceStore {
                     os: v.os,
                     app_version: v.app_version,
                     arch: v.arch,
+                    cpu_model: v.cpu_model,
+                    mac_address: v.mac_address,
+                    total_memory_mb: v.total_memory_mb,
+                    os_version: v.os_version,
+                    gpu_model: v.gpu_model,
                     device_group: v.device_group,
                     disabled: false,
                     created_at: now,
@@ -3251,6 +3519,46 @@ impl DeviceStore for MemoryDeviceStore {
                 }
                 if let Some(pub_ip) = norm_public_ip {
                     rec.last_public_ip = pub_ip;
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn update_device_hardware_info(
+        &self,
+        device_id: &str,
+        owner_user_id: Option<Uuid>,
+        hardware: DeviceHardwareUpdate<'_>,
+    ) -> Result<bool, StoreError> {
+        let norm = normalize_device_id(device_id);
+        if !is_valid_device_id(&norm) {
+            return Ok(false);
+        }
+        let v = validate_hardware_update(&hardware)?;
+
+        let mut guard = self.state.write().expect("MemoryDeviceStore lock poisoned");
+        if let Some(rec) = guard.by_id.get_mut(&norm) {
+            let owner_matches = match owner_user_id {
+                Some(uid) => rec.owner_user_id == Some(uid),
+                None => rec.owner_user_id.is_none(),
+            };
+            if owner_matches {
+                if let Some(cpu_model) = v.cpu_model {
+                    rec.cpu_model = cpu_model;
+                }
+                if let Some(mac_address) = v.mac_address {
+                    rec.mac_address = mac_address;
+                }
+                if let Some(mem) = v.total_memory_mb {
+                    rec.total_memory_mb = u64::try_from(mem.max(0)).unwrap_or(0);
+                }
+                if let Some(os_version) = v.os_version {
+                    rec.os_version = os_version;
+                }
+                if let Some(gpu_model) = v.gpu_model {
+                    rec.gpu_model = gpu_model;
                 }
                 return Ok(true);
             }
@@ -5206,7 +5514,7 @@ mod tests {
 
         // Ensure DeviceRecord JSON serialization never leaks raw mac_addr.
         let rec_json = serde_json::to_string(&rec).unwrap();
-        assert!(!rec_json.contains("mac_addr"));
+        assert!(!rec_json.contains("\"mac_addr\":"));
         assert!(!rec_json.contains("aa:bb:cc:dd:ee:ff"));
 
         // Legacy client re-registering without MAC/wol/network fields preserves stored records.
@@ -5379,5 +5687,97 @@ mod tests {
         assert!(!after_del.wol_enabled);
         assert!(after_del.last_lan_addrs.is_empty());
         assert!(after_del.last_public_ip.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hardware_info_persists_normalizes_and_preserves_legacy_clients() {
+        let store = MemoryDeviceStore::new();
+
+        // 1. Register with full hardware metadata (including hyphenated MAC and null-tolerant JSON).
+        let rec = store
+            .register_or_get(RegisterInput {
+                device_key: "dk-hw-1".into(),
+                hostname: "mac-studio".into(),
+                os: "macos".into(),
+                cpu_model: "Apple M3 Ultra".into(),
+                mac_address: "AA-BB-CC-DD-EE-01".into(),
+                total_memory_mb: 65536,
+                os_version: "macOS 15.2".into(),
+                gpu_model: "Apple M3 Ultra (60-core)".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rec.cpu_model, "Apple M3 Ultra");
+        assert_eq!(rec.mac_address, "aa:bb:cc:dd:ee:01");
+        assert_eq!(rec.total_memory_mb, 65536);
+        assert_eq!(rec.os_version, "macOS 15.2");
+        assert_eq!(rec.gpu_model, "Apple M3 Ultra (60-core)");
+        assert_eq!(rec.effective_mac_address(), "aa:bb:cc:dd:ee:01");
+
+        // 2. Legacy/null JSON without hardware fields must preserve previously stored metadata.
+        let legacy_json = r#"{
+            "device_key": "dk-hw-1",
+            "hostname": "mac-studio-2",
+            "cpu_model": null,
+            "mac_address": null,
+            "total_memory_mb": null,
+            "os_version": "",
+            "gpu_model": null
+        }"#;
+        let legacy_input: RegisterInput = serde_json::from_str(legacy_json).unwrap();
+        let after_legacy = store.register_or_get(legacy_input).await.unwrap();
+        assert_eq!(after_legacy.hostname, "mac-studio-2");
+        assert_eq!(after_legacy.cpu_model, "Apple M3 Ultra");
+        assert_eq!(after_legacy.mac_address, "aa:bb:cc:dd:ee:01");
+        assert_eq!(after_legacy.total_memory_mb, 65536);
+        assert_eq!(after_legacy.os_version, "macOS 15.2");
+        assert_eq!(after_legacy.gpu_model, "Apple M3 Ultra (60-core)");
+
+        // 3. Incremental update via update_device_hardware_info updates only provided non-empty fields.
+        assert!(store
+            .update_device_hardware_info(
+                &rec.device_id,
+                None,
+                DeviceHardwareUpdate {
+                    os_version: Some("macOS 15.3"),
+                    total_memory_mb: Some(131072),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap());
+        let updated = store.get_by_id(&rec.device_id).await.unwrap().unwrap();
+        assert_eq!(updated.cpu_model, "Apple M3 Ultra");
+        assert_eq!(updated.os_version, "macOS 15.3");
+        assert_eq!(updated.total_memory_mb, 131072);
+
+        // 4. Reject oversized or control-char hardware fields and out-of-range total_memory_mb.
+        let bad_cpu = store
+            .register_or_get(RegisterInput {
+                device_key: "dk-hw-bad-cpu".into(),
+                cpu_model: "c".repeat(MAX_CPU_MODEL_LEN + 1),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(bad_cpu, Err(StoreError::InvalidInput(_))));
+
+        let bad_mem = store
+            .register_or_get(RegisterInput {
+                device_key: "dk-hw-bad-mem".into(),
+                total_memory_mb: u64::MAX,
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(bad_mem, Err(StoreError::InvalidInput(_))));
+
+        let bad_ctrl = store
+            .register_or_get(RegisterInput {
+                device_key: "dk-hw-bad-ctrl".into(),
+                gpu_model: "GPU\0Name".into(),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(bad_ctrl, Err(StoreError::InvalidInput(_))));
     }
 }

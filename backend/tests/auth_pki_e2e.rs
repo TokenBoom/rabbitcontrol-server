@@ -31,7 +31,8 @@ use rc_server::relay::{
     encode_relay_handshake, RelayConfig, RelayServer, REPLY_ERR, REPLY_OK, ROLE_CLIENT, ROLE_HOST,
 };
 use rc_server::signal::{
-    read_signal_frame, write_signal_frame, SignalConfig, SignalHub, SignalMsg,
+    read_signal_frame, write_signal_frame, ActiveControllerSummary, SignalConfig, SignalHub,
+    SignalMsg,
 };
 use rc_server::store::{DeviceStore, MemoryDeviceStore, PkiStore, UserStore};
 
@@ -481,6 +482,11 @@ async fn initial_admin_must_change_password_gate_and_settings_toggle() {
             os: "linux".into(),
             app_version: String::new(),
             arch: String::new(),
+            cpu_model: String::new(),
+            mac_address: String::new(),
+            total_memory_mb: 0,
+            os_version: String::new(),
+            gpu_model: String::new(),
             device_group: "".into(),
             lan_addrs: vec![],
             access_token: Some(login_res.access_token.clone()),
@@ -849,6 +855,11 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             os: "macos".into(),
             app_version: String::new(),
             arch: String::new(),
+            cpu_model: String::new(),
+            mac_address: String::new(),
+            total_memory_mb: 0,
+            os_version: String::new(),
+            gpu_model: String::new(),
             device_group: "prod".into(),
             lan_addrs: vec!["10.0.0.1:50000".into()],
             access_token: Some(user_a.access_token.clone()),
@@ -881,6 +892,11 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             os: "linux".into(),
             app_version: String::new(),
             arch: String::new(),
+            cpu_model: String::new(),
+            mac_address: String::new(),
+            total_memory_mb: 0,
+            os_version: String::new(),
+            gpu_model: String::new(),
             device_group: "prod".into(),
             lan_addrs: vec!["10.0.0.2:50001".into()],
             access_token: Some(user_a.access_token.clone()),
@@ -925,6 +941,11 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             os: "windows".into(),
             app_version: String::new(),
             arch: String::new(),
+            cpu_model: String::new(),
+            mac_address: String::new(),
+            total_memory_mb: 0,
+            os_version: String::new(),
+            gpu_model: String::new(),
             device_group: "".into(),
             lan_addrs: vec![],
             access_token: Some(user_b.access_token.clone()),
@@ -957,6 +978,7 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            takeover: false,
         },
     )
     .await
@@ -1010,6 +1032,7 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            takeover: false,
         },
     )
     .await
@@ -1024,6 +1047,7 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
         &SignalMsg::RelayAlloc {
             target_id: host_id.clone(),
             session_id: Some("sess-stranger-relay-blocked".into()),
+            takeover: false,
         },
     )
     .await
@@ -1106,6 +1130,7 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             &SignalMsg::RelayAlloc {
                 target_id: host_id.clone(),
                 session_id: Some("sess-mismatch-test".into()),
+                takeover: false,
             },
         )
         .await
@@ -1201,6 +1226,7 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             &SignalMsg::RelayAlloc {
                 target_id: host_id.clone(),
                 session_id: Some("sess-revoked".into()),
+                takeover: false,
             },
         )
         .await
@@ -1235,6 +1261,11 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             allow_remote_control: None,
             mac_addr: None,
             wol_enabled: None,
+            cpu_model: None,
+            mac_address: None,
+            total_memory_mb: None,
+            os_version: None,
+            gpu_model: None,
         },
     )
     .await
@@ -1259,6 +1290,7 @@ async fn signaling_owner_grant_assist_gate_and_mtls_relay_enforcement() {
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            takeover: false,
         },
     )
     .await
@@ -1414,6 +1446,11 @@ async fn admin_disable_and_delete_user_kicks_signal_relay_and_protects_last_admi
             os: "linux".into(),
             app_version: String::new(),
             arch: String::new(),
+            cpu_model: String::new(),
+            mac_address: String::new(),
+            total_memory_mb: 0,
+            os_version: String::new(),
+            gpu_model: String::new(),
             device_group: "".into(),
             lan_addrs: vec![],
             access_token: Some(charlie_login.access_token.clone()),
@@ -2248,6 +2285,11 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             os: "Android 15".into(),
             app_version: "0.1.12".into(),
             arch: "arm64".into(),
+            cpu_model: String::new(),
+            mac_address: String::new(),
+            total_memory_mb: 0,
+            os_version: String::new(),
+            gpu_model: String::new(),
             device_group: "mobile".into(),
             lan_addrs: vec!["192.168.1.55:50000".into()],
             access_token: Some(user_a.access_token.clone()),
@@ -2299,6 +2341,11 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             os: "windows".into(),
             app_version: String::new(),
             arch: String::new(),
+            cpu_model: String::new(),
+            mac_address: String::new(),
+            total_memory_mb: 0,
+            os_version: String::new(),
+            gpu_model: String::new(),
             device_group: String::new(),
             lan_addrs: vec![],
             access_token: Some(user_b.access_token.clone()),
@@ -2333,6 +2380,7 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            takeover: false,
         },
     )
     .await
@@ -2363,6 +2411,7 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
         &SignalMsg::RelayAlloc {
             target_id: android_id.clone(),
             session_id: Some("sess-android-blocked-relay".into()),
+            takeover: false,
         },
     )
     .await
@@ -2415,6 +2464,7 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            takeover: false,
         },
     )
     .await
@@ -2432,6 +2482,11 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             allow_remote_control: Some(true),
             mac_addr: None,
             wol_enabled: None,
+            cpu_model: None,
+            mac_address: None,
+            total_memory_mb: None,
+            os_version: None,
+            gpu_model: None,
         },
     )
     .await
@@ -2459,6 +2514,7 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            takeover: false,
         },
     )
     .await
@@ -2506,6 +2562,7 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            takeover: false,
         },
     )
     .await
@@ -2609,6 +2666,7 @@ async fn two_layer_remote_control_policy_gates_android_self_control_assist_and_r
             nat_type: None,
             nat_port_delta: None,
             nat_port_range: None,
+            takeover: false,
         },
     )
     .await
@@ -2701,6 +2759,11 @@ async fn my_devices_orders_online_before_offline_even_when_offline_seen_later() 
             os: "macos".into(),
             app_version: "0.1.12".into(),
             arch: "arm64".into(),
+            cpu_model: String::new(),
+            mac_address: String::new(),
+            total_memory_mb: 0,
+            os_version: String::new(),
+            gpu_model: String::new(),
             device_group: "default".into(),
             lan_addrs: vec![],
             access_token: Some(user.access_token.clone()),
@@ -2737,6 +2800,11 @@ async fn my_devices_orders_online_before_offline_even_when_offline_seen_later() 
             os: "macos".into(),
             app_version: "0.1.12".into(),
             arch: "arm64".into(),
+            cpu_model: String::new(),
+            mac_address: String::new(),
+            total_memory_mb: 0,
+            os_version: String::new(),
+            gpu_model: String::new(),
             device_group: "default".into(),
             lan_addrs: vec![],
             access_token: Some(user.access_token.clone()),
@@ -2795,5 +2863,437 @@ async fn my_devices_orders_online_before_offline_even_when_offline_seen_later() 
     );
 
     drop(online_sig);
+    cluster.shutdown().await;
+}
+
+#[tokio::test]
+async fn e2e_multi_controller_sync_force_disconnect_and_rest_device_views() {
+    use rc_server::api::{DeviceView, MyDeviceView};
+
+    let cluster = SecureTestCluster::start_fresh().await;
+
+    let (status, body) = https_json(
+        cluster.http_addr,
+        &cluster.client_tls_no_cert,
+        "POST",
+        "/api/v1/auth/register",
+        None,
+        Some(&serde_json::json!({
+            "email": "alice-multi@example.com",
+            "password": "AlicePassword!2026",
+            "display_name": "Alice Multi",
+        })),
+    )
+    .await;
+    assert_eq!(status, 200, "register alice: {body}");
+    let alice: AuthTokenResponse = serde_json::from_str(&body).unwrap();
+
+    let (status, body) = https_json(
+        cluster.http_addr,
+        &cluster.client_tls_no_cert,
+        "POST",
+        "/api/v1/auth/register",
+        None,
+        Some(&serde_json::json!({
+            "email": "bob-multi@example.com",
+            "password": "BobPassword!2026",
+            "display_name": "Bob Multi",
+        })),
+    )
+    .await;
+    assert_eq!(status, 200, "register bob: {body}");
+    let bob: AuthTokenResponse = serde_json::from_str(&body).unwrap();
+
+    let creds = ensure_initial_admin(&*cluster.store, Some("multi-admin@rc.local"))
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, body) = https_json(
+        cluster.http_addr,
+        &cluster.client_tls_no_cert,
+        "POST",
+        "/api/v1/auth/login",
+        None,
+        Some(&serde_json::json!({
+            "email": "multi-admin@rc.local",
+            "password": creds.password,
+        })),
+    )
+    .await;
+    let init_admin: AuthTokenResponse = serde_json::from_str(&body).unwrap();
+    let (_, body) = https_json(
+        cluster.http_addr,
+        &cluster.client_tls_no_cert,
+        "POST",
+        "/api/v1/auth/change-password",
+        Some(&init_admin.access_token),
+        Some(&serde_json::json!({
+            "current_password": creds.password,
+            "new_password": "AdminStrongPassword!2026",
+        })),
+    )
+    .await;
+    let admin: RefreshTokenResponse = serde_json::from_str(&body).unwrap();
+
+    // 1. Register Alice's host, viewer, and taker devices + Bob's guest device over TLS signaling.
+    let register_tls_device = |key: &str, hostname: &str, os: &str, token: &str, assist: bool| {
+        let addr = cluster.signal_addr;
+        let tls = Arc::clone(&cluster.client_tls_no_cert);
+        let key = key.to_string();
+        let hostname = hostname.to_string();
+        let os = os.to_string();
+        let token = token.to_string();
+        async move {
+            let mut stream = connect_tls_signal(addr, &tls).await;
+            write_signal_frame(
+                &mut stream,
+                &SignalMsg::Register {
+                    device_id: None,
+                    device_key: key,
+                    hostname,
+                    os,
+                    app_version: "0.2.5".into(),
+                    arch: "arm64".into(),
+                    cpu_model: String::new(),
+                    mac_address: String::new(),
+                    total_memory_mb: 0,
+                    os_version: String::new(),
+                    gpu_model: String::new(),
+                    device_group: "default".into(),
+                    lan_addrs: vec![],
+                    access_token: Some(token),
+                    device_pubkey: None,
+                    allow_remote_assist: Some(assist),
+                    allow_remote_control: Some(true),
+                    mac_addr: None,
+                    wol_enabled: None,
+                    nat_type: None,
+                    nat_port_delta: None,
+                    nat_port_range: None,
+                    rcp2_v2: false,
+                },
+            )
+            .await
+            .unwrap();
+            let id = match read_signal_frame(&mut stream).await.unwrap().unwrap() {
+                SignalMsg::Registered { device_id, .. } => device_id,
+                other => panic!("expected Registered, got {other:?}"),
+            };
+            (stream, id)
+        }
+    };
+
+    let (mut host_sig, host_id) = register_tls_device(
+        "dk-e2e-host",
+        "Alice-Studio",
+        "macos",
+        &alice.access_token,
+        true,
+    )
+    .await;
+    let (mut viewer_sig, viewer_id) = register_tls_device(
+        "dk-e2e-viewer",
+        "Alice-iPhone",
+        "ios",
+        &alice.access_token,
+        false,
+    )
+    .await;
+    // Drain DeviceStatusChanged(online=true) for viewer on host.
+    let _ = read_signal_frame(&mut host_sig).await.unwrap().unwrap();
+    let (mut taker_sig, taker_id) = register_tls_device(
+        "dk-e2e-taker",
+        "Alice-MacBook",
+        "macos",
+        &alice.access_token,
+        false,
+    )
+    .await;
+    // Drain DeviceStatusChanged(online=true) for taker on host & viewer.
+    let _ = read_signal_frame(&mut host_sig).await.unwrap().unwrap();
+    let _ = read_signal_frame(&mut viewer_sig).await.unwrap().unwrap();
+
+    let (mut guest_sig, guest_id) = register_tls_device(
+        "dk-e2e-guest",
+        "Bob-Windows",
+        "windows",
+        &bob.access_token,
+        false,
+    )
+    .await;
+
+    // Legacy REST JSON deserialization compatibility check for MyDeviceView & DeviceView.
+    let legacy_my_view: MyDeviceView = serde_json::from_value(serde_json::json!({
+        "device_id": "123456789",
+        "formatted_id": "123 456 789",
+        "hostname": "legacy",
+        "os": "macos",
+        "device_group": "default",
+        "alias": "",
+        "allow_remote_assist": false,
+        "disabled": false,
+        "online": true,
+        "in_session": false,
+        "status": "online",
+        "lan_addrs": [],
+        "bound_at": null,
+        "created_at": Utc::now(),
+        "last_seen_at": Utc::now(),
+    }))
+    .unwrap();
+    assert!(legacy_my_view.active_controllers.is_empty());
+
+    let legacy_dev_view: DeviceView = serde_json::from_value(serde_json::json!({
+        "device_id": "123456789",
+        "formatted_id": "123 456 789",
+        "hostname": "legacy",
+        "os": "macos",
+        "device_group": "default",
+        "disabled": false,
+        "online": true,
+        "in_session": false,
+        "status": "online",
+        "lan_addrs": [],
+        "created_at": Utc::now(),
+        "last_seen_at": Utc::now(),
+    }))
+    .unwrap();
+    assert!(legacy_dev_view.active_controllers.is_empty());
+
+    // 2. Host reports active controller (viewer_id) -> viewer & taker receive DeviceControlStateChanged.
+    let active_summary = ActiveControllerSummary {
+        session_id: "e2e-sess-ctrl-1".into(),
+        controller_device_id: viewer_id.clone(),
+        controller_device_name: "Alice-iPhone".into(),
+        controller_os: "ios".into(),
+        is_owner: true,
+        mode: "remote_control".into(),
+        connected_at_ms: 1_763_800_123_456,
+    };
+    write_signal_frame(
+        &mut host_sig,
+        &SignalMsg::ControlStateReport {
+            active_controllers: vec![active_summary.clone()],
+        },
+    )
+    .await
+    .unwrap();
+
+    for peer in [&mut viewer_sig, &mut taker_sig] {
+        assert!(matches!(
+            read_signal_frame(peer).await.unwrap().unwrap(),
+            SignalMsg::DeviceControlStateChanged {
+                ref device_id,
+                ref active_controllers,
+            } if device_id == &host_id && active_controllers == &vec![active_summary.clone()]
+        ));
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(80), read_signal_frame(&mut guest_sig))
+            .await
+            .is_err(),
+        "guest must not receive Alice's DeviceControlStateChanged"
+    );
+
+    // 3. GET /api/v1/me/devices and Admin GET /api/v1/devices?status=in_session reflect active_controllers & in_session!
+    let (status, body) = https_json(
+        cluster.http_addr,
+        &cluster.client_tls_no_cert,
+        "GET",
+        "/api/v1/me/devices",
+        Some(&alice.access_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "GET /api/v1/me/devices: {body}");
+    let my_devs: MyDevicesResponse = serde_json::from_str(&body).unwrap();
+    let my_host = my_devs
+        .devices
+        .iter()
+        .find(|d| d.device_id == host_id)
+        .unwrap();
+    assert!(my_host.in_session);
+    assert_eq!(my_host.status, "in_session");
+    assert_eq!(my_host.active_controllers, vec![active_summary.clone()]);
+
+    let (status, body) = https_json(
+        cluster.http_addr,
+        &cluster.client_tls_no_cert,
+        "GET",
+        "/api/v1/devices?status=in_session",
+        Some(&admin.access_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "GET /api/v1/devices?status=in_session: {body}");
+    let admin_devs: DevicesResponse = serde_json::from_str(&body).unwrap();
+    let admin_host = admin_devs
+        .devices
+        .iter()
+        .find(|d| d.device_id == host_id)
+        .expect("in_session filter must return host with active_controllers");
+    assert!(admin_host.in_session);
+    assert_eq!(admin_host.status, "in_session");
+    assert_eq!(admin_host.active_controllers, vec![active_summary]);
+
+    // 4. taker (same account) with takeover=false -> target_in_session; guest even with takeover=true -> target_in_session!
+    write_signal_frame(
+        &mut taker_sig,
+        &SignalMsg::ConnectRequest {
+            target_id: host_id.clone(),
+            session_id: Some("e2e-tk-false".into()),
+            lan_addrs: vec![],
+            nonce: None,
+            nat_type: None,
+            nat_port_delta: None,
+            nat_port_range: None,
+            takeover: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_signal_frame(&mut taker_sig).await.unwrap().unwrap(),
+        SignalMsg::Error { ref code, .. } if code == "target_in_session"
+    ));
+
+    write_signal_frame(
+        &mut guest_sig,
+        &SignalMsg::ConnectRequest {
+            target_id: host_id.clone(),
+            session_id: Some("e2e-guest-tk-true".into()),
+            lan_addrs: vec![],
+            nonce: None,
+            nat_type: None,
+            nat_port_delta: None,
+            nat_port_range: None,
+            takeover: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_signal_frame(&mut guest_sig).await.unwrap().unwrap(),
+        SignalMsg::Error { ref code, .. } if code == "target_in_session"
+    ));
+
+    // 5. ForceDisconnectRequest: guest rejected with forbidden; same-account taker forwarded to host.
+    write_signal_frame(
+        &mut guest_sig,
+        &SignalMsg::ForceDisconnectRequest {
+            target_id: host_id.clone(),
+            controller_device_id: Some(viewer_id.clone()),
+            session_id: Some("e2e-sess-ctrl-1".into()),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_signal_frame(&mut guest_sig).await.unwrap().unwrap(),
+        SignalMsg::Error { ref code, .. } if code == "forbidden"
+    ));
+
+    write_signal_frame(
+        &mut taker_sig,
+        &SignalMsg::ForceDisconnectRequest {
+            target_id: host_id.clone(),
+            controller_device_id: Some(viewer_id.clone()),
+            session_id: Some("e2e-sess-ctrl-1".into()),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_signal_frame(&mut host_sig).await.unwrap().unwrap(),
+        SignalMsg::ForceDisconnect {
+            ref requester_device_id,
+            controller_device_id: Some(ref cid),
+            session_id: Some(ref sid),
+        } if requester_device_id == &taker_id && cid == &viewer_id && sid == "e2e-sess-ctrl-1"
+    ));
+
+    // 6. Same-account taker sends ConnectRequest { takeover: true } -> host receives PunchCoord with takeover=true and peer metadata!
+    write_signal_frame(
+        &mut taker_sig,
+        &SignalMsg::ConnectRequest {
+            target_id: host_id.clone(),
+            session_id: Some("e2e-tk-true".into()),
+            lan_addrs: vec![],
+            nonce: None,
+            nat_type: None,
+            nat_port_delta: None,
+            nat_port_range: None,
+            takeover: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_signal_frame(&mut taker_sig).await.unwrap().unwrap(),
+        SignalMsg::PunchCoord {
+            takeover: true,
+            is_owner_connection: true,
+            ..
+        }
+    ));
+    assert!(matches!(
+        read_signal_frame(&mut host_sig).await.unwrap().unwrap(),
+        SignalMsg::PunchCoord {
+            takeover: true,
+            is_owner_connection: true,
+            peer_hostname: Some(ref h),
+            peer_os: Some(ref o),
+            ..
+        } if h == "Alice-MacBook" && o == "macos"
+    ));
+
+    // 7. Host disconnects -> viewer & taker receive empty DeviceControlStateChanged and REST reflects cleared state!
+    drop(host_sig);
+    for peer in [&mut viewer_sig, &mut taker_sig] {
+        let mut saw_ctrl_clear = false;
+        for _ in 0..2 {
+            match read_signal_frame(peer).await.unwrap().unwrap() {
+                SignalMsg::DeviceControlStateChanged {
+                    device_id,
+                    active_controllers,
+                } if device_id == host_id => {
+                    assert!(active_controllers.is_empty());
+                    saw_ctrl_clear = true;
+                }
+                SignalMsg::DeviceStatusChanged {
+                    device_id,
+                    online: false,
+                    ..
+                } if device_id == host_id => {}
+                other => panic!("unexpected frame after host disconnect: {other:?}"),
+            }
+        }
+        assert!(saw_ctrl_clear);
+    }
+
+    let (status, body) = https_json(
+        cluster.http_addr,
+        &cluster.client_tls_no_cert,
+        "GET",
+        "/api/v1/me/devices",
+        Some(&alice.access_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let my_devs_after: MyDevicesResponse = serde_json::from_str(&body).unwrap();
+    let my_host_after = my_devs_after
+        .devices
+        .iter()
+        .find(|d| d.device_id == host_id)
+        .unwrap();
+    assert!(!my_host_after.in_session);
+    assert!(my_host_after.active_controllers.is_empty());
+    assert_eq!(my_host_after.status, "offline");
+    let _ = guest_id;
+
+    drop(viewer_sig);
+    drop(taker_sig);
+    drop(guest_sig);
     cluster.shutdown().await;
 }

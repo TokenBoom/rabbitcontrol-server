@@ -39,15 +39,16 @@ use crate::ephemeral::{EphemeralStore, SettingsCache};
 use crate::generated::error_codes::wire as err_code;
 use crate::pki::{PkiAuthority, PkiError};
 use crate::relay::{RelayServer, RelaySessionInfo};
-use crate::signal::{canonical_ip, SignalHub};
+use crate::signal::{canonical_ip, ActiveControllerSummary, SignalHub};
 use crate::store::{
-    format_device_id, is_valid_device_id, normalize_device_id, normalize_email, validate_email,
-    validate_role, validate_status, validate_text_field, AuthStore, CreateSessionInput,
-    CreateUserInput, DeviceCertRecord, DeviceRecord, DeviceStore, RegisterInput, StoreError,
-    UpdateUserInput, UserRecord, DEFAULT_LIST_LIMIT, MAX_APP_VERSION_LEN, MAX_ARCH_LEN,
-    MAX_CLIENT_INFO_LEN, MAX_DEVICE_ALIAS_LEN, MAX_DEVICE_GROUP_LEN, MAX_DEVICE_KEY_LEN,
-    MAX_DEVICE_PUBKEY_LEN, MAX_HOSTNAME_LEN, MAX_LIST_LIMIT, MAX_OS_LEN, ROLE_ADMIN, ROLE_USER,
-    STATUS_ACTIVE,
+    deserialize_null_default, format_device_id, is_valid_device_id, normalize_device_id,
+    normalize_display_mac_address, normalize_email, validate_email, validate_role, validate_status,
+    validate_text_field, validate_total_memory_mb, AuthStore, CreateSessionInput, CreateUserInput,
+    DeviceCertRecord, DeviceRecord, DeviceStore, RegisterInput, StoreError, UpdateUserInput,
+    UserRecord, DEFAULT_LIST_LIMIT, MAX_APP_VERSION_LEN, MAX_ARCH_LEN, MAX_CLIENT_INFO_LEN,
+    MAX_CPU_MODEL_LEN, MAX_DEVICE_ALIAS_LEN, MAX_DEVICE_GROUP_LEN, MAX_DEVICE_KEY_LEN,
+    MAX_DEVICE_PUBKEY_LEN, MAX_GPU_MODEL_LEN, MAX_HOSTNAME_LEN, MAX_LIST_LIMIT, MAX_OS_LEN,
+    MAX_OS_VERSION_LEN, ROLE_ADMIN, ROLE_USER, STATUS_ACTIVE,
 };
 
 pub const MAX_REGISTER_BODY_BYTES: usize = 8 * 1024;
@@ -586,6 +587,11 @@ struct BindDeviceParams<'a> {
     os: Option<&'a str>,
     app_version: Option<&'a str>,
     arch: Option<&'a str>,
+    cpu_model: Option<&'a str>,
+    mac_address: Option<&'a str>,
+    total_memory_mb: Option<u64>,
+    os_version: Option<&'a str>,
+    gpu_model: Option<&'a str>,
     device_group: Option<&'a str>,
     alias: Option<&'a str>,
     device_pubkey: Option<&'a str>,
@@ -597,6 +603,11 @@ struct OptionalAuthDeviceFields<'a> {
     os: Option<&'a str>,
     app_version: Option<&'a str>,
     arch: Option<&'a str>,
+    cpu_model: Option<&'a str>,
+    mac_address: Option<&'a str>,
+    total_memory_mb: Option<u64>,
+    os_version: Option<&'a str>,
+    gpu_model: Option<&'a str>,
     device_group: Option<&'a str>,
     alias: Option<&'a str>,
     device_pubkey: Option<&'a str>,
@@ -625,6 +636,26 @@ fn validate_optional_auth_device_fields(
     if let Some(ar) = fields.arch {
         validate_text_field(ar, MAX_ARCH_LEN, "arch")
             .map_err(|e| Box::new(map_store_error(e, "validate_arch")))?;
+    }
+    if let Some(cpu) = fields.cpu_model {
+        validate_text_field(cpu, MAX_CPU_MODEL_LEN, "cpu_model")
+            .map_err(|e| Box::new(map_store_error(e, "validate_cpu_model")))?;
+    }
+    if let Some(mac) = fields.mac_address {
+        normalize_display_mac_address(mac)
+            .map_err(|e| Box::new(map_store_error(e, "validate_mac_address")))?;
+    }
+    if let Some(mem) = fields.total_memory_mb {
+        validate_total_memory_mb(mem)
+            .map_err(|e| Box::new(map_store_error(e, "validate_total_memory_mb")))?;
+    }
+    if let Some(ov) = fields.os_version {
+        validate_text_field(ov, MAX_OS_VERSION_LEN, "os_version")
+            .map_err(|e| Box::new(map_store_error(e, "validate_os_version")))?;
+    }
+    if let Some(gpu) = fields.gpu_model {
+        validate_text_field(gpu, MAX_GPU_MODEL_LEN, "gpu_model")
+            .map_err(|e| Box::new(map_store_error(e, "validate_gpu_model")))?;
     }
     if let Some(g) = fields.device_group {
         validate_text_field(g, MAX_DEVICE_GROUP_LEN, "device_group")
@@ -656,6 +687,11 @@ async fn register_and_bind_device_for_user(
         os: params.os,
         app_version: params.app_version,
         arch: params.arch,
+        cpu_model: params.cpu_model,
+        mac_address: params.mac_address,
+        total_memory_mb: params.total_memory_mb,
+        os_version: params.os_version,
+        gpu_model: params.gpu_model,
         device_group: params.device_group,
         alias: params.alias,
         device_pubkey: params.device_pubkey,
@@ -670,6 +706,11 @@ async fn register_and_bind_device_for_user(
             os: params.os.unwrap_or_default().to_string(),
             app_version: params.app_version.unwrap_or_default().to_string(),
             arch: params.arch.unwrap_or_default().to_string(),
+            cpu_model: params.cpu_model.unwrap_or_default().to_string(),
+            mac_address: params.mac_address.unwrap_or_default().to_string(),
+            total_memory_mb: params.total_memory_mb.unwrap_or(0),
+            os_version: params.os_version.unwrap_or_default().to_string(),
+            gpu_model: params.gpu_model.unwrap_or_default().to_string(),
             device_group: params.device_group.unwrap_or_default().to_string(),
             ..Default::default()
         })
@@ -788,6 +829,16 @@ pub struct AuthRegisterRequest {
     pub app_version: Option<String>,
     #[serde(default)]
     pub arch: Option<String>,
+    #[serde(default)]
+    pub cpu_model: Option<String>,
+    #[serde(default)]
+    pub mac_address: Option<String>,
+    #[serde(default)]
+    pub total_memory_mb: Option<u64>,
+    #[serde(default)]
+    pub os_version: Option<String>,
+    #[serde(default)]
+    pub gpu_model: Option<String>,
     #[serde(default, alias = "group")]
     pub device_group: Option<String>,
     #[serde(default)]
@@ -812,6 +863,16 @@ pub struct AuthLoginRequest {
     pub app_version: Option<String>,
     #[serde(default)]
     pub arch: Option<String>,
+    #[serde(default)]
+    pub cpu_model: Option<String>,
+    #[serde(default)]
+    pub mac_address: Option<String>,
+    #[serde(default)]
+    pub total_memory_mb: Option<u64>,
+    #[serde(default)]
+    pub os_version: Option<String>,
+    #[serde(default)]
+    pub gpu_model: Option<String>,
     #[serde(default, alias = "group")]
     pub device_group: Option<String>,
     #[serde(default)]
@@ -903,6 +964,16 @@ pub struct BindDeviceRequest {
     pub app_version: Option<String>,
     #[serde(default)]
     pub arch: Option<String>,
+    #[serde(default)]
+    pub cpu_model: Option<String>,
+    #[serde(default)]
+    pub mac_address: Option<String>,
+    #[serde(default)]
+    pub total_memory_mb: Option<u64>,
+    #[serde(default)]
+    pub os_version: Option<String>,
+    #[serde(default)]
+    pub gpu_model: Option<String>,
     #[serde(default, alias = "group")]
     pub device_group: Option<String>,
     #[serde(default)]
@@ -935,6 +1006,16 @@ pub struct MyDeviceView {
     pub app_version: String,
     #[serde(default)]
     pub arch: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub cpu_model: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub mac_address: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub total_memory_mb: u64,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub os_version: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub gpu_model: String,
     pub device_group: String,
     pub alias: String,
     pub allow_remote_assist: bool,
@@ -945,6 +1026,8 @@ pub struct MyDeviceView {
     pub disabled: bool,
     pub online: bool,
     pub in_session: bool,
+    #[serde(default)]
+    pub active_controllers: Vec<ActiveControllerSummary>,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_udp_addr: Option<String>,
@@ -1079,6 +1162,16 @@ pub struct RegisterResponse {
     pub app_version: String,
     #[serde(default)]
     pub arch: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub cpu_model: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub mac_address: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub total_memory_mb: u64,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub os_version: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub gpu_model: String,
     pub device_group: String,
     pub created_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
@@ -1131,6 +1224,16 @@ pub struct DeviceView {
     pub app_version: String,
     #[serde(default)]
     pub arch: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub cpu_model: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub mac_address: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub total_memory_mb: u64,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub os_version: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub gpu_model: String,
     pub device_group: String,
     #[serde(default)]
     pub alias: String,
@@ -1147,6 +1250,8 @@ pub struct DeviceView {
     pub disabled: bool,
     pub online: bool,
     pub in_session: bool,
+    #[serde(default)]
+    pub active_controllers: Vec<ActiveControllerSummary>,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_udp_addr: Option<String>,
@@ -1551,6 +1656,11 @@ async fn post_auth_register(
         os: req.os.as_deref(),
         app_version: req.app_version.as_deref(),
         arch: req.arch.as_deref(),
+        cpu_model: req.cpu_model.as_deref(),
+        mac_address: req.mac_address.as_deref(),
+        total_memory_mb: req.total_memory_mb,
+        os_version: req.os_version.as_deref(),
+        gpu_model: req.gpu_model.as_deref(),
         device_group: req.device_group.as_deref(),
         alias: req.alias.as_deref(),
         device_pubkey: req.device_pubkey.as_deref(),
@@ -1619,6 +1729,11 @@ async fn post_auth_register(
                     os: req.os.as_deref(),
                     app_version: req.app_version.as_deref(),
                     arch: req.arch.as_deref(),
+                    cpu_model: req.cpu_model.as_deref(),
+                    mac_address: req.mac_address.as_deref(),
+                    total_memory_mb: req.total_memory_mb,
+                    os_version: req.os_version.as_deref(),
+                    gpu_model: req.gpu_model.as_deref(),
                     device_group: req.device_group.as_deref(),
                     alias: req.alias.as_deref(),
                     device_pubkey: req.device_pubkey.as_deref(),
@@ -1760,6 +1875,11 @@ async fn post_auth_login(
         os: req.os.as_deref(),
         app_version: req.app_version.as_deref(),
         arch: req.arch.as_deref(),
+        cpu_model: req.cpu_model.as_deref(),
+        mac_address: req.mac_address.as_deref(),
+        total_memory_mb: req.total_memory_mb,
+        os_version: req.os_version.as_deref(),
+        gpu_model: req.gpu_model.as_deref(),
         device_group: req.device_group.as_deref(),
         alias: req.alias.as_deref(),
         device_pubkey: req.device_pubkey.as_deref(),
@@ -1785,6 +1905,11 @@ async fn post_auth_login(
                 os: req.os.as_deref(),
                 app_version: req.app_version.as_deref(),
                 arch: req.arch.as_deref(),
+                cpu_model: req.cpu_model.as_deref(),
+                mac_address: req.mac_address.as_deref(),
+                total_memory_mb: req.total_memory_mb,
+                os_version: req.os_version.as_deref(),
+                gpu_model: req.gpu_model.as_deref(),
                 device_group: req.device_group.as_deref(),
                 alias: req.alias.as_deref(),
                 device_pubkey: req.device_pubkey.as_deref(),
@@ -2395,7 +2520,8 @@ async fn get_my_devices(
 
     let mut devices = Vec::with_capacity(records.len());
     for rec in records {
-        let in_session = in_session_set.contains(&rec.device_id);
+        let active_controllers = state.signal_hub.peer_active_controllers(&rec.device_id);
+        let in_session = !active_controllers.is_empty() || in_session_set.contains(&rec.device_id);
         let online = online_set.contains(&rec.device_id)
             || state.signal_hub.is_peer_connected(&rec.device_id);
         let status = if in_session {
@@ -2426,6 +2552,7 @@ async fn get_my_devices(
         };
 
         let wol_capable = rec.wol_capable();
+        let mac_address = rec.effective_mac_address();
         devices.push(MyDeviceView {
             formatted_id: format_device_id(&rec.device_id),
             device_id: rec.device_id,
@@ -2433,6 +2560,11 @@ async fn get_my_devices(
             os: rec.os,
             app_version: rec.app_version,
             arch: rec.arch,
+            cpu_model: rec.cpu_model,
+            mac_address,
+            total_memory_mb: rec.total_memory_mb,
+            os_version: rec.os_version,
+            gpu_model: rec.gpu_model,
             device_group: rec.device_group,
             alias: rec.alias,
             allow_remote_assist: rec.allow_remote_assist,
@@ -2441,6 +2573,7 @@ async fn get_my_devices(
             disabled: rec.disabled,
             online,
             in_session,
+            active_controllers,
             status: status.to_string(),
             public_udp_addr,
             lan_addrs,
@@ -2511,6 +2644,11 @@ async fn post_bind_my_device(
             os: req.os.as_deref(),
             app_version: req.app_version.as_deref(),
             arch: req.arch.as_deref(),
+            cpu_model: req.cpu_model.as_deref(),
+            mac_address: req.mac_address.as_deref(),
+            total_memory_mb: req.total_memory_mb,
+            os_version: req.os_version.as_deref(),
+            gpu_model: req.gpu_model.as_deref(),
             device_group: req.device_group.as_deref(),
             alias: req.alias.as_deref(),
             device_pubkey: req.device_pubkey.as_deref(),
@@ -3289,6 +3427,7 @@ async fn post_register_device(
 ) -> Response {
     match state.device_store.register_or_get(input).await {
         Ok(rec) => {
+            let mac_address = rec.effective_mac_address();
             let resp = RegisterResponse {
                 formatted_id: format_device_id(&rec.device_id),
                 device_id: rec.device_id,
@@ -3297,6 +3436,11 @@ async fn post_register_device(
                 os: rec.os,
                 app_version: rec.app_version,
                 arch: rec.arch,
+                cpu_model: rec.cpu_model,
+                mac_address,
+                total_memory_mb: rec.total_memory_mb,
+                os_version: rec.os_version,
+                gpu_model: rec.gpu_model,
                 device_group: rec.device_group,
                 created_at: rec.created_at,
                 last_seen_at: rec.last_seen_at,
@@ -3461,7 +3605,9 @@ async fn get_devices(State(state): State<AppState>, Query(query): Query<DevicesQ
             }
 
             for rec in batch {
-                let in_session = in_session_set.contains(&rec.device_id);
+                let active_controllers = state.signal_hub.peer_active_controllers(&rec.device_id);
+                let in_session =
+                    !active_controllers.is_empty() || in_session_set.contains(&rec.device_id);
                 let online = online_set.contains(&rec.device_id)
                     || state.signal_hub.is_peer_connected(&rec.device_id);
 
@@ -3474,9 +3620,15 @@ async fn get_devices(State(state): State<AppState>, Query(query): Query<DevicesQ
                     continue;
                 }
 
-                let view =
-                    build_device_view_with_state(&state, rec, online, in_session, &mut email_cache)
-                        .await;
+                let view = build_device_view_with_state(
+                    &state,
+                    rec,
+                    online,
+                    in_session,
+                    active_controllers,
+                    &mut email_cache,
+                )
+                .await;
                 devices.push(view);
             }
 
@@ -3529,10 +3681,19 @@ async fn build_device_view(
     in_session_set: &HashSet<String>,
     email_cache: &mut HashMap<Uuid, Option<String>>,
 ) -> DeviceView {
-    let in_session = in_session_set.contains(&rec.device_id);
+    let active_controllers = state.signal_hub.peer_active_controllers(&rec.device_id);
+    let in_session = !active_controllers.is_empty() || in_session_set.contains(&rec.device_id);
     let online =
         online_set.contains(&rec.device_id) || state.signal_hub.is_peer_connected(&rec.device_id);
-    build_device_view_with_state(state, rec, online, in_session, email_cache).await
+    build_device_view_with_state(
+        state,
+        rec,
+        online,
+        in_session,
+        active_controllers,
+        email_cache,
+    )
+    .await
 }
 
 async fn build_device_view_with_state(
@@ -3540,6 +3701,7 @@ async fn build_device_view_with_state(
     rec: DeviceRecord,
     online: bool,
     in_session: bool,
+    active_controllers: Vec<ActiveControllerSummary>,
     email_cache: &mut HashMap<Uuid, Option<String>>,
 ) -> DeviceView {
     let status = if in_session {
@@ -3574,6 +3736,7 @@ async fn build_device_view_with_state(
 
     let owner_email = resolve_owner_email(state, rec.owner_user_id, email_cache).await;
     let wol_capable = rec.wol_capable();
+    let mac_address = rec.effective_mac_address();
 
     DeviceView {
         formatted_id: format_device_id(&rec.device_id),
@@ -3582,6 +3745,11 @@ async fn build_device_view_with_state(
         os: rec.os,
         app_version: rec.app_version,
         arch: rec.arch,
+        cpu_model: rec.cpu_model,
+        mac_address,
+        total_memory_mb: rec.total_memory_mb,
+        os_version: rec.os_version,
+        gpu_model: rec.gpu_model,
         device_group: rec.device_group,
         alias: rec.alias,
         owner_user_id: rec.owner_user_id,
@@ -3592,6 +3760,7 @@ async fn build_device_view_with_state(
         disabled: rec.disabled,
         online,
         in_session,
+        active_controllers,
         status: status.to_string(),
         public_udp_addr,
         lan_addrs,
@@ -4016,11 +4185,9 @@ mod tests {
             .unwrap();
         let raw_admin = std::str::from_utf8(&body_admin).unwrap();
         assert!(
-            !raw_admin.contains("mac_addr"),
-            "raw admin JSON must not expose mac_addr"
+            !raw_admin.contains("\"mac_addr\":"),
+            "raw admin JSON must not expose internal mac_addr key"
         );
-        assert!(!raw_admin.to_ascii_lowercase().contains("aa:bb:cc:dd:ee:ff"));
-        assert!(!raw_admin.to_ascii_lowercase().contains("02:11:22:33:44:55"));
         let parsed_admin: DevicesResponse = serde_json::from_slice(&body_admin).unwrap();
         let on_view = parsed_admin
             .devices
@@ -4033,7 +4200,9 @@ mod tests {
             .find(|d| d.device_id == dev_disabled.device_id)
             .unwrap();
         assert!(on_view.wol_capable);
+        assert_eq!(on_view.mac_address, "aa:bb:cc:dd:ee:ff");
         assert!(!off_view.wol_capable);
+        assert_eq!(off_view.mac_address, "02:11:22:33:44:55");
 
         // 2. Owner GET /api/v1/me/devices
         let req_me = Request::builder()
@@ -4048,11 +4217,9 @@ mod tests {
             .unwrap();
         let raw_me = std::str::from_utf8(&body_me).unwrap();
         assert!(
-            !raw_me.contains("mac_addr"),
-            "raw /me/devices JSON must not expose mac_addr"
+            !raw_me.contains("\"mac_addr\":"),
+            "raw /me/devices JSON must not expose internal mac_addr key"
         );
-        assert!(!raw_me.to_ascii_lowercase().contains("aa:bb:cc:dd:ee:ff"));
-        assert!(!raw_me.to_ascii_lowercase().contains("02:11:22:33:44:55"));
         let parsed_me: MyDevicesResponse = serde_json::from_slice(&body_me).unwrap();
         let on_me = parsed_me
             .devices
@@ -4065,7 +4232,9 @@ mod tests {
             .find(|d| d.device_id == dev_disabled.device_id)
             .unwrap();
         assert!(on_me.wol_capable);
+        assert_eq!(on_me.mac_address, "aa:bb:cc:dd:ee:ff");
         assert!(!off_me.wol_capable);
+        assert_eq!(off_me.mac_address, "02:11:22:33:44:55");
     }
 
     #[tokio::test]
@@ -4210,5 +4379,194 @@ mod tests {
             stats.udp_probe_alt_ip_addr.as_deref(),
             Some("198.51.100.2:21116")
         );
+    }
+
+    #[tokio::test]
+    async fn devices_hardware_metadata_roundtrip_across_register_bind_and_views() {
+        use crate::ephemeral::MemoryEphemeralStore;
+        use crate::relay::RelayConfig;
+        use crate::signal::SignalConfig;
+        use crate::store::{MemoryDeviceStore, UserStore};
+
+        let store = Arc::new(MemoryDeviceStore::new());
+        let ephemeral = Arc::new(MemoryEphemeralStore::new());
+        let auth_authority = Arc::new(AuthAuthority::load_or_create(store.as_ref()).await.unwrap());
+        let pki_authority = Arc::new(PkiAuthority::load_or_create(store.as_ref()).await.unwrap());
+        let settings_cache = Arc::new(SettingsCache::new(store.clone(), ephemeral.clone()));
+        let signal_hub = Arc::new(SignalHub::with_auth(
+            store.clone(),
+            ephemeral.clone(),
+            auth_authority.clone(),
+            SignalConfig::default(),
+        ));
+        let relay_server = Arc::new(RelayServer::new(
+            store.clone(),
+            ephemeral.clone(),
+            RelayConfig::default(),
+        ));
+
+        let admin = store
+            .create_user(CreateUserInput {
+                email: "hw-admin@example.com".into(),
+                display_name: "HW Admin".into(),
+                password_hash: "hash".into(),
+                role: ROLE_ADMIN.into(),
+                status: STATUS_ACTIVE.into(),
+                must_change_password: false,
+            })
+            .await
+            .unwrap();
+        let sess = store
+            .create_user_session(CreateSessionInput {
+                user_id: admin.id,
+                device_id: None,
+                family_id: None,
+                token_hash: format!("{:064x}", admin.id.as_u128()),
+                expires_at: Utc::now() + chrono::Duration::hours(24),
+                client_info: "test".into(),
+            })
+            .await
+            .unwrap();
+        let jwt = auth_authority
+            .issue_access_token_for_user(&admin, sess.id, None, ACCESS_TOKEN_TTL)
+            .unwrap();
+
+        let state = AppState {
+            device_store: store.clone(),
+            auth_store: store,
+            ephemeral,
+            auth_authority,
+            pki_authority,
+            settings_cache,
+            signal_hub,
+            relay_server,
+            endpoints: AdvertisedEndpoints {
+                signal_tcp_addr: "127.0.0.1:21116".into(),
+                udp_probe_addr: "127.0.0.1:21116".into(),
+                udp_probe_alt_addr: None,
+                udp_probe_alt_ip_addr: None,
+                tcp_relay_addr: "127.0.0.1:21117".into(),
+            },
+            started_at: Instant::now(),
+            admin_token: None,
+            cors_origins: Vec::new(),
+            tls_enabled: false,
+            web_dir: None,
+            auth_rate_limiter: Arc::new(AuthRateLimiter::default()),
+            allow_unauthenticated_legacy_admin: false,
+        };
+        let app = router(state);
+
+        // 1. Register via POST /api/v1/devices/register with full hardware metadata
+        let resp_reg = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/devices/register")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "device_key": "ed25519:hw-api-1",
+                            "hostname": "workstation",
+                            "os": "macos",
+                            "app_version": "0.2.0",
+                            "arch": "arm64",
+                            "cpu_model": "Apple M3 Max",
+                            "mac_address": "AA-BB-CC-11-22-33",
+                            "total_memory_mb": 65536,
+                            "os_version": "macOS 15.1",
+                            "gpu_model": "Apple M3 Max"
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_reg.status(), StatusCode::OK);
+        let reg_bytes = axum::body::to_bytes(resp_reg.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let reg: RegisterResponse = serde_json::from_slice(&reg_bytes).unwrap();
+        assert_eq!(reg.cpu_model, "Apple M3 Max");
+        assert_eq!(reg.mac_address, "aa:bb:cc:11:22:33");
+        assert_eq!(reg.total_memory_mb, 65536);
+        assert_eq!(reg.os_version, "macOS 15.1");
+        assert_eq!(reg.gpu_model, "Apple M3 Max");
+
+        // 2. Bind via POST /api/v1/me/devices/bind with partial update (new os_version, omitted others)
+        let resp_bind = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/me/devices/bind")
+                    .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "device_key": "ed25519:hw-api-1",
+                            "os_version": "macOS 15.2"
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_bind.status(), StatusCode::OK);
+
+        // 3. Verify GET /api/v1/me/devices and GET /api/v1/devices both expose hardware metadata
+        let resp_me = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/me/devices")
+                    .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_me.status(), StatusCode::OK);
+        let me_bytes = axum::body::to_bytes(resp_me.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let me: MyDevicesResponse = serde_json::from_slice(&me_bytes).unwrap();
+        let me_dev = me
+            .devices
+            .iter()
+            .find(|d| d.device_id == reg.device_id)
+            .unwrap();
+        assert_eq!(me_dev.cpu_model, "Apple M3 Max");
+        assert_eq!(me_dev.mac_address, "aa:bb:cc:11:22:33");
+        assert_eq!(me_dev.total_memory_mb, 65536);
+        assert_eq!(me_dev.os_version, "macOS 15.2");
+        assert_eq!(me_dev.gpu_model, "Apple M3 Max");
+
+        let resp_admin = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/devices")
+                    .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_admin.status(), StatusCode::OK);
+        let admin_bytes = axum::body::to_bytes(resp_admin.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let admin_list: DevicesResponse = serde_json::from_slice(&admin_bytes).unwrap();
+        let admin_dev = admin_list
+            .devices
+            .iter()
+            .find(|d| d.device_id == reg.device_id)
+            .unwrap();
+        assert_eq!(admin_dev.cpu_model, "Apple M3 Max");
+        assert_eq!(admin_dev.mac_address, "aa:bb:cc:11:22:33");
+        assert_eq!(admin_dev.total_memory_mb, 65536);
+        assert_eq!(admin_dev.os_version, "macOS 15.2");
+        assert_eq!(admin_dev.gpu_model, "Apple M3 Max");
     }
 }

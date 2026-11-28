@@ -25,8 +25,10 @@ use crate::ephemeral::{
 };
 use crate::generated::error_codes::wire as err_code;
 use crate::store::{
-    format_device_id, is_valid_device_id, normalize_device_id, normalize_mac_addr,
-    parse_mac_addr_bytes, AuthStore, DeviceStore, RegisterInput, StoreError, MAX_DEVICE_PUBKEY_LEN,
+    deserialize_null_default, format_device_id, is_valid_device_id, normalize_device_id,
+    normalize_display_mac_address, normalize_mac_addr, parse_mac_addr_bytes, validate_text_field,
+    validate_total_memory_mb, AuthStore, DeviceHardwareUpdate, DeviceStore, RegisterInput,
+    StoreError, MAX_CPU_MODEL_LEN, MAX_DEVICE_PUBKEY_LEN, MAX_GPU_MODEL_LEN, MAX_OS_VERSION_LEN,
     STATUS_ACTIVE,
 };
 
@@ -55,6 +57,9 @@ pub const MAX_OS_LEN: usize = crate::store::MAX_OS_LEN;
 pub const MAX_APP_VERSION_LEN: usize = crate::store::MAX_APP_VERSION_LEN;
 pub const MAX_ARCH_LEN: usize = crate::store::MAX_ARCH_LEN;
 pub const MAX_DEVICE_GROUP_LEN: usize = crate::store::MAX_DEVICE_GROUP_LEN;
+pub const MAX_ACTIVE_CONTROLLERS: usize = 32;
+pub const MAX_CONTROLLER_DEVICE_ID_LEN: usize = 64;
+pub const MAX_CONTROLLER_MODE_LEN: usize = 32;
 
 pub const DEFAULT_MAX_SIGNAL_CONNECTIONS: usize = 8_192;
 pub const DEFAULT_CONNECT_RATE_LIMIT_MAX: usize = 20;
@@ -460,6 +465,27 @@ fn default_true() -> bool {
     true
 }
 
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveControllerSummary {
+    pub session_id: String,
+    #[serde(default)]
+    pub controller_device_id: String,
+    #[serde(default)]
+    pub controller_device_name: String,
+    #[serde(default)]
+    pub controller_os: String,
+    #[serde(default)]
+    pub is_owner: bool,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub connected_at_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SignalMsg {
@@ -475,6 +501,16 @@ pub enum SignalMsg {
         app_version: String,
         #[serde(default)]
         arch: String,
+        #[serde(default, deserialize_with = "deserialize_null_default")]
+        cpu_model: String,
+        #[serde(default, deserialize_with = "deserialize_null_default")]
+        mac_address: String,
+        #[serde(default, deserialize_with = "deserialize_null_default")]
+        total_memory_mb: u64,
+        #[serde(default, deserialize_with = "deserialize_null_default")]
+        os_version: String,
+        #[serde(default, deserialize_with = "deserialize_null_default")]
+        gpu_model: String,
         #[serde(default, alias = "group")]
         device_group: String,
         #[serde(default)]
@@ -544,6 +580,16 @@ pub enum SignalMsg {
         mac_addr: Option<String>,
         #[serde(default)]
         wol_enabled: Option<bool>,
+        #[serde(default)]
+        cpu_model: Option<String>,
+        #[serde(default)]
+        mac_address: Option<String>,
+        #[serde(default)]
+        total_memory_mb: Option<u64>,
+        #[serde(default)]
+        os_version: Option<String>,
+        #[serde(default)]
+        gpu_model: Option<String>,
     },
     DeviceStatusChanged {
         device_id: String,
@@ -555,11 +601,64 @@ pub enum SignalMsg {
         app_version: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         arch: String,
+        #[serde(
+            default,
+            skip_serializing_if = "String::is_empty",
+            deserialize_with = "deserialize_null_default"
+        )]
+        cpu_model: String,
+        #[serde(
+            default,
+            skip_serializing_if = "String::is_empty",
+            deserialize_with = "deserialize_null_default"
+        )]
+        mac_address: String,
+        #[serde(
+            default,
+            skip_serializing_if = "is_zero_u64",
+            deserialize_with = "deserialize_null_default"
+        )]
+        total_memory_mb: u64,
+        #[serde(
+            default,
+            skip_serializing_if = "String::is_empty",
+            deserialize_with = "deserialize_null_default"
+        )]
+        os_version: String,
+        #[serde(
+            default,
+            skip_serializing_if = "String::is_empty",
+            deserialize_with = "deserialize_null_default"
+        )]
+        gpu_model: String,
         allow_remote_assist: bool,
         #[serde(default = "default_true")]
         allow_remote_control: bool,
         #[serde(default)]
         wol_capable: bool,
+    },
+    ControlStateReport {
+        #[serde(default)]
+        active_controllers: Vec<ActiveControllerSummary>,
+    },
+    DeviceControlStateChanged {
+        device_id: String,
+        #[serde(default)]
+        active_controllers: Vec<ActiveControllerSummary>,
+    },
+    ForceDisconnectRequest {
+        target_id: String,
+        #[serde(default)]
+        controller_device_id: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    ForceDisconnect {
+        requester_device_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        controller_device_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
     ConnectRequest {
         target_id: String,
@@ -575,6 +674,8 @@ pub enum SignalMsg {
         nat_port_delta: Option<i16>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         nat_port_range: Option<[u16; 2]>,
+        #[serde(default)]
+        takeover: bool,
     },
     PunchCoord {
         session_id: String,
@@ -608,11 +709,19 @@ pub enum SignalMsg {
         owner_grant: Option<OwnerGrantTicket>,
         #[serde(default)]
         is_owner_connection: bool,
+        #[serde(default)]
+        takeover: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_hostname: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_os: Option<String>,
     },
     RelayAlloc {
         target_id: String,
         #[serde(default)]
         session_id: Option<String>,
+        #[serde(default)]
+        takeover: bool,
     },
     RelayReady {
         session_id: String,
@@ -625,6 +734,12 @@ pub enum SignalMsg {
         owner_grant: Option<OwnerGrantTicket>,
         #[serde(default)]
         is_owner_connection: bool,
+        #[serde(default)]
+        takeover: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_hostname: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_os: Option<String>,
     },
     PeerOffline {
         target_id: String,
@@ -1044,20 +1159,109 @@ fn validate_metadata_field(val: &str, max_len: usize, field: &'static str) -> Re
     Ok(())
 }
 
-fn validate_register_fields(
-    hostname: &str,
-    os: &str,
-    app_version: &str,
-    arch: &str,
-    device_group: &str,
-    lan_addrs: &[String],
-) -> Result<(), String> {
-    validate_metadata_field(hostname, MAX_HOSTNAME_LEN, "hostname")?;
-    validate_metadata_field(os, MAX_OS_LEN, "os")?;
-    validate_metadata_field(app_version, MAX_APP_VERSION_LEN, "app_version")?;
-    validate_metadata_field(arch, MAX_ARCH_LEN, "arch")?;
-    validate_metadata_field(device_group, MAX_DEVICE_GROUP_LEN, "device_group")?;
-    validate_lan_addrs(lan_addrs)?;
+struct RegisterMetadataFields<'a> {
+    hostname: &'a str,
+    os: &'a str,
+    app_version: &'a str,
+    arch: &'a str,
+    cpu_model: &'a str,
+    mac_address: &'a str,
+    total_memory_mb: u64,
+    os_version: &'a str,
+    gpu_model: &'a str,
+    device_group: &'a str,
+    lan_addrs: &'a [String],
+}
+
+fn validate_register_fields(fields: RegisterMetadataFields<'_>) -> Result<String, String> {
+    validate_metadata_field(fields.hostname, MAX_HOSTNAME_LEN, "hostname")?;
+    validate_metadata_field(fields.os, MAX_OS_LEN, "os")?;
+    validate_metadata_field(fields.app_version, MAX_APP_VERSION_LEN, "app_version")?;
+    validate_metadata_field(fields.arch, MAX_ARCH_LEN, "arch")?;
+    validate_metadata_field(fields.cpu_model, MAX_CPU_MODEL_LEN, "cpu_model")?;
+    let norm_mac_address =
+        normalize_display_mac_address(fields.mac_address).map_err(|e| e.to_string())?;
+    validate_total_memory_mb(fields.total_memory_mb).map_err(|e| e.to_string())?;
+    validate_metadata_field(fields.os_version, MAX_OS_VERSION_LEN, "os_version")?;
+    validate_metadata_field(fields.gpu_model, MAX_GPU_MODEL_LEN, "gpu_model")?;
+    validate_metadata_field(fields.device_group, MAX_DEVICE_GROUP_LEN, "device_group")?;
+    validate_lan_addrs(fields.lan_addrs)?;
+    Ok(norm_mac_address)
+}
+
+fn validate_optional_signal_text(
+    raw: Option<&str>,
+    max_len: usize,
+    field: &'static str,
+) -> Result<Option<String>, String> {
+    let Some(val) = raw else {
+        return Ok(None);
+    };
+    let cleaned = validate_text_field(val, max_len, field).map_err(|e| e.to_string())?;
+    if cleaned.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(cleaned))
+    }
+}
+
+fn validate_optional_signal_mac_address(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(val) = raw else {
+        return Ok(None);
+    };
+    let cleaned = normalize_display_mac_address(val).map_err(|e| e.to_string())?;
+    if cleaned.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(cleaned))
+    }
+}
+
+fn validate_optional_signal_total_memory_mb(raw: Option<u64>) -> Result<Option<u64>, String> {
+    let Some(val) = raw else {
+        return Ok(None);
+    };
+    let checked = validate_total_memory_mb(val).map_err(|e| e.to_string())?;
+    if checked == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(checked))
+    }
+}
+
+fn non_empty_opt(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn validate_active_controllers(items: &[ActiveControllerSummary]) -> Result<(), String> {
+    if items.len() > MAX_ACTIVE_CONTROLLERS {
+        return Err(format!(
+            "active_controllers exceeds maximum of {MAX_ACTIVE_CONTROLLERS} entries"
+        ));
+    }
+    for item in items {
+        if item.session_id.is_empty() {
+            return Err("active_controllers session_id must not be empty".into());
+        }
+        validate_ascii_token(&item.session_id, MAX_SESSION_ID_LEN, "session_id")?;
+        validate_metadata_field(
+            &item.controller_device_id,
+            MAX_CONTROLLER_DEVICE_ID_LEN,
+            "controller_device_id",
+        )?;
+        validate_metadata_field(
+            &item.controller_device_name,
+            MAX_HOSTNAME_LEN,
+            "controller_device_name",
+        )?;
+        validate_metadata_field(&item.controller_os, MAX_OS_LEN, "controller_os")?;
+        validate_metadata_field(&item.mode, MAX_CONTROLLER_MODE_LEN, "mode")?;
+    }
     Ok(())
 }
 
@@ -1264,9 +1468,52 @@ struct DeviceStatusBroadcast<'a> {
     os: &'a str,
     app_version: &'a str,
     arch: &'a str,
+    cpu_model: &'a str,
+    mac_address: &'a str,
+    total_memory_mb: u64,
+    os_version: &'a str,
+    gpu_model: &'a str,
     allow_remote_assist: bool,
     allow_remote_control: bool,
     wol_capable: bool,
+}
+
+struct OwnedDeviceStatus {
+    owner_user_id: Option<Uuid>,
+    hostname: String,
+    alias: String,
+    os: String,
+    app_version: String,
+    arch: String,
+    cpu_model: String,
+    mac_address: String,
+    total_memory_mb: u64,
+    os_version: String,
+    gpu_model: String,
+    allow_remote_assist: bool,
+    allow_remote_control: bool,
+    wol_capable: bool,
+}
+
+impl ActivePeer {
+    fn to_owned_status(&self) -> OwnedDeviceStatus {
+        OwnedDeviceStatus {
+            owner_user_id: self.owner_user_id,
+            hostname: self.hostname.clone(),
+            alias: self.alias.clone(),
+            os: self.os.clone(),
+            app_version: self.app_version.clone(),
+            arch: self.arch.clone(),
+            cpu_model: self.cpu_model.clone(),
+            mac_address: self.mac_address.clone(),
+            total_memory_mb: self.total_memory_mb,
+            os_version: self.os_version.clone(),
+            gpu_model: self.gpu_model.clone(),
+            allow_remote_assist: self.allow_remote_assist,
+            allow_remote_control: self.allow_remote_control,
+            wol_capable: self.wol_capable,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1287,12 +1534,18 @@ struct ActivePeer {
     os: String,
     app_version: String,
     arch: String,
+    cpu_model: String,
+    mac_address: String,
+    total_memory_mb: u64,
+    os_version: String,
+    gpu_model: String,
     udp_probe_token: Option<[u8; UDP_PROBE_TOKEN_LEN]>,
     nat_type: Option<String>,
     nat_port_delta: Option<i16>,
     nat_port_range: Option<[u16; 2]>,
     smoothed_rtt_ms: Option<u32>,
     rcp2_v2: bool,
+    active_controllers: Vec<ActiveControllerSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -1444,6 +1697,14 @@ impl SignalHub {
         self.peers.get(&norm).map(|p| p.connected_at)
     }
 
+    pub fn peer_active_controllers(&self, device_id: &str) -> Vec<ActiveControllerSummary> {
+        let norm = normalize_device_id(device_id);
+        self.peers
+            .get(&norm)
+            .map(|p| p.active_controllers.clone())
+            .unwrap_or_default()
+    }
+
     /// Return the peer's smoothed signaling RTT estimate in milliseconds, falling back to `0`
     /// when no RTT sample has been observed yet (or the peer is offline).
     pub fn peer_smoothed_rtt_ms(&self, device_id: &str) -> u32 {
@@ -1523,9 +1784,41 @@ impl SignalHub {
             os: status.os.to_string(),
             app_version: status.app_version.to_string(),
             arch: status.arch.to_string(),
+            cpu_model: status.cpu_model.to_string(),
+            mac_address: status.mac_address.to_string(),
+            total_memory_mb: status.total_memory_mb,
+            os_version: status.os_version.to_string(),
+            gpu_model: status.gpu_model.to_string(),
             allow_remote_assist: status.allow_remote_assist,
             allow_remote_control: status.allow_remote_control,
             wol_capable: status.wol_capable,
+        };
+        for (peer_id, peer_tx) in targets {
+            Self::send_nonblocking(&peer_tx, &peer_id, msg.clone());
+        }
+    }
+
+    fn broadcast_device_control_state(
+        &self,
+        owner_user_id: Option<Uuid>,
+        device_id: &str,
+        active_controllers: Vec<ActiveControllerSummary>,
+    ) {
+        let Some(uid) = owner_user_id else {
+            return;
+        };
+        let targets: Vec<(String, mpsc::Sender<SignalMsg>)> = self
+            .peers
+            .iter()
+            .filter(|entry| entry.key() != device_id && entry.value().owner_user_id == Some(uid))
+            .map(|entry| (entry.key().clone(), entry.value().tx.clone()))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let msg = SignalMsg::DeviceControlStateChanged {
+            device_id: device_id.to_string(),
+            active_controllers,
         };
         for (peer_id, peer_tx) in targets {
             Self::send_nonblocking(&peer_tx, &peer_id, msg.clone());
@@ -1539,6 +1832,7 @@ impl SignalHub {
     pub async fn sync_device_policy_and_broadcast(&self, updated: &crate::store::DeviceRecord) {
         let norm = normalize_device_id(&updated.device_id);
         let wol_capable = updated.wol_capable();
+        let effective_mac = updated.effective_mac_address();
         let self_tx = {
             let _guard = self.lock_device(&norm).await;
             if let Some(mut peer) = self.peers.get_mut(&norm) {
@@ -1546,6 +1840,11 @@ impl SignalHub {
                 peer.allow_remote_assist = updated.allow_remote_assist;
                 peer.allow_remote_control = updated.allow_remote_control;
                 peer.wol_capable = wol_capable;
+                peer.cpu_model = updated.cpu_model.clone();
+                peer.mac_address = effective_mac.clone();
+                peer.total_memory_mb = updated.total_memory_mb;
+                peer.os_version = updated.os_version.clone();
+                peer.gpu_model = updated.gpu_model.clone();
                 Some(peer.tx.clone())
             } else {
                 None
@@ -1561,6 +1860,11 @@ impl SignalHub {
                 os: updated.os.clone(),
                 app_version: updated.app_version.clone(),
                 arch: updated.arch.clone(),
+                cpu_model: updated.cpu_model.clone(),
+                mac_address: effective_mac.clone(),
+                total_memory_mb: updated.total_memory_mb,
+                os_version: updated.os_version.clone(),
+                gpu_model: updated.gpu_model.clone(),
                 allow_remote_assist: updated.allow_remote_assist,
                 allow_remote_control: updated.allow_remote_control,
                 wol_capable,
@@ -1576,6 +1880,11 @@ impl SignalHub {
             os: &updated.os,
             app_version: &updated.app_version,
             arch: &updated.arch,
+            cpu_model: &updated.cpu_model,
+            mac_address: &effective_mac,
+            total_memory_mb: updated.total_memory_mb,
+            os_version: &updated.os_version,
+            gpu_model: &updated.gpu_model,
             allow_remote_assist: updated.allow_remote_assist,
             allow_remote_control: updated.allow_remote_control,
             wol_capable,
@@ -1595,6 +1904,11 @@ impl SignalHub {
             if let Err(err) = self.ephemeral.remove_online(&norm).await {
                 warn!(device_id = %norm, error = %err, "failed to remove kicked device from ephemeral store");
             }
+            if let Some((_, ref peer)) = removed {
+                if !peer.active_controllers.is_empty() {
+                    self.broadcast_device_control_state(peer.owner_user_id, &norm, Vec::new());
+                }
+            }
             removed
         };
         if let Some((_, peer)) = removed {
@@ -1607,6 +1921,11 @@ impl SignalHub {
                 os: &peer.os,
                 app_version: &peer.app_version,
                 arch: &peer.arch,
+                cpu_model: &peer.cpu_model,
+                mac_address: &peer.mac_address,
+                total_memory_mb: peer.total_memory_mb,
+                os_version: &peer.os_version,
+                gpu_model: &peer.gpu_model,
                 allow_remote_assist: peer.allow_remote_assist,
                 allow_remote_control: peer.allow_remote_control,
                 wol_capable: peer.wol_capable,
@@ -2195,6 +2514,11 @@ impl SignalHub {
                 os,
                 app_version,
                 arch,
+                cpu_model,
+                mac_address,
+                total_memory_mb,
+                os_version,
+                gpu_model,
                 device_group,
                 lan_addrs,
                 access_token,
@@ -2208,25 +2532,33 @@ impl SignalHub {
                 nat_port_range,
                 rcp2_v2,
             } => {
-                if let Err(reason) = validate_register_fields(
-                    &hostname,
-                    &os,
-                    &app_version,
-                    &arch,
-                    &device_group,
-                    &lan_addrs,
-                ) {
-                    write_frame_with_timeout(
-                        &mut writer,
-                        &SignalMsg::Error {
-                            code: err_code::INVALID_PAYLOAD.into(),
-                            message: reason,
-                        },
-                        self.config.write_timeout,
-                    )
-                    .await;
-                    return;
-                }
+                let norm_mac_address = match validate_register_fields(RegisterMetadataFields {
+                    hostname: &hostname,
+                    os: &os,
+                    app_version: &app_version,
+                    arch: &arch,
+                    cpu_model: &cpu_model,
+                    mac_address: &mac_address,
+                    total_memory_mb,
+                    os_version: &os_version,
+                    gpu_model: &gpu_model,
+                    device_group: &device_group,
+                    lan_addrs: &lan_addrs,
+                }) {
+                    Ok(mac) => mac,
+                    Err(reason) => {
+                        write_frame_with_timeout(
+                            &mut writer,
+                            &SignalMsg::Error {
+                                code: err_code::INVALID_PAYLOAD.into(),
+                                message: reason,
+                            },
+                            self.config.write_timeout,
+                        )
+                        .await;
+                        return;
+                    }
+                };
                 if let Some(ref pk) = device_pubkey {
                     if let Err(reason) =
                         validate_metadata_field(pk, MAX_DEVICE_PUBKEY_LEN, "device_pubkey")
@@ -2266,6 +2598,11 @@ impl SignalHub {
                         os,
                         app_version,
                         arch,
+                        cpu_model,
+                        mac_address: norm_mac_address,
+                        total_memory_mb,
+                        os_version,
+                        gpu_model,
                         device_group,
                         ..Default::default()
                     },
@@ -2496,6 +2833,11 @@ impl SignalHub {
             peer_os,
             peer_ver,
             peer_arch,
+            peer_cpu_model,
+            peer_mac_address,
+            peer_total_memory_mb,
+            peer_os_version,
+            peer_gpu_model,
             peer_assist,
             peer_remote_control,
             peer_wol_capable,
@@ -2708,11 +3050,12 @@ impl SignalHub {
             let effective_assist = latest.allow_remote_assist;
             let effective_remote_control = latest.allow_remote_control;
             let effective_wol_capable = latest.wol_capable();
+            let effective_mac_address = latest.effective_mac_address();
             let mut udp_probe_token = [0u8; UDP_PROBE_TOKEN_LEN];
             OsRng.fill_bytes(&mut udp_probe_token);
             let udp_probe_token_hex = hex::encode(udp_probe_token);
 
-            if let Some(old_peer) = self.peers.insert(
+            let replaced_owner_to_clear_ctrl = if let Some(old_peer) = self.peers.insert(
                 device_id.clone(),
                 ActivePeer {
                     conn_id,
@@ -2731,16 +3074,29 @@ impl SignalHub {
                     os: latest.os.clone(),
                     app_version: latest.app_version.clone(),
                     arch: latest.arch.clone(),
+                    cpu_model: latest.cpu_model.clone(),
+                    mac_address: effective_mac_address.clone(),
+                    total_memory_mb: latest.total_memory_mb,
+                    os_version: latest.os_version.clone(),
+                    gpu_model: latest.gpu_model.clone(),
                     udp_probe_token: Some(udp_probe_token),
                     nat_type: nat_type_opt,
                     nat_port_delta: nat_port_delta_opt,
                     nat_port_range: nat_port_range_opt,
                     smoothed_rtt_ms: None,
                     rcp2_v2,
+                    active_controllers: Vec::new(),
                 },
             ) {
                 old_peer.cancel.kick(err_code::REPLACED_BY_NEW_CONNECTION);
-            }
+                if !old_peer.active_controllers.is_empty() {
+                    old_peer.owner_user_id
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             if let Err(err) = self
                 .ephemeral
@@ -2762,6 +3118,10 @@ impl SignalHub {
                 relay_addr: self.config.public_relay_addr.clone(),
             });
 
+            if let Some(prev_owner) = replaced_owner_to_clear_ctrl {
+                self.broadcast_device_control_state(Some(prev_owner), &device_id, Vec::new());
+            }
+
             (
                 effective_owner,
                 latest.hostname,
@@ -2769,6 +3129,11 @@ impl SignalHub {
                 latest.os,
                 latest.app_version,
                 latest.arch,
+                latest.cpu_model,
+                effective_mac_address,
+                latest.total_memory_mb,
+                latest.os_version,
+                latest.gpu_model,
                 effective_assist,
                 effective_remote_control,
                 effective_wol_capable,
@@ -2793,6 +3158,11 @@ impl SignalHub {
             os: &peer_os,
             app_version: &peer_ver,
             arch: &peer_arch,
+            cpu_model: &peer_cpu_model,
+            mac_address: &peer_mac_address,
+            total_memory_mb: peer_total_memory_mb,
+            os_version: &peer_os_version,
+            gpu_model: &peer_gpu_model,
             allow_remote_assist: peer_assist,
             allow_remote_control: peer_remote_control,
             wol_capable: peer_wol_capable,
@@ -2955,9 +3325,14 @@ impl SignalHub {
                 .peers
                 .remove_if(&device_id, |_, peer| peer.conn_id == conn_id)
                 .map(|(_, p)| p);
-            if removed.is_some() && !self.peers.contains_key(&device_id) {
-                if let Err(err) = self.ephemeral.remove_online(&device_id).await {
-                    warn!(%device_id, error = %err, "failed to remove offline device from ephemeral store");
+            if let Some(ref peer) = removed {
+                if !self.peers.contains_key(&device_id) {
+                    if let Err(err) = self.ephemeral.remove_online(&device_id).await {
+                        warn!(%device_id, error = %err, "failed to remove offline device from ephemeral store");
+                    }
+                }
+                if !peer.active_controllers.is_empty() {
+                    self.broadcast_device_control_state(peer.owner_user_id, &device_id, Vec::new());
                 }
             }
             removed
@@ -2982,6 +3357,11 @@ impl SignalHub {
                 os: &peer.os,
                 app_version: &peer.app_version,
                 arch: &peer.arch,
+                cpu_model: &peer.cpu_model,
+                mac_address: &peer.mac_address,
+                total_memory_mb: peer.total_memory_mb,
+                os_version: &peer.os_version,
+                gpu_model: &peer.gpu_model,
                 allow_remote_assist: peer.allow_remote_assist,
                 allow_remote_control: peer.allow_remote_control,
                 wol_capable: peer.wol_capable,
@@ -3237,6 +3617,42 @@ impl SignalHub {
         Ok((None, false))
     }
 
+    fn check_target_in_session_and_takeover(
+        &self,
+        caller_device_id: &str,
+        target_device_id: &str,
+        is_owner_connection: bool,
+        requested_takeover: bool,
+    ) -> Result<bool, (&'static str, String)> {
+        let effective_takeover = is_owner_connection && requested_takeover;
+        let Some(target_peer) = self.peers.get(target_device_id) else {
+            return Ok(effective_takeover);
+        };
+        if target_peer.active_controllers.is_empty() {
+            return Ok(effective_takeover);
+        }
+        let is_same_controller = target_peer.active_controllers.iter().any(|c| {
+            !c.controller_device_id.is_empty()
+                && normalize_device_id(&c.controller_device_id) == caller_device_id
+        });
+        if is_same_controller {
+            return Ok(effective_takeover);
+        }
+        if !requested_takeover {
+            return Err((
+                err_code::TARGET_IN_SESSION,
+                "目标设备正在被其他控制端远控中".to_string(),
+            ));
+        }
+        if !is_owner_connection {
+            return Err((
+                err_code::TARGET_IN_SESSION,
+                "目标设备正在被其他控制端远控中，非同账号访客不允许接管".to_string(),
+            ));
+        }
+        Ok(true)
+    }
+
     async fn handle_peer_message(
         &self,
         device_id: &str,
@@ -3351,22 +3767,15 @@ impl SignalHub {
                                         self.device_store.get_by_id(device_id).await
                                     {
                                         let new_wol_capable = rec.wol_capable();
+                                        let effective_mac = rec.effective_mac_address();
                                         self.peers.get_mut(device_id).and_then(|mut peer| {
                                             if peer.conn_id == conn_id
-                                                && peer.wol_capable != new_wol_capable
+                                                && (peer.wol_capable != new_wol_capable
+                                                    || peer.mac_address != effective_mac)
                                             {
                                                 peer.wol_capable = new_wol_capable;
-                                                Some((
-                                                    peer.owner_user_id,
-                                                    peer.hostname.clone(),
-                                                    peer.alias.clone(),
-                                                    peer.os.clone(),
-                                                    peer.app_version.clone(),
-                                                    peer.arch.clone(),
-                                                    peer.allow_remote_assist,
-                                                    peer.allow_remote_control,
-                                                    peer.wol_capable,
-                                                ))
+                                                peer.mac_address = effective_mac;
+                                                Some(peer.to_owned_status())
                                             } else {
                                                 None
                                             }
@@ -3397,30 +3806,24 @@ impl SignalHub {
                     }
                 };
 
-                if let Some((
-                    owner,
-                    hostname,
-                    alias,
-                    os,
-                    app_version,
-                    arch,
-                    allow_assist,
-                    allow_rc,
-                    wol_cap,
-                )) = changed_peer
-                {
+                if let Some(status) = changed_peer {
                     self.broadcast_user_device_status(DeviceStatusBroadcast {
-                        owner_user_id: owner,
+                        owner_user_id: status.owner_user_id,
                         device_id,
                         online: true,
-                        hostname: &hostname,
-                        alias: &alias,
-                        os: &os,
-                        app_version: &app_version,
-                        arch: &arch,
-                        allow_remote_assist: allow_assist,
-                        allow_remote_control: allow_rc,
-                        wol_capable: wol_cap,
+                        hostname: &status.hostname,
+                        alias: &status.alias,
+                        os: &status.os,
+                        app_version: &status.app_version,
+                        arch: &status.arch,
+                        cpu_model: &status.cpu_model,
+                        mac_address: &status.mac_address,
+                        total_memory_mb: status.total_memory_mb,
+                        os_version: &status.os_version,
+                        gpu_model: &status.gpu_model,
+                        allow_remote_assist: status.allow_remote_assist,
+                        allow_remote_control: status.allow_remote_control,
+                        wol_capable: status.wol_capable,
                     });
                 }
 
@@ -3454,6 +3857,11 @@ impl SignalHub {
                 allow_remote_control,
                 mac_addr,
                 wol_enabled,
+                cpu_model,
+                mac_address,
+                total_memory_mb,
+                os_version,
+                gpu_model,
             } => {
                 let normalized_mac = match validate_optional_signal_mac_addr(mac_addr.as_deref()) {
                     Ok(mac) => mac,
@@ -3469,17 +3877,107 @@ impl SignalHub {
                         return;
                     }
                 };
+                let clean_cpu_model = match validate_optional_signal_text(
+                    cpu_model.as_deref(),
+                    MAX_CPU_MODEL_LEN,
+                    "cpu_model",
+                ) {
+                    Ok(v) => v,
+                    Err(reason) => {
+                        Self::send_nonblocking(
+                            self_tx,
+                            device_id,
+                            SignalMsg::Error {
+                                code: err_code::INVALID_INPUT.into(),
+                                message: reason,
+                            },
+                        );
+                        return;
+                    }
+                };
+                let clean_mac_address =
+                    match validate_optional_signal_mac_address(mac_address.as_deref()) {
+                        Ok(v) => v,
+                        Err(reason) => {
+                            Self::send_nonblocking(
+                                self_tx,
+                                device_id,
+                                SignalMsg::Error {
+                                    code: err_code::INVALID_INPUT.into(),
+                                    message: reason,
+                                },
+                            );
+                            return;
+                        }
+                    };
+                let clean_total_memory_mb =
+                    match validate_optional_signal_total_memory_mb(total_memory_mb) {
+                        Ok(v) => v,
+                        Err(reason) => {
+                            Self::send_nonblocking(
+                                self_tx,
+                                device_id,
+                                SignalMsg::Error {
+                                    code: err_code::INVALID_INPUT.into(),
+                                    message: reason,
+                                },
+                            );
+                            return;
+                        }
+                    };
+                let clean_os_version = match validate_optional_signal_text(
+                    os_version.as_deref(),
+                    MAX_OS_VERSION_LEN,
+                    "os_version",
+                ) {
+                    Ok(v) => v,
+                    Err(reason) => {
+                        Self::send_nonblocking(
+                            self_tx,
+                            device_id,
+                            SignalMsg::Error {
+                                code: err_code::INVALID_INPUT.into(),
+                                message: reason,
+                            },
+                        );
+                        return;
+                    }
+                };
+                let clean_gpu_model = match validate_optional_signal_text(
+                    gpu_model.as_deref(),
+                    MAX_GPU_MODEL_LEN,
+                    "gpu_model",
+                ) {
+                    Ok(v) => v,
+                    Err(reason) => {
+                        Self::send_nonblocking(
+                            self_tx,
+                            device_id,
+                            SignalMsg::Error {
+                                code: err_code::INVALID_INPUT.into(),
+                                message: reason,
+                            },
+                        );
+                        return;
+                    }
+                };
+                let has_hardware_update = clean_cpu_model.is_some()
+                    || clean_mac_address.is_some()
+                    || clean_total_memory_mb.is_some()
+                    || clean_os_version.is_some()
+                    || clean_gpu_model.is_some();
                 if allow_remote_assist.is_none()
                     && allow_remote_control.is_none()
                     && normalized_mac.is_none()
                     && wol_enabled.is_none()
+                    && !has_hardware_update
                 {
                     Self::send_nonblocking(
                         self_tx,
                         device_id,
                         SignalMsg::Error {
                             code: err_code::INVALID_PAYLOAD.into(),
-                            message: "at least one of allow_remote_assist, allow_remote_control, mac_addr, or wol_enabled is required"
+                            message: "at least one policy, Wake-on-LAN, or hardware metadata field is required"
                                 .into(),
                         },
                     );
@@ -3601,6 +4099,7 @@ impl SignalHub {
                     }
 
                     let mut refreshed_wol_capable: Option<bool> = None;
+                    let mut refreshed_mac_address: Option<String> = None;
                     if normalized_mac.is_some() || wol_enabled.is_some() {
                         match self
                             .device_store
@@ -3618,6 +4117,7 @@ impl SignalHub {
                                 if let Ok(Some(rec)) = self.device_store.get_by_id(device_id).await
                                 {
                                     refreshed_wol_capable = Some(rec.wol_capable());
+                                    refreshed_mac_address = Some(rec.effective_mac_address());
                                 }
                             }
                             Ok(false) => {
@@ -3647,6 +4147,55 @@ impl SignalHub {
                         }
                     }
 
+                    if has_hardware_update {
+                        match self
+                            .device_store
+                            .update_device_hardware_info(
+                                device_id,
+                                owner,
+                                DeviceHardwareUpdate {
+                                    cpu_model: clean_cpu_model.as_deref(),
+                                    mac_address: clean_mac_address.as_deref(),
+                                    total_memory_mb: clean_total_memory_mb,
+                                    os_version: clean_os_version.as_deref(),
+                                    gpu_model: clean_gpu_model.as_deref(),
+                                },
+                            )
+                            .await
+                        {
+                            Ok(true) => {
+                                if let Ok(Some(rec)) = self.device_store.get_by_id(device_id).await
+                                {
+                                    refreshed_mac_address = Some(rec.effective_mac_address());
+                                }
+                            }
+                            Ok(false) => {
+                                warn!(%device_id, "UpdateAssistState hardware update affected 0 rows");
+                                Self::send_nonblocking(
+                                    self_tx,
+                                    device_id,
+                                    SignalMsg::Error {
+                                        code: err_code::UPDATE_FAILED.into(),
+                                        message: "failed to update hardware metadata".into(),
+                                    },
+                                );
+                                return;
+                            }
+                            Err(err) => {
+                                warn!(%device_id, error = %err, "failed to persist hardware metadata");
+                                Self::send_nonblocking(
+                                    self_tx,
+                                    device_id,
+                                    SignalMsg::Error {
+                                        code: err_code::INTERNAL_ERROR.into(),
+                                        message: "failed to persist hardware metadata".into(),
+                                    },
+                                );
+                                return;
+                            }
+                        }
+                    }
+
                     self.peers.get_mut(device_id).and_then(|mut peer| {
                         if peer.conn_id == conn_id {
                             if let Some(allow_assist) = allow_remote_assist {
@@ -3658,49 +4207,76 @@ impl SignalHub {
                             if let Some(wol_cap) = refreshed_wol_capable {
                                 peer.wol_capable = wol_cap;
                             }
-                            Some((
-                                peer.owner_user_id,
-                                peer.hostname.clone(),
-                                peer.alias.clone(),
-                                peer.os.clone(),
-                                peer.app_version.clone(),
-                                peer.arch.clone(),
-                                peer.allow_remote_assist,
-                                peer.allow_remote_control,
-                                peer.wol_capable,
-                            ))
+                            if let Some(ref cpu) = clean_cpu_model {
+                                peer.cpu_model = cpu.clone();
+                            }
+                            if let Some(ref mac) = refreshed_mac_address {
+                                peer.mac_address = mac.clone();
+                            } else if let Some(ref mac) = clean_mac_address {
+                                peer.mac_address = mac.clone();
+                            }
+                            if let Some(mem) = clean_total_memory_mb {
+                                peer.total_memory_mb = mem;
+                            }
+                            if let Some(ref ov) = clean_os_version {
+                                peer.os_version = ov.clone();
+                            }
+                            if let Some(ref gpu) = clean_gpu_model {
+                                peer.gpu_model = gpu.clone();
+                            }
+                            Some(peer.to_owned_status())
                         } else {
                             None
                         }
                     })
                 };
 
-                if let Some((
-                    owner,
-                    hostname,
-                    alias,
-                    os,
-                    app_version,
-                    arch,
-                    effective_assist,
-                    effective_remote_control,
-                    effective_wol_capable,
-                )) = updated_peer
-                {
+                if let Some(status) = updated_peer {
                     self.broadcast_user_device_status(DeviceStatusBroadcast {
-                        owner_user_id: owner,
+                        owner_user_id: status.owner_user_id,
                         device_id,
                         online: true,
-                        hostname: &hostname,
-                        alias: &alias,
-                        os: &os,
-                        app_version: &app_version,
-                        arch: &arch,
-                        allow_remote_assist: effective_assist,
-                        allow_remote_control: effective_remote_control,
-                        wol_capable: effective_wol_capable,
+                        hostname: &status.hostname,
+                        alias: &status.alias,
+                        os: &status.os,
+                        app_version: &status.app_version,
+                        arch: &status.arch,
+                        cpu_model: &status.cpu_model,
+                        mac_address: &status.mac_address,
+                        total_memory_mb: status.total_memory_mb,
+                        os_version: &status.os_version,
+                        gpu_model: &status.gpu_model,
+                        allow_remote_assist: status.allow_remote_assist,
+                        allow_remote_control: status.allow_remote_control,
+                        wol_capable: status.wol_capable,
                     });
                 }
+            }
+
+            SignalMsg::ControlStateReport { active_controllers } => {
+                self.handle_control_state_report(
+                    device_id,
+                    conn_id,
+                    cancel,
+                    self_tx,
+                    active_controllers,
+                )
+                .await;
+            }
+
+            SignalMsg::ForceDisconnectRequest {
+                target_id,
+                controller_device_id,
+                session_id,
+            } => {
+                self.handle_force_disconnect_request(
+                    device_id,
+                    conn_id,
+                    cancel,
+                    self_tx,
+                    (target_id, controller_device_id, session_id),
+                )
+                .await;
             }
 
             SignalMsg::ConnectRequest {
@@ -3711,6 +4287,7 @@ impl SignalHub {
                 nat_type,
                 nat_port_delta,
                 nat_port_range,
+                takeover,
             } => {
                 let target_norm = normalize_device_id(&target_id);
                 if target_norm.is_empty() {
@@ -3834,6 +4411,8 @@ impl SignalHub {
                     client_nat_port_range,
                     client_rtt_ms,
                     client_rcp2_v2,
+                    client_hostname,
+                    client_os,
                 ) = {
                     let snapshot = self
                         .peers
@@ -3847,43 +4426,33 @@ impl SignalHub {
                                 p.nat_port_range,
                                 p.smoothed_rtt_ms.unwrap_or(0),
                                 p.rcp2_v2,
+                                p.hostname.clone(),
+                                p.os.clone(),
                             )
                         });
                     match snapshot {
-                        Some((peer_lan, nt, delta, range, rtt, rcp2_v2)) => {
+                        Some((peer_lan, nt, delta, range, rtt, rcp2_v2, hostname, os)) => {
                             let addrs = if !lan_addrs.is_empty() {
                                 lan_addrs
                             } else {
                                 peer_lan
                             };
-                            (addrs, nt, delta, range, rtt, rcp2_v2)
+                            (addrs, nt, delta, range, rtt, rcp2_v2, hostname, os)
                         }
-                        None => (lan_addrs, None, None, None, 0, false),
+                        None => (
+                            lan_addrs,
+                            None,
+                            None,
+                            None,
+                            0,
+                            false,
+                            String::new(),
+                            String::new(),
+                        ),
                     }
                 };
 
-                let target_snapshot = self.peers.get(&target_norm).map(|p| {
-                    (
-                        p.tx.clone(),
-                        p.lan_addrs.clone(),
-                        p.nat_type.clone(),
-                        p.nat_port_delta,
-                        p.nat_port_range,
-                        p.smoothed_rtt_ms.unwrap_or(0),
-                        p.rcp2_v2,
-                    )
-                });
-
-                let Some((
-                    host_tx,
-                    host_lan_addrs,
-                    host_nat_type,
-                    host_nat_port_delta,
-                    host_nat_port_range,
-                    host_rtt_ms,
-                    host_rcp2_v2,
-                )) = target_snapshot
-                else {
+                if !self.peers.contains_key(&target_norm) {
                     Self::send_nonblocking(
                         self_tx,
                         device_id,
@@ -3893,7 +4462,7 @@ impl SignalHub {
                         },
                     );
                     return;
-                };
+                }
 
                 let (owner_grant, is_owner_connection) = match self
                     .authorize_peer_connection(device_id, &target_norm, &session_id)
@@ -3911,6 +4480,63 @@ impl SignalHub {
                         );
                         return;
                     }
+                };
+
+                let effective_takeover = match self.check_target_in_session_and_takeover(
+                    device_id,
+                    &target_norm,
+                    is_owner_connection,
+                    takeover,
+                ) {
+                    Ok(v) => v,
+                    Err((code, message)) => {
+                        Self::send_nonblocking(
+                            self_tx,
+                            device_id,
+                            SignalMsg::Error {
+                                code: code.into(),
+                                message,
+                            },
+                        );
+                        return;
+                    }
+                };
+
+                let target_snapshot = self.peers.get(&target_norm).map(|p| {
+                    (
+                        p.tx.clone(),
+                        p.lan_addrs.clone(),
+                        p.nat_type.clone(),
+                        p.nat_port_delta,
+                        p.nat_port_range,
+                        p.smoothed_rtt_ms.unwrap_or(0),
+                        p.rcp2_v2,
+                        p.hostname.clone(),
+                        p.os.clone(),
+                    )
+                });
+
+                let Some((
+                    host_tx,
+                    host_lan_addrs,
+                    host_nat_type,
+                    host_nat_port_delta,
+                    host_nat_port_range,
+                    host_rtt_ms,
+                    host_rcp2_v2,
+                    host_hostname,
+                    host_os,
+                )) = target_snapshot
+                else {
+                    Self::send_nonblocking(
+                        self_tx,
+                        device_id,
+                        SignalMsg::PeerOffline {
+                            target_id: target_norm,
+                            session_id,
+                        },
+                    );
+                    return;
                 };
 
                 let client_udp_fallback = self
@@ -3981,6 +4607,9 @@ impl SignalHub {
                     relay_addr: self.config.public_relay_addr.clone(),
                     owner_grant,
                     is_owner_connection,
+                    takeover: effective_takeover,
+                    peer_hostname: non_empty_opt(&host_hostname),
+                    peer_os: non_empty_opt(&host_os),
                 };
                 let host_msg = SignalMsg::PunchCoord {
                     session_id: session_id.clone(),
@@ -4002,6 +4631,9 @@ impl SignalHub {
                     relay_addr: self.config.public_relay_addr.clone(),
                     owner_grant: None,
                     is_owner_connection,
+                    takeover: effective_takeover,
+                    peer_hostname: non_empty_opt(&client_hostname),
+                    peer_os: non_empty_opt(&client_os),
                 };
 
                 // H5: Pre-check serialized frame length <= MAX_SIGNAL_FRAME_LEN before
@@ -4088,6 +4720,7 @@ impl SignalHub {
             SignalMsg::RelayAlloc {
                 target_id,
                 session_id,
+                takeover,
             } => {
                 let target_norm = normalize_device_id(&target_id);
                 if target_norm.is_empty() {
@@ -4158,8 +4791,7 @@ impl SignalHub {
                     return;
                 }
 
-                let target_tx = self.peers.get(&target_norm).map(|p| p.tx.clone());
-                let Some(host_tx) = target_tx else {
+                if !self.peers.contains_key(&target_norm) {
                     Self::send_nonblocking(
                         self_tx,
                         device_id,
@@ -4169,7 +4801,7 @@ impl SignalHub {
                         },
                     );
                     return;
-                };
+                }
 
                 let (owner_grant, is_owner_connection) = match self
                     .authorize_peer_connection(device_id, &target_norm, &session_id)
@@ -4189,6 +4821,49 @@ impl SignalHub {
                     }
                 };
 
+                let effective_takeover = match self.check_target_in_session_and_takeover(
+                    device_id,
+                    &target_norm,
+                    is_owner_connection,
+                    takeover,
+                ) {
+                    Ok(v) => v,
+                    Err((code, message)) => {
+                        Self::send_nonblocking(
+                            self_tx,
+                            device_id,
+                            SignalMsg::Error {
+                                code: code.into(),
+                                message,
+                            },
+                        );
+                        return;
+                    }
+                };
+
+                let (client_hostname, client_os) = self
+                    .peers
+                    .get(device_id)
+                    .filter(|p| p.conn_id == conn_id)
+                    .map(|p| (p.hostname.clone(), p.os.clone()))
+                    .unwrap_or_default();
+
+                let target_snapshot = self
+                    .peers
+                    .get(&target_norm)
+                    .map(|p| (p.tx.clone(), p.hostname.clone(), p.os.clone()));
+                let Some((host_tx, host_hostname, host_os)) = target_snapshot else {
+                    Self::send_nonblocking(
+                        self_tx,
+                        device_id,
+                        SignalMsg::PeerOffline {
+                            target_id: target_norm,
+                            session_id,
+                        },
+                    );
+                    return;
+                };
+
                 if !self.is_active_conn(device_id, conn_id, cancel) {
                     return;
                 }
@@ -4204,6 +4879,9 @@ impl SignalHub {
                     expires_in_sec,
                     owner_grant,
                     is_owner_connection,
+                    takeover: effective_takeover,
+                    peer_hostname: non_empty_opt(&host_hostname),
+                    peer_os: non_empty_opt(&host_os),
                 };
                 let host_msg = SignalMsg::RelayReady {
                     session_id: session_id.clone(),
@@ -4214,6 +4892,9 @@ impl SignalHub {
                     expires_in_sec,
                     owner_grant: None,
                     is_owner_connection,
+                    takeover: effective_takeover,
+                    peer_hostname: non_empty_opt(&client_hostname),
+                    peer_os: non_empty_opt(&client_os),
                 };
 
                 // H5: Pre-check serialized frame length before allocating token or enqueueing.
@@ -4328,6 +5009,232 @@ impl SignalHub {
                         code: err_code::UNEXPECTED_MESSAGE.into(),
                         message: "unsupported client-to-server signaling message".into(),
                     },
+                );
+            }
+        }
+    }
+
+    async fn handle_control_state_report(
+        &self,
+        device_id: &str,
+        conn_id: u64,
+        cancel: &PeerCancel,
+        self_tx: &mpsc::Sender<SignalMsg>,
+        active_controllers: Vec<ActiveControllerSummary>,
+    ) {
+        if let Err(reason) = validate_active_controllers(&active_controllers) {
+            Self::send_nonblocking(
+                self_tx,
+                device_id,
+                SignalMsg::Error {
+                    code: err_code::INVALID_PAYLOAD.into(),
+                    message: reason,
+                },
+            );
+            return;
+        }
+        let _guard = self.lock_device(device_id).await;
+        if !self.is_active_conn(device_id, conn_id, cancel) {
+            return;
+        }
+        let owner_user_id = {
+            let Some(mut peer) = self.peers.get_mut(device_id) else {
+                return;
+            };
+            if peer.conn_id != conn_id {
+                return;
+            }
+            peer.active_controllers = active_controllers.clone();
+            peer.owner_user_id
+        };
+        if let Err(err) = self
+            .ephemeral
+            .set_online(device_id, self.config.online_ttl)
+            .await
+        {
+            warn!(
+                %device_id,
+                error = %err,
+                "failed to refresh ephemeral online TTL on control_state_report"
+            );
+        }
+        self.broadcast_device_control_state(owner_user_id, device_id, active_controllers);
+    }
+
+    async fn handle_force_disconnect_request(
+        &self,
+        device_id: &str,
+        conn_id: u64,
+        cancel: &PeerCancel,
+        self_tx: &mpsc::Sender<SignalMsg>,
+        (target_id, controller_device_id, session_id): (String, Option<String>, Option<String>),
+    ) {
+        let send_err = |code: &'static str, message: String| {
+            Self::send_nonblocking(
+                self_tx,
+                device_id,
+                SignalMsg::Error {
+                    code: code.into(),
+                    message,
+                },
+            );
+        };
+
+        let target_norm = normalize_device_id(&target_id);
+        if target_norm.is_empty() {
+            send_err(err_code::INVALID_PAYLOAD, "target_id is required".into());
+            return;
+        }
+
+        let controller_device_id = match controller_device_id {
+            Some(raw) => {
+                if let Err(reason) = validate_metadata_field(
+                    &raw,
+                    MAX_CONTROLLER_DEVICE_ID_LEN,
+                    "controller_device_id",
+                ) {
+                    send_err(err_code::INVALID_PAYLOAD, reason);
+                    return;
+                }
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            None => None,
+        };
+
+        let session_id = match session_id {
+            Some(raw) if !raw.is_empty() => {
+                if let Err(reason) = validate_ascii_token(&raw, MAX_SESSION_ID_LEN, "session_id") {
+                    send_err(err_code::INVALID_PAYLOAD, reason);
+                    return;
+                }
+                Some(raw)
+            }
+            _ => None,
+        };
+
+        if !check_sliding_window_rate_limit(
+            &self.connect_rate_limits,
+            device_id.to_string(),
+            self.config.connect_rate_limit_max,
+            self.config.connect_rate_limit_window,
+        ) {
+            send_err(
+                err_code::RATE_LIMITED,
+                "too many connect/relay/force_disconnect requests".into(),
+            );
+            return;
+        }
+
+        if !self
+            .refresh_online_under_lock(device_id, conn_id, cancel, None)
+            .await
+        {
+            return;
+        }
+
+        let caller_peer_owner = self.peers.get(device_id).and_then(|p| p.owner_user_id);
+        let caller_uid = match self.device_store.get_by_id(device_id).await {
+            Ok(Some(rec)) => {
+                if rec.disabled {
+                    send_err(err_code::PEER_DISABLED, "当前设备已被禁用".into());
+                    return;
+                }
+                if self.peers.contains_key(device_id) && caller_peer_owner != rec.owner_user_id {
+                    send_err(
+                        err_code::UNAUTHORIZED,
+                        "设备归属已变更，请重新登录认证".into(),
+                    );
+                    return;
+                }
+                match rec.owner_user_id {
+                    Some(uid) => uid,
+                    None => {
+                        send_err(
+                            err_code::UNAUTHORIZED,
+                            "当前设备未绑定账号，无法发起远程断开".into(),
+                        );
+                        return;
+                    }
+                }
+            }
+            Ok(None) => {
+                send_err(err_code::UNAUTHORIZED, "当前设备未注册或已失效".into());
+                return;
+            }
+            Err(err) => {
+                warn!(caller = %device_id, error = %err, "failed to load caller device for force_disconnect");
+                send_err(err_code::INTERNAL_ERROR, "校验当前设备状态失败".into());
+                return;
+            }
+        };
+
+        match self.device_store.get_by_id(&target_norm).await {
+            Ok(Some(rec)) => {
+                if rec.owner_user_id != Some(caller_uid) {
+                    send_err(
+                        err_code::FORBIDDEN,
+                        "仅允许断开同一账号下设备的远控连接".into(),
+                    );
+                    return;
+                }
+                if rec.disabled {
+                    send_err(err_code::PEER_DISABLED, "目标设备已被禁用".into());
+                    return;
+                }
+            }
+            Ok(None) => {
+                send_err(err_code::PEER_NOT_FOUND, "目标设备不存在".into());
+                return;
+            }
+            Err(err) => {
+                warn!(target = %target_norm, error = %err, "failed to load target device for force_disconnect");
+                send_err(err_code::INTERNAL_ERROR, "校验目标设备状态失败".into());
+                return;
+            }
+        }
+
+        let target_peer = self
+            .peers
+            .get(&target_norm)
+            .map(|p| (p.tx.clone(), p.owner_user_id));
+        let Some((target_tx, target_peer_owner)) = target_peer else {
+            send_err(err_code::PEER_OFFLINE, "目标设备当前不在线".into());
+            return;
+        };
+        if target_peer_owner != Some(caller_uid) {
+            send_err(
+                err_code::FORBIDDEN,
+                "仅允许断开同一账号下设备的远控连接".into(),
+            );
+            return;
+        }
+
+        if !self.is_active_conn(device_id, conn_id, cancel) {
+            return;
+        }
+
+        let msg = SignalMsg::ForceDisconnect {
+            requester_device_id: device_id.to_string(),
+            controller_device_id,
+            session_id,
+        };
+        match Self::try_enqueue_checked(&target_tx, &target_norm, msg) {
+            Ok(()) => {}
+            Err(EnqueueError::Closed) => {
+                send_err(err_code::PEER_OFFLINE, "目标设备当前不在线".into());
+            }
+            Err(EnqueueError::Full) => {
+                send_err(err_code::PEER_BUSY, "目标设备信令队列已满".into());
+            }
+            Err(EnqueueError::FrameTooLarge) => {
+                send_err(
+                    err_code::FRAME_TOO_LARGE,
+                    "force_disconnect frame exceeds maximum length".into(),
                 );
             }
         }
@@ -4789,6 +5696,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -4905,6 +5817,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: "lab".into(),
                 lan_addrs: vec!["192.168.1.10:50000".into()],
                 access_token: None,
@@ -4936,6 +5853,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: "lab".into(),
                 lan_addrs: vec!["192.168.1.20:50001".into()],
                 access_token: None,
@@ -5007,6 +5929,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                takeover: false,
             },
         )
         .await
@@ -5066,6 +5989,7 @@ mod tests {
             &SignalMsg::RelayAlloc {
                 target_id: host_id.clone(),
                 session_id: Some("sess-relay-2".into()),
+                takeover: false,
             },
         )
         .await
@@ -5109,6 +6033,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                takeover: false,
             },
         )
         .await
@@ -5141,6 +6066,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: "lab".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -5189,6 +6119,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -5226,6 +6161,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -5258,6 +6198,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -5353,6 +6298,11 @@ mod tests {
                 os: "linux".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -5390,6 +6340,11 @@ mod tests {
                 os: "linux".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec!["10.0.0.1:5000".into()],
                 access_token: None,
@@ -5440,6 +6395,7 @@ mod tests {
             &SignalMsg::RelayAlloc {
                 target_id: target_id.clone(),
                 session_id: Some("sess-after-kick".into()),
+                takeover: false,
             },
         )
         .await;
@@ -5460,6 +6416,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec!["10.1.0.1:1111".into()],
                 access_token: None,
@@ -5495,6 +6456,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec!["10.2.0.2:2222".into()],
                 access_token: None,
@@ -5578,6 +6544,11 @@ mod tests {
                 os: "linux".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -5664,6 +6635,11 @@ mod tests {
                     os: "evil-os".into(),
                     app_version: String::new(),
                     arch: String::new(),
+                    cpu_model: String::new(),
+                    mac_address: String::new(),
+                    total_memory_mb: 0,
+                    os_version: String::new(),
+                    gpu_model: String::new(),
                     device_group: "evil-grp".into(),
                     lan_addrs: vec![],
                     access_token: None,
@@ -5698,6 +6674,11 @@ mod tests {
                     os: "linux".into(),
                     app_version: String::new(),
                     arch: String::new(),
+                    cpu_model: String::new(),
+                    mac_address: String::new(),
+                    total_memory_mb: 0,
+                    os_version: String::new(),
+                    gpu_model: String::new(),
                     device_group: "ghost".into(),
                     lan_addrs: vec![],
                     access_token: None,
@@ -5732,6 +6713,11 @@ mod tests {
                     os: "mutated-os".into(),
                     app_version: String::new(),
                     arch: String::new(),
+                    cpu_model: String::new(),
+                    mac_address: String::new(),
+                    total_memory_mb: 0,
+                    os_version: String::new(),
+                    gpu_model: String::new(),
                     device_group: "mutated-grp".into(),
                     lan_addrs: vec![],
                     access_token: None,
@@ -5768,6 +6754,9 @@ mod tests {
         gate_enabled: std::sync::atomic::AtomicBool,
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
+        remove_gate_enabled: std::sync::atomic::AtomicBool,
+        remove_entered: tokio::sync::Notify,
+        remove_release: tokio::sync::Notify,
     }
 
     impl GatedEphemeralStore {
@@ -5777,11 +6766,19 @@ mod tests {
                 gate_enabled: std::sync::atomic::AtomicBool::new(false),
                 entered: tokio::sync::Notify::new(),
                 release: tokio::sync::Notify::new(),
+                remove_gate_enabled: std::sync::atomic::AtomicBool::new(false),
+                remove_entered: tokio::sync::Notify::new(),
+                remove_release: tokio::sync::Notify::new(),
             }
         }
 
         fn enable_gate(&self, enabled: bool) {
             self.gate_enabled
+                .store(enabled, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn enable_remove_gate(&self, enabled: bool) {
+            self.remove_gate_enabled
                 .store(enabled, std::sync::atomic::Ordering::SeqCst);
         }
     }
@@ -5807,6 +6804,13 @@ mod tests {
             &self,
             device_id: &str,
         ) -> Result<(), crate::ephemeral::EphemeralError> {
+            if self
+                .remove_gate_enabled
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.remove_entered.notify_one();
+                self.remove_release.notified().await;
+            }
             self.inner.remove_online(device_id).await
         }
 
@@ -5909,6 +6913,11 @@ mod tests {
                 os: "linux".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -5967,6 +6976,11 @@ mod tests {
                 os: "linux".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -6047,6 +7061,11 @@ mod tests {
                 os: "linux".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: "test".into(),
                 lan_addrs,
                 access_token: None,
@@ -6104,6 +7123,11 @@ mod tests {
                 os: "linux".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -6392,6 +7416,11 @@ mod tests {
                 os: "linux".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -6412,6 +7441,11 @@ mod tests {
                 os: "lin\0ux".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -6432,6 +7466,11 @@ mod tests {
                 os: "linux".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec!["10.0.0.1:5000".into(); MAX_LAN_ADDRS + 1],
                 access_token: None,
@@ -6469,6 +7508,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                takeover: false,
             },
             SignalMsg::ConnectRequest {
                 target_id: victim_id.clone(),
@@ -6478,6 +7518,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                takeover: false,
             },
             SignalMsg::ConnectRequest {
                 target_id: victim_id.clone(),
@@ -6487,6 +7528,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                takeover: false,
             },
             SignalMsg::ConnectRequest {
                 target_id: victim_id.clone(),
@@ -6496,6 +7538,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                takeover: false,
             },
             SignalMsg::ConnectRequest {
                 target_id: victim_id.clone(),
@@ -6505,10 +7548,12 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                takeover: false,
             },
             SignalMsg::RelayAlloc {
                 target_id: victim_id.clone(),
                 session_id: Some("r".repeat(MAX_SESSION_ID_LEN + 1)),
+                takeover: false,
             },
         ] {
             write_signal_frame(&mut attacker, &bad_msg).await.unwrap();
@@ -6596,6 +7641,7 @@ mod tests {
                     nat_type: None,
                     nat_port_delta: None,
                     nat_port_range: None,
+                    takeover: false,
                 },
             )
             .await
@@ -6615,6 +7661,7 @@ mod tests {
                 &SignalMsg::RelayAlloc {
                     target_id: host_id.clone(),
                     session_id: Some("s2".into()),
+                    takeover: false,
                 },
             )
             .await
@@ -6635,6 +7682,7 @@ mod tests {
                 &SignalMsg::RelayAlloc {
                     target_id: host_id.clone(),
                     session_id: Some("s3".into()),
+                    takeover: false,
                 },
             )
             .await
@@ -6679,6 +7727,7 @@ mod tests {
                     &SignalMsg::RelayAlloc {
                         target_id: host_id.clone(),
                         session_id: Some(format!("cap-{i}")),
+                        takeover: false,
                     },
                 )
                 .await
@@ -6700,6 +7749,7 @@ mod tests {
                 &SignalMsg::RelayAlloc {
                     target_id: host_id.clone(),
                     session_id: Some("cap-3".into()),
+                    takeover: false,
                 },
             )
             .await
@@ -6768,12 +7818,18 @@ mod tests {
                     os: String::new(),
                     app_version: String::new(),
                     arch: String::new(),
+                    cpu_model: String::new(),
+                    mac_address: String::new(),
+                    total_memory_mb: 0,
+                    os_version: String::new(),
+                    gpu_model: String::new(),
                     udp_probe_token: None,
                     nat_type: None,
                     nat_port_delta: None,
                     nat_port_range: None,
                     smoothed_rtt_ms: None,
                     rcp2_v2: false,
+                    active_controllers: Vec::new(),
                 },
             );
 
@@ -6788,6 +7844,7 @@ mod tests {
                     nat_type: None,
                     nat_port_delta: None,
                     nat_port_range: None,
+                    takeover: false,
                 },
             )
             .await
@@ -6808,6 +7865,7 @@ mod tests {
                 &SignalMsg::RelayAlloc {
                     target_id: full_host_id.clone(),
                     session_id: Some("full-relay".into()),
+                    takeover: false,
                 },
             )
             .await
@@ -6829,6 +7887,7 @@ mod tests {
                 &SignalMsg::RelayAlloc {
                     target_id: full_host_id.clone(),
                     session_id: Some("closed-relay".into()),
+                    takeover: false,
                 },
             )
             .await
@@ -6889,6 +7948,11 @@ mod tests {
                 os: "linux".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: "".into(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -6971,6 +8035,11 @@ mod tests {
                         os: "linux".into(),
                         app_version: String::new(),
                         arch: String::new(),
+                        cpu_model: String::new(),
+                        mac_address: String::new(),
+                        total_memory_mb: 0,
+                        os_version: String::new(),
+                        gpu_model: String::new(),
                         device_group: "".into(),
                         lan_addrs: vec![],
                         access_token: None,
@@ -7031,6 +8100,11 @@ mod tests {
                         os: "linux".into(),
                         app_version: String::new(),
                         arch: String::new(),
+                        cpu_model: String::new(),
+                        mac_address: String::new(),
+                        total_memory_mb: 0,
+                        os_version: String::new(),
+                        gpu_model: String::new(),
                         device_group: "".into(),
                         lan_addrs: vec![],
                         access_token: None,
@@ -7104,6 +8178,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                takeover: false,
             },
         )
         .await
@@ -7184,15 +8259,51 @@ mod tests {
         assert_eq!(MAX_OS_LEN, 128);
         assert_eq!(MAX_APP_VERSION_LEN, crate::store::MAX_APP_VERSION_LEN);
         assert_eq!(MAX_ARCH_LEN, crate::store::MAX_ARCH_LEN);
-        validate_register_fields("host", &"o".repeat(128), "0.1.10", "arm64", "grp", &[]).unwrap();
-        assert!(
-            validate_register_fields("host", "macos", &"1".repeat(33), "arm64", "grp", &[])
-                .is_err()
-        );
-        assert!(
-            validate_register_fields("host", "macos", "0.1.10", &"a".repeat(33), "grp", &[])
-                .is_err()
-        );
+        let long_os = "o".repeat(128);
+        let long_ver = "1".repeat(33);
+        let long_arch = "a".repeat(33);
+        validate_register_fields(RegisterMetadataFields {
+            hostname: "host",
+            os: &long_os,
+            app_version: "0.1.10",
+            arch: "arm64",
+            cpu_model: "",
+            mac_address: "",
+            total_memory_mb: 0,
+            os_version: "",
+            gpu_model: "",
+            device_group: "grp",
+            lan_addrs: &[],
+        })
+        .unwrap();
+        assert!(validate_register_fields(RegisterMetadataFields {
+            hostname: "host",
+            os: "macos",
+            app_version: &long_ver,
+            arch: "arm64",
+            cpu_model: "",
+            mac_address: "",
+            total_memory_mb: 0,
+            os_version: "",
+            gpu_model: "",
+            device_group: "grp",
+            lan_addrs: &[],
+        })
+        .is_err());
+        assert!(validate_register_fields(RegisterMetadataFields {
+            hostname: "host",
+            os: "macos",
+            app_version: "0.1.10",
+            arch: &long_arch,
+            cpu_model: "",
+            mac_address: "",
+            total_memory_mb: 0,
+            os_version: "",
+            gpu_model: "",
+            device_group: "grp",
+            lan_addrs: &[],
+        })
+        .is_err());
 
         let store = Arc::new(MemoryDeviceStore::new());
         let ephemeral = Arc::new(MemoryEphemeralStore::new());
@@ -7239,6 +8350,11 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                cpu_model: None,
+                mac_address: None,
+                total_memory_mb: None,
+                os_version: None,
+                gpu_model: None,
             }
         );
 
@@ -7251,6 +8367,11 @@ mod tests {
                 allow_remote_control: Some(false),
                 mac_addr: None,
                 wol_enabled: None,
+                cpu_model: None,
+                mac_address: None,
+                total_memory_mb: None,
+                os_version: None,
+                gpu_model: None,
             }
         );
 
@@ -7264,6 +8385,11 @@ mod tests {
                 allow_remote_control: Some(true),
                 mac_addr: None,
                 wol_enabled: None,
+                cpu_model: None,
+                mac_address: None,
+                total_memory_mb: None,
+                os_version: None,
+                gpu_model: None,
             }
         );
 
@@ -7309,6 +8435,11 @@ mod tests {
                 os: "Android 15".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: String::new(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -7344,6 +8475,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                takeover: false,
             },
         )
         .await
@@ -7359,6 +8491,7 @@ mod tests {
             &SignalMsg::RelayAlloc {
                 target_id: android_id.clone(),
                 session_id: Some("anon-blocked-relay".into()),
+                takeover: false,
             },
         )
         .await
@@ -7391,12 +8524,18 @@ mod tests {
                 os: "android".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 udp_probe_token: None,
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
                 smoothed_rtt_ms: None,
                 rcp2_v2: false,
+                active_controllers: Vec::new(),
             },
         );
         write_signal_frame(
@@ -7409,6 +8548,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                takeover: false,
             },
         )
         .await
@@ -7428,6 +8568,11 @@ mod tests {
                 allow_remote_control: Some(true),
                 mac_addr: None,
                 wol_enabled: None,
+                cpu_model: None,
+                mac_address: None,
+                total_memory_mb: None,
+                os_version: None,
+                gpu_model: None,
             },
         )
         .await
@@ -7449,6 +8594,11 @@ mod tests {
                 allow_remote_control: Some(false),
                 mac_addr: None,
                 wol_enabled: None,
+                cpu_model: None,
+                mac_address: None,
+                total_memory_mb: None,
+                os_version: None,
+                gpu_model: None,
             },
         )
         .await
@@ -7469,6 +8619,11 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: None,
+                cpu_model: None,
+                mac_address: None,
+                total_memory_mb: None,
+                os_version: None,
+                gpu_model: None,
             },
         )
         .await
@@ -7526,6 +8681,7 @@ mod tests {
             (err_code::SERVER_MISCONFIGURED, "server_misconfigured"),
             (err_code::SERVER_SHUTDOWN, "server_shutdown"),
             (err_code::SERVICE_UNAVAILABLE, "service_unavailable"),
+            (err_code::TARGET_IN_SESSION, "target_in_session"),
             (err_code::TOKEN_EXPIRED, "token_expired"),
             (err_code::TOKEN_REVOKED, "token_revoked"),
             (err_code::UNAUTHORIZED, "unauthorized"),
@@ -7650,6 +8806,11 @@ mod tests {
             os: "macos".into(),
             app_version: String::new(),
             arch: String::new(),
+            cpu_model: String::new(),
+            mac_address: String::new(),
+            total_memory_mb: 0,
+            os_version: String::new(),
+            gpu_model: String::new(),
             allow_remote_assist: false,
             allow_remote_control: true,
             wol_capable: true,
@@ -7735,6 +8896,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: String::new(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -7803,6 +8969,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: String::new(),
                 lan_addrs: vec!["192.168.1.10:50000".into()],
                 access_token: Some(alice_token.clone()),
@@ -7834,6 +9005,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: String::new(),
                 lan_addrs: vec!["192.168.1.20:50000".into()],
                 access_token: Some(alice_token.clone()),
@@ -7874,6 +9050,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: String::new(),
                 lan_addrs: vec!["192.168.1.30:50000".into()],
                 access_token: Some(bob_token),
@@ -7983,6 +9164,11 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: None,
                 wol_enabled: Some(true),
+                cpu_model: None,
+                mac_address: None,
+                total_memory_mb: None,
+                os_version: None,
+                gpu_model: None,
             },
         )
         .await
@@ -8130,6 +9316,11 @@ mod tests {
                 os: "ios".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: String::new(),
                 lan_addrs: vec!["10.99.0.5:50000".into()],
                 access_token: Some(alice_token.clone()),
@@ -8162,6 +9353,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: String::new(),
                 lan_addrs: vec!["192.168.50.99:50000".into()],
                 access_token: Some(bob_token),
@@ -8194,6 +9390,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: String::new(),
                 lan_addrs: vec!["192.168.60.88:50000".into()],
                 access_token: Some(alice_token),
@@ -8406,6 +9607,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: String::new(),
                 lan_addrs: vec!["10.66.66.66:50000".into()],
                 access_token: None,
@@ -8489,6 +9695,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: String::new(),
                 lan_addrs: vec!["192.168.1.10:50000".into()],
                 access_token: Some(alice_token),
@@ -8518,6 +9729,11 @@ mod tests {
                 allow_remote_control: None,
                 mac_addr: Some("   ".into()),
                 wol_enabled: None,
+                cpu_model: None,
+                mac_address: None,
+                total_memory_mb: None,
+                os_version: None,
+                gpu_model: None,
             },
         )
         .await
@@ -8591,12 +9807,18 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 udp_probe_token: None,
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
                 smoothed_rtt_ms: None,
                 rcp2_v2: false,
+                active_controllers: Vec::new(),
             },
         );
         write_signal_frame(
@@ -8713,6 +9935,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: String::new(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -8895,6 +10122,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: String::new(),
                 lan_addrs: vec!["192.168.10.2:50000".into()],
                 access_token: None,
@@ -8927,6 +10159,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: String::new(),
                 lan_addrs: vec!["192.168.20.2:50001".into()],
                 access_token: None,
@@ -9001,6 +10238,7 @@ mod tests {
                 nat_type: Some("symmetric_random".into()),
                 nat_port_delta: Some(-5000),
                 nat_port_range: None,
+                takeover: false,
             },
         )
         .await
@@ -9200,6 +10438,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: String::new(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -9242,6 +10485,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: String::new(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -9382,6 +10630,7 @@ mod tests {
                 nat_type: Some("cone".into()),
                 nat_port_delta: Some(0),
                 nat_port_range: None,
+                takeover: false,
             },
         )
         .await
@@ -9612,6 +10861,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: String::new(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -9651,6 +10905,11 @@ mod tests {
                 os: "macos".into(),
                 app_version: String::new(),
                 arch: String::new(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
                 device_group: String::new(),
                 lan_addrs: vec![],
                 access_token: None,
@@ -9692,6 +10951,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                takeover: false,
             },
         )
         .await
@@ -9794,6 +11054,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                takeover: false,
             },
         )
         .await
@@ -9855,6 +11116,7 @@ mod tests {
                 nat_type: None,
                 nat_port_delta: None,
                 nat_port_range: None,
+                takeover: false,
             },
         )
         .await
@@ -9913,6 +11175,11 @@ mod tests {
                     os: "macos".into(),
                     app_version: String::new(),
                     arch: String::new(),
+                    cpu_model: String::new(),
+                    mac_address: String::new(),
+                    total_memory_mb: 0,
+                    os_version: String::new(),
+                    gpu_model: String::new(),
                     device_group: String::new(),
                     lan_addrs: vec![],
                     access_token: None,
@@ -9944,6 +11211,11 @@ mod tests {
                     os: "macos".into(),
                     app_version: String::new(),
                     arch: String::new(),
+                    cpu_model: String::new(),
+                    mac_address: String::new(),
+                    total_memory_mb: 0,
+                    os_version: String::new(),
+                    gpu_model: String::new(),
                     device_group: String::new(),
                     lan_addrs: vec![],
                     access_token: None,
@@ -9975,6 +11247,7 @@ mod tests {
                     nat_type: None,
                     nat_port_delta: None,
                     nat_port_range: None,
+                    takeover: false,
                 },
             )
             .await
@@ -10026,6 +11299,1705 @@ mod tests {
             drop(host);
         }
 
+        hub.shutdown_all().await;
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn hardware_metadata_register_update_assist_and_status_broadcast() {
+        use crate::ephemeral::MemoryEphemeralStore;
+        use crate::store::MemoryDeviceStore;
+
+        // Legacy Register/DeviceStatusChanged frames without hardware fields deserialize cleanly,
+        // and empty/zero hardware fields are omitted on DeviceStatusChanged serialization.
+        let legacy_reg: SignalMsg = serde_json::from_str(
+            r#"{"type":"register","device_key":"dk-hw-legacy","cpu_model":null,"total_memory_mb":null}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy_reg,
+            SignalMsg::Register {
+                cpu_model,
+                mac_address,
+                total_memory_mb: 0,
+                os_version,
+                gpu_model,
+                ..
+            } if cpu_model.is_empty() && mac_address.is_empty() && os_version.is_empty() && gpu_model.is_empty()
+        ));
+
+        let empty_status_json = serde_json::to_string(&SignalMsg::DeviceStatusChanged {
+            device_id: "123456789".into(),
+            online: true,
+            hostname: "host".into(),
+            alias: String::new(),
+            os: "macos".into(),
+            app_version: String::new(),
+            arch: String::new(),
+            cpu_model: String::new(),
+            mac_address: String::new(),
+            total_memory_mb: 0,
+            os_version: String::new(),
+            gpu_model: String::new(),
+            allow_remote_assist: false,
+            allow_remote_control: true,
+            wol_capable: false,
+        })
+        .unwrap();
+        assert!(!empty_status_json.contains("cpu_model"));
+        assert!(!empty_status_json.contains("mac_address"));
+        assert!(!empty_status_json.contains("total_memory_mb"));
+        assert!(!empty_status_json.contains("os_version"));
+        assert!(!empty_status_json.contains("gpu_model"));
+
+        let store = Arc::new(MemoryDeviceStore::new());
+        let ephemeral = Arc::new(MemoryEphemeralStore::new());
+        let auth_authority = Arc::new(AuthAuthority::load_or_create(store.as_ref()).await.unwrap());
+        let hub = Arc::new(SignalHub::with_auth(
+            store.clone(),
+            ephemeral,
+            auth_authority.clone(),
+            SignalConfig::default(),
+        ));
+
+        let (_uid, token) =
+            create_test_authed_user(&store, &auth_authority, "hw-sig@example.com").await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(hub.clone().serve_tcp_signaling_on_listener(listener));
+
+        // Peer 1 connects first to receive DeviceStatusChanged broadcasts for Peer 2.
+        let mut peer1 = TcpStream::connect(tcp_addr).await.unwrap();
+        write_signal_frame(
+            &mut peer1,
+            &SignalMsg::Register {
+                device_id: None,
+                device_key: "ed25519:hw-peer1".into(),
+                hostname: "viewer".into(),
+                os: "macos".into(),
+                app_version: "0.2.0".into(),
+                arch: "arm64".into(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
+                device_group: String::new(),
+                lan_addrs: vec![],
+                access_token: Some(token.clone()),
+                device_pubkey: None,
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
+                nat_port_range: None,
+                rcp2_v2: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut peer1).await.unwrap().unwrap(),
+            SignalMsg::Registered { .. }
+        ));
+
+        // Peer 2 registers with full hardware metadata.
+        let mut peer2 = TcpStream::connect(tcp_addr).await.unwrap();
+        write_signal_frame(
+            &mut peer2,
+            &SignalMsg::Register {
+                device_id: None,
+                device_key: "ed25519:hw-peer2".into(),
+                hostname: "studio-host".into(),
+                os: "macos".into(),
+                app_version: "0.2.0".into(),
+                arch: "arm64".into(),
+                cpu_model: "Apple M3 Max".into(),
+                mac_address: "AA-BB-CC-DD-EE-02".into(),
+                total_memory_mb: 65536,
+                os_version: "macOS 15.1".into(),
+                gpu_model: "Apple M3 Max".into(),
+                device_group: String::new(),
+                lan_addrs: vec![],
+                access_token: Some(token),
+                device_pubkey: None,
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
+                nat_port_range: None,
+                rcp2_v2: false,
+            },
+        )
+        .await
+        .unwrap();
+        let peer2_id = match read_signal_frame(&mut peer2).await.unwrap().unwrap() {
+            SignalMsg::Registered { device_id, .. } => device_id,
+            other => panic!("expected Registered for peer2, got {other:?}"),
+        };
+
+        // Peer 1 receives DeviceStatusChanged with hardware metadata.
+        match read_signal_frame(&mut peer1).await.unwrap().unwrap() {
+            SignalMsg::DeviceStatusChanged {
+                device_id,
+                online,
+                cpu_model,
+                mac_address,
+                total_memory_mb,
+                os_version,
+                gpu_model,
+                ..
+            } => {
+                assert_eq!(device_id, peer2_id);
+                assert!(online);
+                assert_eq!(cpu_model, "Apple M3 Max");
+                assert_eq!(mac_address, "aa:bb:cc:dd:ee:02");
+                assert_eq!(total_memory_mb, 65536);
+                assert_eq!(os_version, "macOS 15.1");
+                assert_eq!(gpu_model, "Apple M3 Max");
+            }
+            other => panic!("expected DeviceStatusChanged on peer1, got {other:?}"),
+        }
+
+        // Peer 2 sends incremental hardware update via UpdateAssistState.
+        write_signal_frame(
+            &mut peer2,
+            &SignalMsg::UpdateAssistState {
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
+                cpu_model: None,
+                mac_address: None,
+                total_memory_mb: Some(131072),
+                os_version: Some("macOS 15.2".into()),
+                gpu_model: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        match read_signal_frame(&mut peer1).await.unwrap().unwrap() {
+            SignalMsg::DeviceStatusChanged {
+                device_id,
+                cpu_model,
+                mac_address,
+                total_memory_mb,
+                os_version,
+                gpu_model,
+                ..
+            } => {
+                assert_eq!(device_id, peer2_id);
+                assert_eq!(cpu_model, "Apple M3 Max");
+                assert_eq!(mac_address, "aa:bb:cc:dd:ee:02");
+                assert_eq!(total_memory_mb, 131072);
+                assert_eq!(os_version, "macOS 15.2");
+                assert_eq!(gpu_model, "Apple M3 Max");
+            }
+            other => panic!("expected updated DeviceStatusChanged on peer1, got {other:?}"),
+        }
+
+        // Invalid oversized cpu_model in UpdateAssistState returns invalid_input without kicking peer2.
+        write_signal_frame(
+            &mut peer2,
+            &SignalMsg::UpdateAssistState {
+                allow_remote_assist: None,
+                allow_remote_control: None,
+                mac_addr: None,
+                wol_enabled: None,
+                cpu_model: Some("x".repeat(MAX_CPU_MODEL_LEN + 1)),
+                mac_address: None,
+                total_memory_mb: None,
+                os_version: None,
+                gpu_model: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut peer2).await.unwrap().unwrap(),
+            SignalMsg::Error { code, .. } if code == "invalid_input"
+        ));
+
+        let stored = store.get_by_id(&peer2_id).await.unwrap().unwrap();
+        assert_eq!(stored.cpu_model, "Apple M3 Max");
+        assert_eq!(stored.mac_address, "aa:bb:cc:dd:ee:02");
+        assert_eq!(stored.total_memory_mb, 131072);
+        assert_eq!(stored.os_version, "macOS 15.2");
+        assert_eq!(stored.gpu_model, "Apple M3 Max");
+
+        drop(peer1);
+        drop(peer2);
+        hub.shutdown_all().await;
+        let _ = server_task.await;
+    }
+
+    async fn register_authed_peer_helper(
+        addr: SocketAddr,
+        device_key: &str,
+        hostname: &str,
+        os: &str,
+        access_token: Option<&str>,
+        allow_remote_assist: Option<bool>,
+        allow_remote_control: Option<bool>,
+    ) -> (TcpStream, String) {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        write_signal_frame(
+            &mut stream,
+            &SignalMsg::Register {
+                device_id: None,
+                device_key: device_key.into(),
+                hostname: hostname.into(),
+                os: os.into(),
+                app_version: "0.2.5".into(),
+                arch: "arm64".into(),
+                cpu_model: String::new(),
+                mac_address: String::new(),
+                total_memory_mb: 0,
+                os_version: String::new(),
+                gpu_model: String::new(),
+                device_group: String::new(),
+                lan_addrs: vec![],
+                access_token: access_token.map(str::to_string),
+                device_pubkey: None,
+                allow_remote_assist,
+                allow_remote_control,
+                mac_addr: None,
+                wol_enabled: None,
+                nat_type: None,
+                nat_port_delta: None,
+                nat_port_range: None,
+                rcp2_v2: false,
+            },
+        )
+        .await
+        .unwrap();
+        let device_id = match read_signal_frame(&mut stream).await.unwrap().unwrap() {
+            SignalMsg::Registered { device_id, .. } => device_id,
+            other => panic!("expected Registered, got {other:?}"),
+        };
+        (stream, device_id)
+    }
+
+    #[tokio::test]
+    async fn control_state_report_validation_and_backward_compatible_serde() {
+        let legacy_conn: SignalMsg =
+            serde_json::from_str(r#"{"type":"connect_request","target_id":"987654321"}"#).unwrap();
+        assert!(matches!(
+            legacy_conn,
+            SignalMsg::ConnectRequest {
+                takeover: false,
+                ..
+            }
+        ));
+
+        let legacy_relay: SignalMsg =
+            serde_json::from_str(r#"{"type":"relay_alloc","target_id":"987654321"}"#).unwrap();
+        assert!(matches!(
+            legacy_relay,
+            SignalMsg::RelayAlloc {
+                takeover: false,
+                ..
+            }
+        ));
+
+        let legacy_punch: SignalMsg = serde_json::from_str(
+            r#"{"type":"punch_coord","session_id":"s1","role":"client","peer_id":"987654321","peer_lan_addrs":[],"nonce":"n1","relay_token":"t1","relay_addr":"127.0.0.1:21117"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy_punch,
+            SignalMsg::PunchCoord {
+                takeover: false,
+                peer_hostname: None,
+                peer_os: None,
+                ..
+            }
+        ));
+        let punch_json = serde_json::to_string(&legacy_punch).unwrap();
+        assert!(!punch_json.contains("peer_hostname"));
+        assert!(!punch_json.contains("peer_os"));
+
+        let legacy_ready: SignalMsg = serde_json::from_str(
+            r#"{"type":"relay_ready","session_id":"s1","role":"host","peer_id":"123456789","relay_token":"t1","relay_addr":"127.0.0.1:21117","expires_in_sec":60}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy_ready,
+            SignalMsg::RelayReady {
+                takeover: false,
+                peer_hostname: None,
+                peer_os: None,
+                ..
+            }
+        ));
+        let ready_json = serde_json::to_string(&legacy_ready).unwrap();
+        assert!(!ready_json.contains("peer_hostname"));
+        assert!(!ready_json.contains("peer_os"));
+
+        let summary_min: ActiveControllerSummary =
+            serde_json::from_str(r#"{"session_id":"sess-min"}"#).unwrap();
+        assert_eq!(summary_min.session_id, "sess-min");
+        assert_eq!(summary_min.controller_device_id, "");
+        assert!(!summary_min.is_owner);
+        assert_eq!(summary_min.connected_at_ms, 0);
+
+        let store = Arc::new(MemoryDeviceStore::new());
+        let ephemeral = Arc::new(MemoryEphemeralStore::new());
+        let hub = Arc::new(SignalHub::new(store, ephemeral, SignalConfig::default()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(hub.clone().serve_tcp_signaling_on_listener(listener));
+
+        let (mut host, host_id) = register_peer_helper(addr, "ed25519:ctrl-val-host", vec![]).await;
+
+        // Empty session_id is rejected without mutating active_controllers.
+        write_signal_frame(
+            &mut host,
+            &SignalMsg::ControlStateReport {
+                active_controllers: vec![ActiveControllerSummary {
+                    session_id: String::new(),
+                    controller_device_id: "111222333".into(),
+                    controller_device_name: "ctrl".into(),
+                    controller_os: "macos".into(),
+                    is_owner: true,
+                    mode: "remote_control".into(),
+                    connected_at_ms: 1_700_000_000_000,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut host).await.unwrap().unwrap(),
+            SignalMsg::Error { ref code, .. } if code == err_code::INVALID_PAYLOAD
+        ));
+        assert!(hub.peer_active_controllers(&host_id).is_empty());
+
+        // Exceeding MAX_ACTIVE_CONTROLLERS is rejected.
+        let too_many: Vec<ActiveControllerSummary> = (0..=MAX_ACTIVE_CONTROLLERS)
+            .map(|i| ActiveControllerSummary {
+                session_id: format!("sess-{i}"),
+                controller_device_id: String::new(),
+                controller_device_name: String::new(),
+                controller_os: String::new(),
+                is_owner: false,
+                mode: String::new(),
+                connected_at_ms: 0,
+            })
+            .collect();
+        write_signal_frame(
+            &mut host,
+            &SignalMsg::ControlStateReport {
+                active_controllers: too_many,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut host).await.unwrap().unwrap(),
+            SignalMsg::Error { ref code, .. } if code == err_code::INVALID_PAYLOAD
+        ));
+        assert!(hub.peer_active_controllers(&host_id).is_empty());
+
+        drop(host);
+        hub.shutdown_all().await;
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn control_state_report_broadcasts_and_clears_on_disconnect_kick_and_replace() {
+        let store = Arc::new(MemoryDeviceStore::new());
+        let ephemeral = Arc::new(MemoryEphemeralStore::new());
+        let auth_authority = Arc::new(AuthAuthority::load_or_create(store.as_ref()).await.unwrap());
+        let (_alice_id, alice_token) =
+            create_test_authed_user(&store, &auth_authority, "alice-ctrl-state@example.com").await;
+        let (_bob_id, bob_token) =
+            create_test_authed_user(&store, &auth_authority, "bob-ctrl-state@example.com").await;
+
+        let hub = Arc::new(SignalHub::with_auth(
+            store,
+            ephemeral,
+            auth_authority,
+            SignalConfig::default(),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(hub.clone().serve_tcp_signaling_on_listener(listener));
+
+        let (mut watcher, _watcher_id) = register_authed_peer_helper(
+            addr,
+            "dk-ctrl-watcher",
+            "watcher-mac",
+            "macos",
+            Some(&alice_token),
+            None,
+            None,
+        )
+        .await;
+        let (mut host, host_id) = register_authed_peer_helper(
+            addr,
+            "dk-ctrl-host",
+            "host-mac",
+            "macos",
+            Some(&alice_token),
+            Some(true),
+            Some(true),
+        )
+        .await;
+        let (mut stranger, _stranger_id) = register_authed_peer_helper(
+            addr,
+            "dk-ctrl-stranger",
+            "stranger-pc",
+            "windows",
+            Some(&bob_token),
+            None,
+            None,
+        )
+        .await;
+
+        // Drain initial DeviceStatusChanged(online=true) for host on watcher.
+        assert!(matches!(
+            read_signal_frame(&mut watcher).await.unwrap().unwrap(),
+            SignalMsg::DeviceStatusChanged { ref device_id, online: true, .. } if device_id == &host_id
+        ));
+
+        let summary = ActiveControllerSummary {
+            session_id: "sess-sync-1".into(),
+            controller_device_id: "555666777".into(),
+            controller_device_name: "Alice iPad".into(),
+            controller_os: "ios".into(),
+            is_owner: true,
+            mode: "remote_control".into(),
+            connected_at_ms: 1_763_800_000_000,
+        };
+        write_signal_frame(
+            &mut host,
+            &SignalMsg::ControlStateReport {
+                active_controllers: vec![summary.clone()],
+            },
+        )
+        .await
+        .unwrap();
+
+        match read_signal_frame(&mut watcher).await.unwrap().unwrap() {
+            SignalMsg::DeviceControlStateChanged {
+                device_id,
+                active_controllers,
+            } => {
+                assert_eq!(device_id, host_id);
+                assert_eq!(active_controllers, vec![summary.clone()]);
+            }
+            other => panic!("expected DeviceControlStateChanged on watcher, got {other:?}"),
+        }
+        assert_eq!(hub.peer_active_controllers(&host_id), vec![summary.clone()]);
+
+        // Cross-account stranger must NOT receive DeviceControlStateChanged.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), read_signal_frame(&mut stranger))
+                .await
+                .is_err(),
+            "cross-account stranger must not receive DeviceControlStateChanged"
+        );
+
+        // 1. Disconnecting host clears active_controllers and broadcasts empty list!
+        drop(host);
+        let mut saw_cleared = false;
+        for _ in 0..2 {
+            match read_signal_frame(&mut watcher).await.unwrap().unwrap() {
+                SignalMsg::DeviceControlStateChanged {
+                    device_id,
+                    active_controllers,
+                } if device_id == host_id => {
+                    assert!(active_controllers.is_empty());
+                    saw_cleared = true;
+                }
+                SignalMsg::DeviceStatusChanged {
+                    device_id,
+                    online: false,
+                    ..
+                } if device_id == host_id => {}
+                other => panic!("unexpected frame on watcher after host disconnect: {other:?}"),
+            }
+        }
+        assert!(
+            saw_cleared,
+            "watcher must receive cleared DeviceControlStateChanged on disconnect"
+        );
+        assert!(hub.peer_active_controllers(&host_id).is_empty());
+
+        // 2. Reconnect host, report active controller, then kick_device -> clears & broadcasts [].
+        let (mut host2, host_id2) = register_authed_peer_helper(
+            addr,
+            "dk-ctrl-host",
+            "host-mac",
+            "macos",
+            Some(&alice_token),
+            Some(true),
+            Some(true),
+        )
+        .await;
+        assert_eq!(host_id2, host_id);
+        assert!(matches!(
+            read_signal_frame(&mut watcher).await.unwrap().unwrap(),
+            SignalMsg::DeviceStatusChanged { ref device_id, online: true, .. } if device_id == &host_id
+        ));
+        write_signal_frame(
+            &mut host2,
+            &SignalMsg::ControlStateReport {
+                active_controllers: vec![summary.clone()],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut watcher).await.unwrap().unwrap(),
+            SignalMsg::DeviceControlStateChanged { ref device_id, ref active_controllers }
+                if device_id == &host_id && active_controllers.len() == 1
+        ));
+        assert!(hub.kick_device(&host_id, err_code::DEVICE_UNBOUND).await);
+        let mut saw_kick_clear = false;
+        for _ in 0..2 {
+            match read_signal_frame(&mut watcher).await.unwrap().unwrap() {
+                SignalMsg::DeviceControlStateChanged {
+                    device_id,
+                    active_controllers,
+                } if device_id == host_id => {
+                    assert!(active_controllers.is_empty());
+                    saw_kick_clear = true;
+                }
+                SignalMsg::DeviceStatusChanged {
+                    device_id,
+                    online: false,
+                    ..
+                } if device_id == host_id => {}
+                other => panic!("unexpected frame after kick_device: {other:?}"),
+            }
+        }
+        assert!(saw_kick_clear);
+
+        // 3. Replacing an active host connection also clears active_controllers and broadcasts [].
+        let (mut host3, _) = register_authed_peer_helper(
+            addr,
+            "dk-ctrl-host",
+            "host-mac",
+            "macos",
+            Some(&alice_token),
+            Some(true),
+            Some(true),
+        )
+        .await;
+        assert!(matches!(
+            read_signal_frame(&mut watcher).await.unwrap().unwrap(),
+            SignalMsg::DeviceStatusChanged { ref device_id, online: true, .. } if device_id == &host_id
+        ));
+        write_signal_frame(
+            &mut host3,
+            &SignalMsg::ControlStateReport {
+                active_controllers: vec![summary],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut watcher).await.unwrap().unwrap(),
+            SignalMsg::DeviceControlStateChanged { ref device_id, ref active_controllers }
+                if device_id == &host_id && active_controllers.len() == 1
+        ));
+        let (host4, _) = register_authed_peer_helper(
+            addr,
+            "dk-ctrl-host",
+            "host-mac",
+            "macos",
+            Some(&alice_token),
+            Some(true),
+            Some(true),
+        )
+        .await;
+        let mut saw_replace_clear = false;
+        for _ in 0..2 {
+            match read_signal_frame(&mut watcher).await.unwrap().unwrap() {
+                SignalMsg::DeviceControlStateChanged {
+                    device_id,
+                    active_controllers,
+                } if device_id == host_id => {
+                    assert!(active_controllers.is_empty());
+                    saw_replace_clear = true;
+                }
+                SignalMsg::DeviceStatusChanged {
+                    device_id,
+                    online: true,
+                    ..
+                } if device_id == host_id => {}
+                other => panic!("unexpected frame on watcher after replacement: {other:?}"),
+            }
+        }
+        assert!(saw_replace_clear);
+        assert!(hub.peer_active_controllers(&host_id).is_empty());
+
+        drop(host2);
+        drop(host3);
+        drop(host4);
+        drop(watcher);
+        drop(stranger);
+        hub.shutdown_all().await;
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn kick_and_replace_during_inflight_control_state_report_is_serialized() {
+        let store = Arc::new(MemoryDeviceStore::new());
+        let ephemeral = Arc::new(GatedEphemeralStore::new());
+        let auth_authority = Arc::new(AuthAuthority::load_or_create(store.as_ref()).await.unwrap());
+        let (_alice_id, alice_token) =
+            create_test_authed_user(&store, &auth_authority, "alice-ctrl-race@example.com").await;
+
+        let hub = Arc::new(SignalHub::with_auth(
+            store,
+            ephemeral.clone(),
+            auth_authority,
+            SignalConfig::default(),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(hub.clone().serve_tcp_signaling_on_listener(listener));
+
+        let (mut watcher, _watcher_id) = register_authed_peer_helper(
+            addr,
+            "dk-ctrl-race-watcher",
+            "watcher-mac",
+            "macos",
+            Some(&alice_token),
+            None,
+            None,
+        )
+        .await;
+        let (mut host, host_id) = register_authed_peer_helper(
+            addr,
+            "dk-ctrl-race-host",
+            "host-mac",
+            "macos",
+            Some(&alice_token),
+            Some(true),
+            Some(true),
+        )
+        .await;
+        assert!(matches!(
+            read_signal_frame(&mut watcher).await.unwrap().unwrap(),
+            SignalMsg::DeviceStatusChanged { ref device_id, online: true, .. } if device_id == &host_id
+        ));
+
+        let summary = ActiveControllerSummary {
+            session_id: "sess-race-1".into(),
+            controller_device_id: "555666777".into(),
+            controller_device_name: "Alice iPad".into(),
+            controller_os: "ios".into(),
+            is_owner: true,
+            mode: "remote_control".into(),
+            connected_at_ms: 1_763_800_000_000,
+        };
+
+        // Sub-case A: kick_device arrives while ControlStateReport's `set_online` is suspended.
+        // The stripe lock must serialize kick_device behind `set_online` AND the broadcast of
+        // `[summary]` so ephemeral stays offline and watcher observes `[summary]` before `[]`.
+        ephemeral.enable_gate(true);
+        write_signal_frame(
+            &mut host,
+            &SignalMsg::ControlStateReport {
+                active_controllers: vec![summary.clone()],
+            },
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), ephemeral.entered.notified())
+            .await
+            .expect("control_state_report must enter set_online");
+
+        let kick_task = tokio::spawn({
+            let hub = hub.clone();
+            let id = host_id.clone();
+            async move {
+                hub.kick_device(&id, "kick_during_control_state_report")
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        ephemeral.release.notify_one();
+
+        assert!(tokio::time::timeout(Duration::from_secs(2), kick_task)
+            .await
+            .expect("kick_device must complete after control_state_report releases stripe lock")
+            .unwrap());
+        assert!(!hub.is_peer_connected(&host_id));
+        assert!(
+            !ephemeral.is_online(&host_id).await.unwrap(),
+            "device must not remain falsely online after kick during ControlStateReport"
+        );
+
+        let mut control_state_events = Vec::new();
+        let mut saw_offline = false;
+        for _ in 0..3 {
+            match read_signal_frame(&mut watcher).await.unwrap().unwrap() {
+                SignalMsg::DeviceControlStateChanged {
+                    device_id,
+                    active_controllers,
+                } if device_id == host_id => {
+                    control_state_events.push(active_controllers);
+                }
+                SignalMsg::DeviceStatusChanged {
+                    device_id,
+                    online: false,
+                    ..
+                } if device_id == host_id => {
+                    saw_offline = true;
+                }
+                other => panic!("unexpected frame on watcher during kick race: {other:?}"),
+            }
+        }
+        assert!(saw_offline);
+        assert_eq!(
+            control_state_events,
+            vec![vec![summary.clone()], Vec::new()],
+            "watcher must observe non-empty control state strictly before cleared []"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), read_signal_frame(&mut watcher))
+                .await
+                .is_err(),
+            "no stale trailing DeviceControlStateChanged should arrive after kick"
+        );
+
+        // Sub-case B: replacement Register arrives while ControlStateReport's `set_online` is suspended.
+        let (mut host2, host_id2) = register_authed_peer_helper(
+            addr,
+            "dk-ctrl-race-host",
+            "host-mac",
+            "macos",
+            Some(&alice_token),
+            Some(true),
+            Some(true),
+        )
+        .await;
+        assert_eq!(host_id2, host_id);
+        assert!(matches!(
+            read_signal_frame(&mut watcher).await.unwrap().unwrap(),
+            SignalMsg::DeviceStatusChanged { ref device_id, online: true, .. } if device_id == &host_id
+        ));
+
+        ephemeral.enable_gate(true);
+        write_signal_frame(
+            &mut host2,
+            &SignalMsg::ControlStateReport {
+                active_controllers: vec![summary.clone()],
+            },
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), ephemeral.entered.notified())
+            .await
+            .expect("second control_state_report must enter set_online");
+
+        let replace_task = tokio::spawn({
+            let token = alice_token.clone();
+            async move {
+                register_authed_peer_helper(
+                    addr,
+                    "dk-ctrl-race-host",
+                    "host-mac",
+                    "macos",
+                    Some(&token),
+                    Some(true),
+                    Some(true),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        ephemeral.release.notify_one();
+
+        let (host3, host_id3) = tokio::time::timeout(Duration::from_secs(2), replace_task)
+            .await
+            .expect("replacement register must complete after control_state_report releases stripe lock")
+            .unwrap();
+        assert_eq!(host_id3, host_id);
+        assert!(hub.peer_active_controllers(&host_id).is_empty());
+        assert!(ephemeral.is_online(&host_id).await.unwrap());
+
+        let mut replace_events = Vec::new();
+        let mut saw_online_again = false;
+        for _ in 0..3 {
+            match read_signal_frame(&mut watcher).await.unwrap().unwrap() {
+                SignalMsg::DeviceControlStateChanged {
+                    device_id,
+                    active_controllers,
+                } if device_id == host_id => {
+                    replace_events.push(active_controllers);
+                }
+                SignalMsg::DeviceStatusChanged {
+                    device_id,
+                    online: true,
+                    ..
+                } if device_id == host_id => {
+                    saw_online_again = true;
+                }
+                other => panic!("unexpected frame on watcher during replace race: {other:?}"),
+            }
+        }
+        assert!(saw_online_again);
+        assert_eq!(
+            replace_events,
+            vec![vec![summary.clone()], Vec::new()],
+            "watcher must observe non-empty control state strictly before replacement cleared []"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), read_signal_frame(&mut watcher))
+                .await
+                .is_err(),
+            "no stale trailing DeviceControlStateChanged should arrive after replacement"
+        );
+
+        // Sub-case C: a stale connection invoking handle_control_state_report after kick is a no-op.
+        assert!(
+            hub.kick_device(&host_id, "cleanup_before_stale_report")
+                .await
+        );
+        assert!(matches!(
+            read_signal_frame(&mut watcher).await.unwrap().unwrap(),
+            SignalMsg::DeviceStatusChanged { ref device_id, online: false, .. } if device_id == &host_id
+        ));
+        let (stale_tx, _stale_rx) = mpsc::channel(4);
+        let stale_cancel = PeerCancel::new();
+        hub.handle_control_state_report(&host_id, 999_999, &stale_cancel, &stale_tx, vec![summary])
+            .await;
+        assert!(!ephemeral.is_online(&host_id).await.unwrap());
+        assert!(hub.peer_active_controllers(&host_id).is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), read_signal_frame(&mut watcher))
+                .await
+                .is_err(),
+            "stale connection control_state_report must not broadcast"
+        );
+
+        drop(host);
+        drop(host2);
+        drop(host3);
+        drop(watcher);
+        hub.shutdown_all().await;
+        let _ = server_task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconnect_control_state_report_after_kick_disconnect_and_replace_is_serialized() {
+        let store = Arc::new(MemoryDeviceStore::new());
+        let ephemeral = Arc::new(GatedEphemeralStore::new());
+        let auth_authority = Arc::new(AuthAuthority::load_or_create(store.as_ref()).await.unwrap());
+        let (_alice_id, alice_token) =
+            create_test_authed_user(&store, &auth_authority, "alice-ctrl-rev-race@example.com")
+                .await;
+
+        let hub = Arc::new(SignalHub::with_auth(
+            store,
+            ephemeral.clone(),
+            auth_authority,
+            SignalConfig::default(),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(hub.clone().serve_tcp_signaling_on_listener(listener));
+
+        let (mut watcher, _watcher_id) = register_authed_peer_helper(
+            addr,
+            "dk-ctrl-rev-watcher",
+            "watcher-mac",
+            "macos",
+            Some(&alice_token),
+            None,
+            None,
+        )
+        .await;
+        let (mut host1, host_id) = register_authed_peer_helper(
+            addr,
+            "dk-ctrl-rev-host",
+            "host-mac",
+            "macos",
+            Some(&alice_token),
+            Some(true),
+            Some(true),
+        )
+        .await;
+        assert!(matches!(
+            read_signal_frame(&mut watcher).await.unwrap().unwrap(),
+            SignalMsg::DeviceStatusChanged { ref device_id, online: true, .. } if device_id == &host_id
+        ));
+
+        let summary_old = ActiveControllerSummary {
+            session_id: "sess-old".into(),
+            controller_device_id: "111222333".into(),
+            controller_device_name: "Old iPad".into(),
+            controller_os: "ios".into(),
+            is_owner: true,
+            mode: "remote_control".into(),
+            connected_at_ms: 1_763_800_000_000,
+        };
+        let summary_new_1 = ActiveControllerSummary {
+            session_id: "sess-new-1".into(),
+            controller_device_id: "444555666".into(),
+            controller_device_name: "New Mac 1".into(),
+            controller_os: "macos".into(),
+            is_owner: true,
+            mode: "remote_control".into(),
+            connected_at_ms: 1_763_800_000_100,
+        };
+        let summary_new_2 = ActiveControllerSummary {
+            session_id: "sess-new-2".into(),
+            controller_device_id: "777888999".into(),
+            controller_device_name: "New Mac 2".into(),
+            controller_os: "macos".into(),
+            is_owner: true,
+            mode: "remote_control".into(),
+            connected_at_ms: 1_763_800_000_200,
+        };
+        let summary_new_3 = ActiveControllerSummary {
+            session_id: "sess-new-3".into(),
+            controller_device_id: "101112131".into(),
+            controller_device_name: "New Mac 3".into(),
+            controller_os: "macos".into(),
+            is_owner: true,
+            mode: "remote_control".into(),
+            connected_at_ms: 1_763_800_000_300,
+        };
+
+        // 1. Kick -> concurrent Register -> immediate ControlStateReport([summary_new_1])
+        write_signal_frame(
+            &mut host1,
+            &SignalMsg::ControlStateReport {
+                active_controllers: vec![summary_old.clone()],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut watcher).await.unwrap().unwrap(),
+            SignalMsg::DeviceControlStateChanged { ref device_id, ref active_controllers }
+                if device_id == &host_id && active_controllers == &vec![summary_old.clone()]
+        ));
+
+        ephemeral.enable_remove_gate(true);
+        let kick_task = tokio::spawn({
+            let hub = hub.clone();
+            let id = host_id.clone();
+            async move { hub.kick_device(&id, "kick_before_reconnect").await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), ephemeral.remove_entered.notified())
+            .await
+            .expect("kick_device must enter remove_online");
+
+        let reconnect_task = tokio::spawn({
+            let token = alice_token.clone();
+            async move {
+                register_authed_peer_helper(
+                    addr,
+                    "dk-ctrl-rev-host",
+                    "host-mac",
+                    "macos",
+                    Some(&token),
+                    Some(true),
+                    Some(true),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        ephemeral.remove_release.notify_one();
+
+        assert!(tokio::time::timeout(Duration::from_secs(2), kick_task)
+            .await
+            .unwrap()
+            .unwrap());
+        let (mut host2, host_id2) = tokio::time::timeout(Duration::from_secs(2), reconnect_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(host_id2, host_id);
+
+        write_signal_frame(
+            &mut host2,
+            &SignalMsg::ControlStateReport {
+                active_controllers: vec![summary_new_1.clone()],
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut events_after_kick = Vec::new();
+        for _ in 0..4 {
+            match read_signal_frame(&mut watcher).await.unwrap().unwrap() {
+                SignalMsg::DeviceControlStateChanged {
+                    device_id,
+                    active_controllers,
+                } if device_id == host_id => {
+                    events_after_kick.push(active_controllers);
+                }
+                SignalMsg::DeviceStatusChanged { device_id, .. } if device_id == host_id => {}
+                other => panic!("unexpected frame after kick reconnect: {other:?}"),
+            }
+        }
+        assert_eq!(
+            events_after_kick,
+            vec![Vec::new(), vec![summary_new_1.clone()]],
+            "kick [] broadcast must strictly precede new connection's ControlStateReport broadcast"
+        );
+        assert_eq!(
+            hub.peer_active_controllers(&host_id),
+            vec![summary_new_1.clone()]
+        );
+
+        // 2. Disconnect cleanup -> concurrent Register -> immediate ControlStateReport([summary_new_2])
+        ephemeral.enable_remove_gate(true);
+        drop(host1);
+        drop(host2);
+        tokio::time::timeout(Duration::from_secs(2), ephemeral.remove_entered.notified())
+            .await
+            .expect("disconnect cleanup must enter remove_online");
+
+        let reconnect_task_2 = tokio::spawn({
+            let token = alice_token.clone();
+            async move {
+                register_authed_peer_helper(
+                    addr,
+                    "dk-ctrl-rev-host",
+                    "host-mac",
+                    "macos",
+                    Some(&token),
+                    Some(true),
+                    Some(true),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        ephemeral.remove_release.notify_one();
+
+        let (mut host3, host_id3) = tokio::time::timeout(Duration::from_secs(2), reconnect_task_2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(host_id3, host_id);
+
+        write_signal_frame(
+            &mut host3,
+            &SignalMsg::ControlStateReport {
+                active_controllers: vec![summary_new_2.clone()],
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut events_after_disconnect = Vec::new();
+        for _ in 0..4 {
+            match read_signal_frame(&mut watcher).await.unwrap().unwrap() {
+                SignalMsg::DeviceControlStateChanged {
+                    device_id,
+                    active_controllers,
+                } if device_id == host_id => {
+                    events_after_disconnect.push(active_controllers);
+                }
+                SignalMsg::DeviceStatusChanged { device_id, .. } if device_id == host_id => {}
+                other => panic!("unexpected frame after disconnect reconnect: {other:?}"),
+            }
+        }
+        assert_eq!(
+            events_after_disconnect,
+            vec![Vec::new(), vec![summary_new_2.clone()]],
+            "disconnect [] broadcast must strictly precede new connection's ControlStateReport broadcast"
+        );
+        assert_eq!(
+            hub.peer_active_controllers(&host_id),
+            vec![summary_new_2.clone()]
+        );
+
+        // 3. handle_register replacement -> immediate ControlStateReport([summary_new_3])
+        ephemeral.enable_gate(true);
+        let replace_task = tokio::spawn({
+            let token = alice_token.clone();
+            async move {
+                register_authed_peer_helper(
+                    addr,
+                    "dk-ctrl-rev-host",
+                    "host-mac",
+                    "macos",
+                    Some(&token),
+                    Some(true),
+                    Some(true),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), ephemeral.entered.notified())
+            .await
+            .expect("replacement register must enter set_online");
+        ephemeral.release.notify_one();
+
+        let (mut host4, host_id4) = tokio::time::timeout(Duration::from_secs(2), replace_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(host_id4, host_id);
+
+        write_signal_frame(
+            &mut host4,
+            &SignalMsg::ControlStateReport {
+                active_controllers: vec![summary_new_3.clone()],
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut events_after_replace = Vec::new();
+        for _ in 0..3 {
+            match read_signal_frame(&mut watcher).await.unwrap().unwrap() {
+                SignalMsg::DeviceControlStateChanged {
+                    device_id,
+                    active_controllers,
+                } if device_id == host_id => {
+                    events_after_replace.push(active_controllers);
+                }
+                SignalMsg::DeviceStatusChanged { device_id, .. } if device_id == host_id => {}
+                other => panic!("unexpected frame after replace report: {other:?}"),
+            }
+        }
+        assert_eq!(
+            events_after_replace,
+            vec![Vec::new(), vec![summary_new_3.clone()]],
+            "replacement [] broadcast must strictly precede new connection's ControlStateReport broadcast"
+        );
+        assert_eq!(hub.peer_active_controllers(&host_id), vec![summary_new_3]);
+
+        drop(host3);
+        drop(host4);
+        drop(watcher);
+        hub.shutdown_all().await;
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn force_disconnect_request_auth_and_forwarding() {
+        let store = Arc::new(MemoryDeviceStore::new());
+        let ephemeral = Arc::new(MemoryEphemeralStore::new());
+        let auth_authority = Arc::new(AuthAuthority::load_or_create(store.as_ref()).await.unwrap());
+        let (_alice_id, alice_token) =
+            create_test_authed_user(&store, &auth_authority, "alice-fd@example.com").await;
+        let (_bob_id, bob_token) =
+            create_test_authed_user(&store, &auth_authority, "bob-fd@example.com").await;
+
+        let hub = Arc::new(SignalHub::with_auth(
+            store,
+            ephemeral,
+            auth_authority,
+            SignalConfig {
+                require_auth: false,
+                ..SignalConfig::default()
+            },
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(hub.clone().serve_tcp_signaling_on_listener(listener));
+
+        let (mut anon, _) =
+            register_authed_peer_helper(addr, "dk-fd-anon", "anon", "macos", None, None, None)
+                .await;
+        let (mut alice_host, alice_host_id) = register_authed_peer_helper(
+            addr,
+            "dk-fd-alice-host",
+            "alice-host",
+            "macos",
+            Some(&alice_token),
+            Some(true),
+            Some(true),
+        )
+        .await;
+        let (mut alice_req, alice_req_id) = register_authed_peer_helper(
+            addr,
+            "dk-fd-alice-req",
+            "alice-req",
+            "macos",
+            Some(&alice_token),
+            None,
+            None,
+        )
+        .await;
+        let (mut bob_stranger, _) = register_authed_peer_helper(
+            addr,
+            "dk-fd-bob",
+            "bob-pc",
+            "windows",
+            Some(&bob_token),
+            None,
+            None,
+        )
+        .await;
+        // Drain DeviceStatusChanged on alice_host.
+        let _ = read_signal_frame(&mut alice_host).await.unwrap().unwrap();
+
+        // 1. Unauthenticated caller -> unauthorized.
+        write_signal_frame(
+            &mut anon,
+            &SignalMsg::ForceDisconnectRequest {
+                target_id: alice_host_id.clone(),
+                controller_device_id: None,
+                session_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut anon).await.unwrap().unwrap(),
+            SignalMsg::Error { ref code, .. } if code == err_code::UNAUTHORIZED
+        ));
+
+        // 2. Cross-account caller -> forbidden (never kicks across accounts!).
+        write_signal_frame(
+            &mut bob_stranger,
+            &SignalMsg::ForceDisconnectRequest {
+                target_id: alice_host_id.clone(),
+                controller_device_id: Some("111222333".into()),
+                session_id: Some("sess-x".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut bob_stranger).await.unwrap().unwrap(),
+            SignalMsg::Error { ref code, .. } if code == err_code::FORBIDDEN
+        ));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(80),
+                read_signal_frame(&mut alice_host)
+            )
+            .await
+            .is_err(),
+            "cross-account ForceDisconnectRequest must not reach target host"
+        );
+
+        // 3. Unknown target -> peer_not_found.
+        write_signal_frame(
+            &mut alice_req,
+            &SignalMsg::ForceDisconnectRequest {
+                target_id: "999999999".into(),
+                controller_device_id: None,
+                session_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut alice_req).await.unwrap().unwrap(),
+            SignalMsg::Error { ref code, .. } if code == err_code::PEER_NOT_FOUND
+        ));
+
+        // 4. Same-account caller -> forwards ForceDisconnect to target host!
+        write_signal_frame(
+            &mut alice_req,
+            &SignalMsg::ForceDisconnectRequest {
+                target_id: alice_host_id.clone(),
+                controller_device_id: Some("222333444".into()),
+                session_id: Some("sess-kick-1".into()),
+            },
+        )
+        .await
+        .unwrap();
+        match read_signal_frame(&mut alice_host).await.unwrap().unwrap() {
+            SignalMsg::ForceDisconnect {
+                requester_device_id,
+                controller_device_id,
+                session_id,
+            } => {
+                assert_eq!(requester_device_id, alice_req_id);
+                assert_eq!(controller_device_id.as_deref(), Some("222333444"));
+                assert_eq!(session_id.as_deref(), Some("sess-kick-1"));
+            }
+            other => panic!("expected ForceDisconnect on alice_host, got {other:?}"),
+        }
+
+        // 5. Offline same-account target -> peer_offline.
+        drop(alice_host);
+        assert!(matches!(
+            read_signal_frame(&mut alice_req).await.unwrap().unwrap(),
+            SignalMsg::DeviceStatusChanged { ref device_id, online: false, .. } if device_id == &alice_host_id
+        ));
+        write_signal_frame(
+            &mut alice_req,
+            &SignalMsg::ForceDisconnectRequest {
+                target_id: alice_host_id,
+                controller_device_id: None,
+                session_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut alice_req).await.unwrap().unwrap(),
+            SignalMsg::Error { ref code, .. } if code == err_code::PEER_OFFLINE
+        ));
+
+        drop(anon);
+        drop(alice_req);
+        drop(bob_stranger);
+        hub.shutdown_all().await;
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn connect_request_and_relay_alloc_target_in_session_and_takeover_boundaries() {
+        let store = Arc::new(MemoryDeviceStore::new());
+        let ephemeral = Arc::new(MemoryEphemeralStore::new());
+        let auth_authority = Arc::new(AuthAuthority::load_or_create(store.as_ref()).await.unwrap());
+        let (_alice_id, alice_token) =
+            create_test_authed_user(&store, &auth_authority, "alice-takeover@example.com").await;
+        let (_bob_id, bob_token) =
+            create_test_authed_user(&store, &auth_authority, "bob-takeover@example.com").await;
+
+        let hub = Arc::new(SignalHub::with_auth(
+            store,
+            ephemeral.clone(),
+            auth_authority,
+            SignalConfig::default(),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(hub.clone().serve_tcp_signaling_on_listener(listener));
+
+        let (mut host, host_id) = register_authed_peer_helper(
+            addr,
+            "dk-tk-host",
+            "host-studio",
+            "macos",
+            Some(&alice_token),
+            Some(true),
+            Some(true),
+        )
+        .await;
+        let (mut owner1, owner1_id) = register_authed_peer_helper(
+            addr,
+            "dk-tk-owner1",
+            "owner1-mac",
+            "macos",
+            Some(&alice_token),
+            None,
+            None,
+        )
+        .await;
+        let (mut owner2, _owner2_id) = register_authed_peer_helper(
+            addr,
+            "dk-tk-owner2",
+            "owner2-win",
+            "windows",
+            Some(&alice_token),
+            None,
+            None,
+        )
+        .await;
+        let (mut guest, _guest_id) = register_authed_peer_helper(
+            addr,
+            "dk-tk-guest",
+            "guest-linux",
+            "linux",
+            Some(&bob_token),
+            None,
+            None,
+        )
+        .await;
+
+        // Drain initial DeviceStatusChanged frames on host.
+        for _ in 0..2 {
+            let _ = read_signal_frame(&mut host).await.unwrap().unwrap();
+        }
+        // Drain DeviceStatusChanged frames on owner1 & owner2.
+        let _ = read_signal_frame(&mut owner1).await.unwrap().unwrap();
+
+        // Host reports owner1 is actively controlling it.
+        write_signal_frame(
+            &mut host,
+            &SignalMsg::ControlStateReport {
+                active_controllers: vec![ActiveControllerSummary {
+                    session_id: "active-sess-1".into(),
+                    controller_device_id: owner1_id.clone(),
+                    controller_device_name: "owner1-mac".into(),
+                    controller_os: "macos".into(),
+                    is_owner: true,
+                    mode: "remote_control".into(),
+                    connected_at_ms: 1_763_800_000_000,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut owner1).await.unwrap().unwrap(),
+            SignalMsg::DeviceControlStateChanged { .. }
+        ));
+        assert!(matches!(
+            read_signal_frame(&mut owner2).await.unwrap().unwrap(),
+            SignalMsg::DeviceControlStateChanged { .. }
+        ));
+
+        // A & B: owner2 with takeover=false -> TARGET_IN_SESSION on ConnectRequest & RelayAlloc!
+        write_signal_frame(
+            &mut owner2,
+            &SignalMsg::ConnectRequest {
+                target_id: host_id.clone(),
+                session_id: Some("tk-denied-1".into()),
+                lan_addrs: vec![],
+                nonce: None,
+                nat_type: None,
+                nat_port_delta: None,
+                nat_port_range: None,
+                takeover: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut owner2).await.unwrap().unwrap(),
+            SignalMsg::Error { ref code, .. } if code == err_code::TARGET_IN_SESSION
+        ));
+        write_signal_frame(
+            &mut owner2,
+            &SignalMsg::RelayAlloc {
+                target_id: host_id.clone(),
+                session_id: Some("tk-denied-relay-1".into()),
+                takeover: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut owner2).await.unwrap().unwrap(),
+            SignalMsg::Error { ref code, .. } if code == err_code::TARGET_IN_SESSION
+        ));
+        assert_eq!(ephemeral.active_token_count(), 0);
+
+        // C & D: owner1 (same controller_device_id!) with takeover=false -> ALLOWED (reconnect/route switch)!
+        write_signal_frame(
+            &mut owner1,
+            &SignalMsg::ConnectRequest {
+                target_id: host_id.clone(),
+                session_id: Some("same-ctrl-reconnect".into()),
+                lan_addrs: vec![],
+                nonce: None,
+                nat_type: None,
+                nat_port_delta: None,
+                nat_port_range: None,
+                takeover: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut owner1).await.unwrap().unwrap(),
+            SignalMsg::PunchCoord {
+                takeover: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            read_signal_frame(&mut host).await.unwrap().unwrap(),
+            SignalMsg::PunchCoord {
+                takeover: false,
+                peer_hostname: Some(ref h),
+                peer_os: Some(ref o),
+                ..
+            } if h == "owner1-mac" && o == "macos"
+        ));
+        write_signal_frame(
+            &mut owner1,
+            &SignalMsg::RelayAlloc {
+                target_id: host_id.clone(),
+                session_id: Some("same-ctrl-relay".into()),
+                takeover: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut owner1).await.unwrap().unwrap(),
+            SignalMsg::RelayReady {
+                takeover: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            read_signal_frame(&mut host).await.unwrap().unwrap(),
+            SignalMsg::RelayReady {
+                takeover: false,
+                ..
+            }
+        ));
+
+        // E, F & G: cross-account guest MUST be rejected with TARGET_IN_SESSION even with takeover=true!
+        let tokens_before_guest = ephemeral.active_token_count();
+        for takeover in [false, true] {
+            write_signal_frame(
+                &mut guest,
+                &SignalMsg::ConnectRequest {
+                    target_id: host_id.clone(),
+                    session_id: Some(format!("guest-blk-{takeover}")),
+                    lan_addrs: vec![],
+                    nonce: None,
+                    nat_type: None,
+                    nat_port_delta: None,
+                    nat_port_range: None,
+                    takeover,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                read_signal_frame(&mut guest).await.unwrap().unwrap(),
+                SignalMsg::Error { ref code, .. } if code == err_code::TARGET_IN_SESSION
+            ));
+        }
+        write_signal_frame(
+            &mut guest,
+            &SignalMsg::RelayAlloc {
+                target_id: host_id.clone(),
+                session_id: Some("guest-relay-takeover-blk".into()),
+                takeover: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut guest).await.unwrap().unwrap(),
+            SignalMsg::Error { ref code, .. } if code == err_code::TARGET_IN_SESSION
+        ));
+        assert_eq!(ephemeral.active_token_count(), tokens_before_guest);
+
+        // H & I: same-account owner2 with takeover=true -> ALLOWED and passes takeover=true + peer_hostname/peer_os!
+        write_signal_frame(
+            &mut owner2,
+            &SignalMsg::ConnectRequest {
+                target_id: host_id.clone(),
+                session_id: Some("owner-tk-punch".into()),
+                lan_addrs: vec![],
+                nonce: None,
+                nat_type: None,
+                nat_port_delta: None,
+                nat_port_range: None,
+                takeover: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut owner2).await.unwrap().unwrap(),
+            SignalMsg::PunchCoord {
+                takeover: true,
+                is_owner_connection: true,
+                peer_hostname: Some(ref h),
+                peer_os: Some(ref o),
+                ..
+            } if h == "host-studio" && o == "macos"
+        ));
+        assert!(matches!(
+            read_signal_frame(&mut host).await.unwrap().unwrap(),
+            SignalMsg::PunchCoord {
+                takeover: true,
+                is_owner_connection: true,
+                peer_hostname: Some(ref h),
+                peer_os: Some(ref o),
+                ..
+            } if h == "owner2-win" && o == "windows"
+        ));
+
+        write_signal_frame(
+            &mut owner2,
+            &SignalMsg::RelayAlloc {
+                target_id: host_id.clone(),
+                session_id: Some("owner-tk-relay".into()),
+                takeover: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut owner2).await.unwrap().unwrap(),
+            SignalMsg::RelayReady {
+                takeover: true,
+                is_owner_connection: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            read_signal_frame(&mut host).await.unwrap().unwrap(),
+            SignalMsg::RelayReady {
+                takeover: true,
+                is_owner_connection: true,
+                peer_hostname: Some(ref h),
+                peer_os: Some(ref o),
+                ..
+            } if h == "owner2-win" && o == "windows"
+        ));
+
+        // J: When host has no active_controllers, guest passing takeover=true is allowed as a normal session
+        // with takeover sanitized to false!
+        write_signal_frame(
+            &mut host,
+            &SignalMsg::ControlStateReport {
+                active_controllers: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        let _ = read_signal_frame(&mut owner1).await.unwrap().unwrap();
+        let _ = read_signal_frame(&mut owner2).await.unwrap().unwrap();
+
+        write_signal_frame(
+            &mut guest,
+            &SignalMsg::ConnectRequest {
+                target_id: host_id,
+                session_id: Some("guest-idle-sanitized".into()),
+                lan_addrs: vec![],
+                nonce: None,
+                nat_type: None,
+                nat_port_delta: None,
+                nat_port_range: None,
+                takeover: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read_signal_frame(&mut guest).await.unwrap().unwrap(),
+            SignalMsg::PunchCoord {
+                takeover: false,
+                is_owner_connection: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            read_signal_frame(&mut host).await.unwrap().unwrap(),
+            SignalMsg::PunchCoord {
+                takeover: false,
+                is_owner_connection: false,
+                peer_hostname: Some(ref h),
+                peer_os: Some(ref o),
+                ..
+            } if h == "guest-linux" && o == "linux"
+        ));
+
+        drop(host);
+        drop(owner1);
+        drop(owner2);
+        drop(guest);
         hub.shutdown_all().await;
         let _ = server_task.await;
     }
